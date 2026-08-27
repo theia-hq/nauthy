@@ -4,6 +4,9 @@ Decide whether an already-authenticated peer may connect. You hand it a peer's p
 transport has already proven) and a policy, and it returns admit or refuse. The policies range from a
 fixed allowlist to bearer capabilities you can expire, narrow, and hand on without any central server.
 
+The capabilities are [biscuit](https://www.biscuitsec.org) tokens; nauthy wraps them behind a small,
+misuse-resistant API rather than hand-rolling crypto.
+
 ```rust
 use nauthy::{Gate, Decision};
 
