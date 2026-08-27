@@ -164,13 +164,27 @@ impl Cap {
         ))
     }
 
+    /// Seal this cap so it can no longer be attenuated.
+    ///
+    /// A sealed cap still verifies, but no further block can be appended, so it cannot be narrowed and
+    /// handed onward. This is the honest "non-delegable" grant: the recipient may use it but may not
+    /// re-share a tightened copy. An unsealed cap (the default from [`Identity::mint`]) stays open to
+    /// attenuation and delegation.
+    pub fn seal(&self) -> Result<Self, CapError> {
+        Ok(Self {
+            root: self.root,
+            token: self.token.seal().map_err(CapError::Seal)?,
+        })
+    }
+
     /// Narrow this cap, offline, by appending a block that adds a tighter service and/or expiry check.
     ///
     /// Monotone by construction: [`biscuit_auth`] only lets a block ADD checks, so the result is always
     /// the same grant or narrower, never broader. Any holder can do this with no secret and no network,
     /// which is exactly what makes delegation work: a third party narrows and hands the token onward, and
-    /// the exposer still verifies the whole chain. At least one of `service`/`shorten` must be given, or
-    /// this is a no-op and returns [`CapError::EmptyAttenuation`].
+    /// the exposer still verifies the whole chain. A sealed cap (see [`Cap::seal`]) rejects this with
+    /// [`CapError::Attenuate`]. At least one of `service`/`shorten` must be given, or this is a no-op and
+    /// returns [`CapError::EmptyAttenuation`].
     pub fn attenuate(
         &self,
         service: Option<&Service>,
@@ -274,9 +288,12 @@ pub enum CapError {
     /// Encoding the token to bytes failed.
     #[error("encode capability")]
     Encode(#[source] biscuit_auth::error::Token),
-    /// Appending an attenuation block failed.
+    /// Appending an attenuation block failed (for instance, the cap is sealed).
     #[error("attenuate capability")]
     Attenuate(#[source] biscuit_auth::error::Token),
+    /// Sealing the token failed.
+    #[error("seal capability")]
+    Seal(#[source] biscuit_auth::error::Token),
     /// An attenuation was requested that narrows nothing.
     #[error("attenuation narrows nothing")]
     EmptyAttenuation,

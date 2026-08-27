@@ -184,6 +184,23 @@ fn attenuating_nothing_is_an_error() {
 }
 
 #[test]
+fn a_sealed_cap_verifies_but_cannot_be_attenuated() {
+    let exposer = identity(1);
+    let sealed = exposer
+        .mint(&service("ssh"), at(3600))
+        .expect("mint")
+        .seal()
+        .expect("seal");
+    // A sealed cap still grants normally.
+    assert!(exposer.verify(&sealed, &request("ssh", 0)).is_ok());
+    // But it cannot be narrowed and handed onward: delegation is refused by construction.
+    assert!(matches!(
+        sealed.attenuate(None, Some(at(60))),
+        Err(CapError::Attenuate(_))
+    ));
+}
+
+#[test]
 fn a_non_sheer_link_is_rejected() {
     assert!(matches!(
         Cap::parse("https://example.com"),

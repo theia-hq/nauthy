@@ -96,3 +96,14 @@ pub enum Refusal {
     /// A capability was presented but did not grant the request (foreign root, wrong service, expired).
     NotGranted,
 }
+
+impl core::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let reason = match self {
+            Refusal::NotPermitted => "not permitted",
+            Refusal::Missing => "no capability presented",
+            Refusal::NotGranted => "capability does not grant this request",
+        };
+        f.write_str(reason)
+    }
+}
