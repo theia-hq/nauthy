@@ -1,24 +1,33 @@
 # nauthy
 
-Authorization for the theia overlay: given a peer identity the transport has already proven, decide
-whether it may connect. It sits above [bifrost](https://github.com/theia-hq/bifrost), so reach stays
-policy-free and authorization is policy on proven identities.
+Decide whether an already-authenticated peer may connect. You hand it a peer's public key (which the
+transport has already proven) and a policy, and it returns admit or refuse. The policies range from a
+fixed allowlist to bearer capabilities you can expire, narrow, and hand on without any central server.
+
+```rust
+use nauthy::{Gate, Decision};
+
+match gate.admit(peer_id, presented_cap, &service) {
+    Decision::Admit => serve(peer_id).await,
+    Decision::Refuse(why) => reject(why),
+}
+```
 
 > Experimental. The capability layer is v1; short-expiry is the only revocation story (see below).
 
 ## The gate
 
-A `Gate` is the policy a server applies to an inbound, already-authenticated peer. Four variants, floor
-to profound:
+A `Gate` is the policy a server applies to an inbound, already-authenticated peer. Four variants, from
+simplest to most capable:
 
 - `Open` permits any peer that reached the key.
-- `Strict(set)` permits a fixed allowlist of node ids (`authorized_keys`).
-- `Paired(approvals)` permits a persisted, consent-grown approved set.
+- `Strict(set)` permits a fixed set of node ids: an allowlist.
+- `Paired(approvals)` permits a persisted set you grow by approving peers as they arrive.
 - `Cap(identity)` permits a peer that presents a **capability** which verifies against this node's own
   identity for the requested service.
 
-The first three gate on *who* the peer is. The fourth gates on *what token* the peer presents, and it is
-the thing an allowlist cannot do: attenuate, expire, and delegate a grant, with no central authority.
+The first three gate on *who* the peer is. The fourth gates on *what token* the peer presents, which is
+the thing an allowlist cannot do: expire, narrow, and hand on a grant, with no central authority.
 
 ## The capability (`sheer`)
 
