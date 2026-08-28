@@ -85,10 +85,17 @@ impl Denylist {
         let mut lines = self
             .ids
             .iter()
-            .map(|id| BASE32_NOPAD.encode(id).to_lowercase())
+            .map(|id| BASE32_NOPAD.encode(id))
             .collect::<Vec<_>>();
         lines.sort();
-        tokio::fs::write(&self.path, lines.join("\n") + "\n")
+        let body = lines.join("\n") + "\n";
+        // Atomic replace: write a temp sibling, then rename over the target. A crash mid-write can never
+        // truncate the denylist and silently bring a revoked cap back to life; the rename is all-or-nothing.
+        let tmp = self.path.with_extension("tmp");
+        tokio::fs::write(&tmp, body)
+            .await
+            .map_err(DenylistError::Io)?;
+        tokio::fs::rename(&tmp, &self.path)
             .await
             .map_err(DenylistError::Io)
     }
