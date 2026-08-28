@@ -15,7 +15,10 @@ fn identity(seed: u8) -> Identity {
 
 /// A cap gate with an empty (no-file) revocation denylist, for tests that do not exercise revocation.
 fn cap_gate(seed: u8) -> Gate {
-    Gate::Cap(identity(seed), Box::new(Denylist::empty(PathBuf::new())))
+    Gate::Cap(
+        identity(seed).node_id(),
+        Box::new(Denylist::empty(PathBuf::new())),
+    )
 }
 
 fn service(name: &str) -> Service {
@@ -127,7 +130,7 @@ async fn a_revoked_cap_and_its_delegations_are_refused_across_a_reload() {
     }
     // Reload from disk: revocation must survive a restart, which a bare TTL cannot give.
     let denylist = Denylist::load(path.clone()).await.expect("reload");
-    let gate = Gate::Cap(identity(1), Box::new(denylist));
+    let gate = Gate::Cap(identity(1).node_id(), Box::new(denylist));
 
     assert_eq!(
         gate.admit(some_peer(), Some(&cap), &service("ssh")),
@@ -150,4 +153,24 @@ async fn a_revoked_cap_and_its_delegations_are_refused_across_a_reload() {
         Decision::Admit
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cap_gate_can_trust_a_foreign_root_the_ci_model() {
+    let hour = || crate::cap::expires_in(core::time::Duration::from_secs(3600));
+    // The issuer (your laptop) mints a cap; the exposer (a CI runner) trusts the issuer's root WITHOUT
+    // ever holding its secret. Only a cap rooted at the trusted issuer is admitted.
+    let issuer = identity(5);
+    let cap = issuer.mint(&service("ssh"), hour()).expect("mint");
+    let gate = Gate::Cap(issuer.node_id(), Box::new(Denylist::empty(PathBuf::new())));
+    assert_eq!(
+        gate.admit(some_peer(), Some(&cap), &service("ssh")),
+        Decision::Admit
+    );
+    // A cap rooted at a DIFFERENT key is refused: the runner trusts only the named issuer.
+    let stranger = identity(6).mint(&service("ssh"), hour()).expect("mint");
+    assert_eq!(
+        gate.admit(some_peer(), Some(&stranger), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
 }

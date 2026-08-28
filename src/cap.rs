@@ -99,24 +99,34 @@ impl Identity {
     /// service mismatch, an expired token, or a token narrowed past the request is a denial. Returns this
     /// node's [`NodeId`] on success so a caller can log which identity authorized the grant.
     pub fn verify(&self, cap: &Cap, request: &Request) -> Result<NodeId, CapError> {
-        if cap.root != self.node_id() {
-            return Err(CapError::ForeignRoot);
-        }
-        let authorizer = authorizer!(
-            r#"
-            time({now});
-            service({service});
-            allow if true;
-            "#,
-            now = request.now,
-            service = request.service.as_str(),
-        )
-        .build(&cap.token)
-        .map_err(CapError::Authorize)?;
-        let mut authorizer = authorizer;
-        authorizer.authorize().map_err(CapError::Denied)?;
-        Ok(cap.root)
+        verify_at_root(cap, request, self.node_id())
     }
+}
+
+/// Verify a presented cap grants `request` and is rooted at `root`, returning the root identity on success.
+///
+/// Verification is pure public-key: a cap's signature chain is checked against its embedded root at
+/// [`Cap::parse`], so granting a request only needs the root to match `root` and every caveat to pass. No
+/// secret is involved, which is what lets a node gate on a root it merely TRUSTS rather than owns: a CI
+/// runner accepts caps rooted at YOUR key without ever holding your secret, so a compromised runner can
+/// never mint new access (see [`crate::Gate`]). [`Identity::verify`] is the self-rooted special case.
+pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<NodeId, CapError> {
+    if cap.root != root {
+        return Err(CapError::ForeignRoot);
+    }
+    let mut authorizer = authorizer!(
+        r#"
+        time({now});
+        service({service});
+        allow if true;
+        "#,
+        now = request.now,
+        service = request.service.as_str(),
+    )
+    .build(&cap.token)
+    .map_err(CapError::Authorize)?;
+    authorizer.authorize().map_err(CapError::Denied)?;
+    Ok(cap.root)
 }
 
 /// A capability: a token decoded and signature-verified against the root [`NodeId`] embedded in its link.

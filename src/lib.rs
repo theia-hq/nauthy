@@ -31,7 +31,7 @@ mod gate_tests;
 pub use bifrost_core::NodeId;
 
 pub use crate::approvals::{Approvals, ApprovalsError};
-pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in};
+pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in, verify_at_root};
 pub use crate::gate::{Decision, Gate, Refusal};
 pub use crate::revocations::{Denylist, DenylistError};
 pub use crate::service::{Service, ServiceParseError};

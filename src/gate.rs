@@ -1,7 +1,7 @@
 //! The authorization gate: the policy that decides whether a proven peer may connect.
 
 use crate::approvals::Approvals;
-use crate::cap::{Cap, Identity, Request};
+use crate::cap::{Cap, Request, verify_at_root};
 use crate::revocations::Denylist;
 use crate::{NodeId, Service};
 
@@ -18,12 +18,14 @@ pub enum Gate {
     Strict(std::collections::HashSet<NodeId>),
     /// Permit only peers in a persisted, consent-grown approved set.
     Paired(Approvals),
-    /// Permit a peer iff it presents a [`Cap`] that verifies against this node's own identity for the
-    /// requested service, is unexpired, and is not on the revocation [`Denylist`]. No allowlist, no
-    /// server: the exposer holds only its own secret, verifies every grant offline against it, and can
-    /// recall a leaked one by revoking it. The denylist is boxed to keep this variant from bloating the
-    /// enum (a `Gate` is one long-lived value, but clippy rightly flags the size gap).
-    Cap(Identity, Box<Denylist>),
+    /// Permit a peer iff it presents a [`Cap`] that verifies against a TRUSTED ROOT for the requested
+    /// service, is unexpired, and is not on the revocation [`Denylist`]. The root is a [`NodeId`]: the
+    /// exposer's OWN identity for a self-issued grant, or a FOREIGN issuer's key the node merely trusts
+    /// (the CI model: a runner accepts caps rooted at your key without holding your secret, so it can
+    /// never mint access). No allowlist, no server: verified offline, revocable by the denylist. The
+    /// denylist is boxed to keep this variant from bloating the enum (a `Gate` is one long-lived value,
+    /// but clippy rightly flags the size gap).
+    Cap(NodeId, Box<Denylist>),
 }
 
 impl Gate {
@@ -38,7 +40,7 @@ impl Gate {
             Gate::Open => Decision::Admit,
             Gate::Strict(allowed) => Decision::from(allowed.contains(&peer)),
             Gate::Paired(approvals) => Decision::from(approvals.keys().contains(&peer)),
-            Gate::Cap(identity, denylist) => admit_cap(identity, denylist, presented, service),
+            Gate::Cap(root, denylist) => admit_cap(*root, denylist, presented, service),
         }
     }
 
@@ -50,9 +52,9 @@ impl Gate {
     }
 }
 
-/// Verify a presented cap for the requested service against the exposer's identity, then check revocation.
+/// Verify a presented cap for the requested service against the trusted `root`, then check revocation.
 fn admit_cap(
-    identity: &Identity,
+    root: NodeId,
     denylist: &Denylist,
     presented: Option<&Cap>,
     service: &Service,
@@ -61,9 +63,9 @@ fn admit_cap(
         return Decision::Refuse(Refusal::Missing);
     };
     let request = Request::now(Service::clone(service));
-    match identity.verify(cap, &request) {
-        // Verified against this identity for the service and unexpired, but a revoked cap is still
-        // refused: the offline recall a bare TTL cannot give.
+    match verify_at_root(cap, &request, root) {
+        // Rooted at the trusted key for the service and unexpired, but a revoked cap is still refused:
+        // the offline recall a bare TTL cannot give.
         Ok(_) if denylist.is_revoked(cap) => Decision::Refuse(Refusal::Revoked),
         Ok(_) => Decision::Admit,
         Err(_) => Decision::Refuse(Refusal::NotGranted),
