@@ -65,6 +65,39 @@ fn cap_does_not_verify_against_a_different_identity() {
 }
 
 #[test]
+fn the_membership_constant_is_a_valid_service_name() {
+    // membership() builds the Service directly from the constant; pin that the constant parses so the
+    // infallible constructor can never yield a malformed service name.
+    let parsed: Service = Service::MEMBERSHIP
+        .parse()
+        .expect("membership name is valid");
+    assert_eq!(parsed, Service::membership());
+    assert_eq!(Service::membership().as_str(), "theia:member");
+}
+
+#[test]
+fn a_membership_badge_is_a_cap_for_the_reserved_service() {
+    // A membership badge is a cap minted for the reserved `theia:member` service: the signet stamps a
+    // device as its own. It verifies AS membership (a family gate honors that as whole-node admission), but
+    // is not itself a grant to any named service -- membership is a distinct claim from a delegated cap.
+    let signet = identity(1);
+    let badge = signet
+        .mint(&Service::membership(), at(3600))
+        .expect("mint membership badge");
+    assert!(
+        signet.verify(&badge, &request("theia:member", 0)).is_ok(),
+        "a badge grants the membership service"
+    );
+    assert!(
+        matches!(
+            signet.verify(&badge, &request("ssh", 0)),
+            Err(CapError::Denied(_))
+        ),
+        "a membership badge is not itself an ssh grant"
+    );
+}
+
+#[test]
 fn a_link_round_trips_and_carries_the_root() {
     let exposer = identity(1);
     let cap = exposer.mint(&service("ssh"), at(3600)).expect("mint");
