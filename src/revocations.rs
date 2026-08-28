@@ -41,8 +41,8 @@ impl Denylist {
         Ok(Self { path, ids })
     }
 
-    /// Whether a presented cap is revoked: any id in its chain (the cap itself or an ancestor block) is on
-    /// the denylist.
+    /// Whether a presented cap is revoked: any id in its chain (the cap's own blocks, including any it
+    /// inherited from the grant it was attenuated from) is on the denylist.
     pub fn is_revoked(&self, cap: &Cap) -> bool {
         cap.revocation_ids().iter().any(|id| self.ids.contains(id))
     }
