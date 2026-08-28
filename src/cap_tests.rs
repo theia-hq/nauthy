@@ -240,3 +240,25 @@ fn a_non_sheer_link_is_rejected() {
         Err(CapError::Scheme)
     ));
 }
+
+#[test]
+fn an_oversized_link_is_refused_before_decoding() {
+    // A body past the size bound is rejected before the base32 decode + signature verification, so an
+    // untrusted peer cannot force that work with a huge link (the availability DoS the red-team found).
+    let root = identity(1).node_id();
+    let huge = format!("sheer:{root}.{}", "a".repeat(20_000));
+    assert!(matches!(Cap::parse(&huge), Err(CapError::TooLarge)));
+}
+
+#[test]
+fn a_many_block_cap_is_refused_at_parse() {
+    // A deeply-attenuated token is O(blocks) to verify; a legitimate delegation chain is short, so one
+    // past the block bound is refused at parse rather than burning CPU.
+    let exposer = identity(1);
+    let mut cap = exposer.mint(&service("ssh"), at(3600)).expect("mint");
+    for _ in 0..20 {
+        cap = cap.attenuate(None, Some(at(3600))).expect("attenuate");
+    }
+    let link = cap.link().expect("encode");
+    assert!(matches!(Cap::parse(&link), Err(CapError::TooLarge)));
+}

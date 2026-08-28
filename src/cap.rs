@@ -44,6 +44,15 @@ pub const SCHEME: &str = "sheer:";
 /// The separator between the embedded root [`NodeId`] and the token body inside a link.
 const SEPARATOR: char = '.';
 
+/// The maximum encoded token length [`Cap::parse`] accepts (~8 KiB decoded). A capability is a small
+/// token, so this is generous; it bounds the base32 decode and the O(blocks) signature-chain work, which
+/// run before any trust check, so an oversized link cannot burn a verifier's CPU un-refused.
+const MAX_ENCODED_LEN: usize = 13_200;
+
+/// The maximum number of blocks [`Cap::parse`] accepts: the authority block plus a bounded delegation
+/// chain. Verification is O(blocks) and a legitimate chain is short, so a many-block token is refused.
+const MAX_BLOCKS: usize = 16;
+
 /// An exposer's signing identity: the ed25519 keypair whose public half is a [`NodeId`].
 ///
 /// This is the root of every cap it mints. Reconstructed from the exposer's persisted 32-byte secret so
@@ -147,6 +156,13 @@ impl Cap {
     pub fn parse(link: &str) -> Result<Self, CapError> {
         let body = link.strip_prefix(SCHEME).ok_or(CapError::Scheme)?;
         let (root, encoded) = body.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
+        // Bound the token size BEFORE the expensive work: base32-decoding a huge body, and then the
+        // O(blocks) signature-chain verification, both run before any trust check, so an untrusted peer
+        // could otherwise burn CPU with an oversized or many-block link (a foreign token is parsed here,
+        // then refused later against the trusted root: too late). A real cap is small; this is generous.
+        if encoded.len() > MAX_ENCODED_LEN {
+            return Err(CapError::TooLarge);
+        }
         let root = root.parse::<NodeId>().map_err(|_| CapError::Malformed)?;
         let bytes = BASE32_NOPAD
             .decode(encoded.to_uppercase().as_bytes())
@@ -155,6 +171,11 @@ impl Cap {
         // Decoding with the embedded root verifies the signature chain back to it; a token that does not
         // chain to the NodeId it claims is rejected here, before any caveat is ever considered.
         let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Malformed)?;
+        // A well-formed but deeply-attenuated token is still a DoS via O(blocks) work; a legitimate
+        // delegation chain is short, so bound the block count too.
+        if token.block_count() > MAX_BLOCKS {
+            return Err(CapError::TooLarge);
+        }
         Ok(Self { root, token })
     }
 
@@ -291,6 +312,10 @@ pub enum CapError {
     /// The link did not start with the `sheer:` scheme.
     #[error("not a sheer link")]
     Scheme,
+    /// The token exceeded the size or block-count bound; refused before verification to cap the work an
+    /// untrusted peer can force.
+    #[error("capability is too large")]
+    TooLarge,
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
