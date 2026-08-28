@@ -1,23 +1,23 @@
-//! nauthy: the authorization gate. Given a peer identity that the transport has already proven, decide
-//! whether it may connect.
+//! nauthy: control-plane-free authorization. Given a peer identity that a transport has already proven,
+//! decide whether it may connect, with no server, no PKI, and no registry.
 //!
-//! Authorization here is policy on *proven* identities, not crypto: a bifrost transport handshake has
-//! already proven the peer holds the private key behind its [`NodeId`], so the question is only whether
-//! that identity is permitted. nauthy sits ABOVE bifrost, so reach stays policy-free.
+//! Authorization here is policy on *proven* identities, not crypto: a transport handshake has already
+//! proven the peer holds the private key behind its [`NodeId`], so the question is only whether that
+//! identity is permitted. nauthy sits above the transport and never reaches out itself, so it is usable
+//! wherever a peer can be named by an ed25519 key, theia or not.
 //!
-//! Four policies, floor to profound:
-//! - [`Gate::Open`] permits any peer that reached the key.
-//! - [`Gate::Strict`] permits a fixed allowlist of node ids.
-//! - [`Gate::Paired`] permits a persisted, consent-grown approved set (see [`Approvals`]).
-//! - [`Gate::Cap`] permits a peer that *presents a capability* ([`Cap`]) which verifies against this
-//!   node's own identity for the requested service. This is the wedge: a bearer token the exposer mints,
-//!   the holder can narrow and hand off offline, and the exposer verifies with no central authority.
+//! Three policies:
+//! - [`Gate::Open`] permits any peer.
+//! - [`Gate::Strict`] permits a fixed allowlist of keys: the signet-less floor.
+//! - [`Gate::Family`] permits a peer that *presents a signed token* ([`Cap`]) rooted at a trusted signet,
+//!   granting either MEMBERSHIP (a badge for [`Service::membership`], admitting to the whole node) or the
+//!   requested SERVICE (a delegated slip). One key you own authorizes both your own devices and anyone you
+//!   delegate to, offline and revocably: the thing `authorized_keys` cannot do.
 //!
-//! The first three answer `authorized_keys`; the fourth is the thing `authorized_keys` cannot do. It is
-//! built on [`biscuit-auth`](biscuit_auth), an ed25519-signed, datalog-attenuable token: nauthy never
-//! hand-rolls crypto, it wraps a vetted library behind a small parse-don't-validate [`Cap`] type.
+//! The token is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable capability. nauthy never
+//! hand-rolls crypto; it wraps a vetted library behind a small parse-don't-validate [`Cap`] type, adds a
+//! signed membership claim, and revokes offline via a node-local [`Denylist`].
 
-mod approvals;
 mod cap;
 mod gate;
 mod revocations;
@@ -30,7 +30,6 @@ mod gate_tests;
 
 pub use bifrost_core::NodeId;
 
-pub use crate::approvals::{Approvals, ApprovalsError};
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in, verify_at_root};
 pub use crate::gate::{Decision, Gate, Refusal};
 pub use crate::revocations::{Denylist, DenylistError};
