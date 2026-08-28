@@ -154,6 +154,14 @@ impl Cap {
         self.root
     }
 
+    /// This cap's revocation identifiers, one per block (the authority block first, the narrowest last).
+    /// Each is a pure, offline function of the block's signature. Recording one in a
+    /// [`Denylist`](crate::Denylist) revokes that token and every token attenuated from it (all of which
+    /// carry that block, hence that id).
+    pub fn revocation_ids(&self) -> Vec<Vec<u8>> {
+        self.token.revocation_identifiers()
+    }
+
     /// Encode this cap as a `sheer:<node-id>.<base32>` share-link.
     pub fn link(&self) -> Result<String, CapError> {
         let bytes = self.token.to_vec().map_err(CapError::Encode)?;

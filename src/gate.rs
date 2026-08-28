@@ -2,6 +2,7 @@
 
 use crate::approvals::Approvals;
 use crate::cap::{Cap, Identity, Request};
+use crate::revocations::Denylist;
 use crate::{NodeId, Service};
 
 /// An authorization policy over proven peer identities.
@@ -18,9 +19,11 @@ pub enum Gate {
     /// Permit only peers in a persisted, consent-grown approved set.
     Paired(Approvals),
     /// Permit a peer iff it presents a [`Cap`] that verifies against this node's own identity for the
-    /// requested service and is unexpired. No allowlist, no server: the exposer holds only its own
-    /// secret, and every grant it ever issued verifies offline against it.
-    Cap(Identity),
+    /// requested service, is unexpired, and is not on the revocation [`Denylist`]. No allowlist, no
+    /// server: the exposer holds only its own secret, verifies every grant offline against it, and can
+    /// recall a leaked one by revoking it. The denylist is boxed to keep this variant from bloating the
+    /// enum (a `Gate` is one long-lived value, but clippy rightly flags the size gap).
+    Cap(Identity, Box<Denylist>),
 }
 
 impl Gate {
@@ -35,7 +38,7 @@ impl Gate {
             Gate::Open => Decision::Admit,
             Gate::Strict(allowed) => Decision::from(allowed.contains(&peer)),
             Gate::Paired(approvals) => Decision::from(approvals.keys().contains(&peer)),
-            Gate::Cap(identity) => admit_cap(identity, presented, service),
+            Gate::Cap(identity, denylist) => admit_cap(identity, denylist, presented, service),
         }
     }
 
@@ -43,17 +46,25 @@ impl Gate {
     /// connect path needs a cap only for a [`Cap`](Gate::Cap) gate, so a `false` here means "no token
     /// required".
     pub fn wants_capability(&self) -> bool {
-        matches!(self, Gate::Cap(_))
+        matches!(self, Gate::Cap(..))
     }
 }
 
-/// Verify a presented cap for the requested service against the exposer's identity.
-fn admit_cap(identity: &Identity, presented: Option<&Cap>, service: &Service) -> Decision {
+/// Verify a presented cap for the requested service against the exposer's identity, then check revocation.
+fn admit_cap(
+    identity: &Identity,
+    denylist: &Denylist,
+    presented: Option<&Cap>,
+    service: &Service,
+) -> Decision {
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
     let request = Request::now(Service::clone(service));
     match identity.verify(cap, &request) {
+        // Verified against this identity for the service and unexpired, but a revoked cap is still
+        // refused: the offline recall a bare TTL cannot give.
+        Ok(_) if denylist.is_revoked(cap) => Decision::Refuse(Refusal::Revoked),
         Ok(_) => Decision::Admit,
         Err(_) => Decision::Refuse(Refusal::NotGranted),
     }
@@ -95,6 +106,8 @@ pub enum Refusal {
     Missing,
     /// A capability was presented but did not grant the request (foreign root, wrong service, expired).
     NotGranted,
+    /// A capability verified and granted the request, but has been revoked.
+    Revoked,
 }
 
 impl core::fmt::Display for Refusal {
@@ -103,6 +116,7 @@ impl core::fmt::Display for Refusal {
             Refusal::NotPermitted => "not permitted",
             Refusal::Missing => "no capability presented",
             Refusal::NotGranted => "capability does not grant this request",
+            Refusal::Revoked => "capability has been revoked",
         };
         f.write_str(reason)
     }

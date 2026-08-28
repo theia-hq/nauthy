@@ -40,6 +40,7 @@ name = "bifrost-core"
 version = "0.0.0"
 dependencies = [
  "data-encoding",
+ "ed25519-dalek",
  "thiserror 2.0.20",
 ]
 

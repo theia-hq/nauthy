@@ -20,6 +20,7 @@
 mod approvals;
 mod cap;
 mod gate;
+mod revocations;
 mod service;
 
 #[cfg(test)]
@@ -32,4 +33,5 @@ pub use bifrost_core::NodeId;
 pub use crate::approvals::{Approvals, ApprovalsError};
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in};
 pub use crate::gate::{Decision, Gate, Refusal};
+pub use crate::revocations::{Denylist, DenylistError};
 pub use crate::service::{Service, ServiceParseError};
