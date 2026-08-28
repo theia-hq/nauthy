@@ -31,7 +31,7 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use biscuit_auth::builder::Algorithm;
-use biscuit_auth::macros::{authorizer, biscuit, block};
+use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use data_encoding::BASE32_NOPAD;
 
@@ -101,6 +101,33 @@ impl Identity {
         })
     }
 
+    /// Mint a membership badge for the device `bound_to`, granting [`Service::membership`] until `expiry`.
+    ///
+    /// A device badge, not a service slip: it asserts "the bearer is one of my devices", which a
+    /// [`Family`](crate::Gate::Family) gate honors as whole-node admission. It is BOUND to `bound_to`, so it
+    /// grants only when the *proven* dialer is that device: a badge lifted onto a different key (a leaked
+    /// blob, a copied secret handed to the wrong machine) verifies against no one. Only the signet (this
+    /// identity) can mint one, since minting needs the root secret; a delegated slip can never be attenuated
+    /// into a membership badge (attenuation only adds checks, [`Cap::attenuate`]).
+    pub fn mint_member(&self, bound_to: NodeId, expiry: SystemTime) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if bound_device($d), $d == {bound};
+            "#,
+            service = Service::MEMBERSHIP,
+            expiry = expiry,
+            bound = bound_to.to_string(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.node_id(),
+            token,
+        })
+    }
+
     /// Verify a presented cap grants `request` against this identity, returning the identity it roots at.
     ///
     /// Grants iff the cap is rooted at this node's key AND every check in the chain passes for the
@@ -123,7 +150,7 @@ pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<Node
     if cap.root != root {
         return Err(CapError::ForeignRoot);
     }
-    let mut authorizer = authorizer!(
+    let mut builder = authorizer!(
         r#"
         time({now});
         service({service});
@@ -131,9 +158,17 @@ pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<Node
         "#,
         now = request.now,
         service = request.service.as_str(),
-    )
-    .build(&cap.token)
-    .map_err(CapError::Authorize)?;
+    );
+    // Inject the proven dialer as a `bound_device` fact so a device-bound membership badge (see
+    // [`Identity::mint_member`]) grants only when the peer IS the bound device. An unbound cap — a slip, or
+    // a badge with no binding block — carries no `bound_device` check and is unaffected: monotone, so
+    // presenting the extra fact can never broaden a grant.
+    if let Some(peer) = request.bound_device {
+        builder = builder
+            .fact(fact!(r#"bound_device({peer})"#, peer = peer.to_string()))
+            .map_err(CapError::Authorize)?;
+    }
+    let mut authorizer = builder.build(&cap.token).map_err(CapError::Authorize)?;
     authorizer.authorize().map_err(CapError::Denied)?;
     Ok(cap.root)
 }
@@ -265,15 +300,27 @@ pub struct Request {
     pub service: Service,
     /// The moment to evaluate expiry against.
     pub now: SystemTime,
+    /// The proven identity of the dialer, when known. A device-bound membership badge (see
+    /// [`Identity::mint_member`]) grants only when this matches the badge's bound device; `None`, or a cap
+    /// with no binding, skips the check.
+    pub bound_device: Option<NodeId>,
 }
 
 impl Request {
-    /// A request for `service` evaluated at the current wall-clock time.
+    /// A request for `service` evaluated at the current wall-clock time, with no bound dialer.
     pub fn now(service: Service) -> Self {
         Self {
             service,
             now: SystemTime::now(),
+            bound_device: None,
         }
+    }
+
+    /// Bind this request to the proven dialer `peer`, so a device-bound badge admits only that device. The
+    /// gate sets this from the identity the transport handshake proved.
+    pub fn bound_to(mut self, peer: NodeId) -> Self {
+        self.bound_device = Some(peer);
+        self
     }
 }
 

@@ -38,6 +38,13 @@ fn badge(seed: u8) -> Cap {
         .expect("mint badge")
 }
 
+/// A device-bound membership badge minted by `seed`'s signet for `device` (see `Identity::mint_member`).
+fn bound_badge(seed: u8, device: NodeId) -> Cap {
+    identity(seed)
+        .mint_member(device, hour())
+        .expect("mint bound badge")
+}
+
 /// A delegated slip minted by `seed`'s signet for `svc`.
 fn slip(seed: u8, svc: &str) -> Cap {
     identity(seed)
@@ -96,6 +103,29 @@ fn family_admits_a_membership_badge_to_any_service_regardless_of_dialer() {
     assert_eq!(
         gate.admit(stranger, Some(&badge), &service("web")),
         Decision::Admit
+    );
+}
+
+#[test]
+fn family_admits_a_bound_badge_only_from_its_device() {
+    // A device-bound badge (mint_member) is non-transferable: the family gate admits it whole-node ONLY when
+    // the proven dialer is the bound device. The same badge presented by any other key is refused, so a
+    // leaked badge blob is useless without the matching device secret. This is the production admit() path
+    // (peer threaded through), not just verify().
+    let gate = family_gate(1);
+    let device = identity(4).node_id();
+    let badge = bound_badge(1, device);
+
+    assert_eq!(
+        gate.admit(device, Some(&badge), &service("ssh")),
+        Decision::Admit,
+        "the bound device is admitted whole-node"
+    );
+    let stranger = identity(7).node_id();
+    assert_eq!(
+        gate.admit(stranger, Some(&badge), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted),
+        "the same badge from a foreign dialer is refused"
     );
 }
 

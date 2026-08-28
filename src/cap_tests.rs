@@ -4,6 +4,7 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
+use crate::NodeId;
 use crate::cap::{Cap, CapError, Identity, Request};
 use crate::service::Service;
 
@@ -29,7 +30,13 @@ fn request(name: &str, now_secs: i64) -> Request {
     Request {
         service: service(name),
         now: at(now_secs),
+        bound_device: None,
     }
+}
+
+/// A request carrying the proven dialer, for verifying device-bound membership badges.
+fn bound_request(name: &str, now_secs: i64, peer: NodeId) -> Request {
+    request(name, now_secs).bound_to(peer)
 }
 
 #[test]
@@ -94,6 +101,54 @@ fn a_membership_badge_is_a_cap_for_the_reserved_service() {
             Err(CapError::Denied(_))
         ),
         "a membership badge is not itself an ssh grant"
+    );
+}
+
+#[test]
+fn a_bound_membership_badge_admits_only_its_device() {
+    // mint_member binds the badge to a specific device: it grants membership when the proven dialer IS that
+    // device, and no one else. A badge lifted onto another key (a leaked blob, a copied secret handed to the
+    // wrong machine) verifies against no one -- non-transferable by construction.
+    let signet = identity(1);
+    let device: NodeId = identity(2).node_id();
+    let stranger: NodeId = identity(3).node_id();
+    let badge = signet
+        .mint_member(device, at(3600))
+        .expect("mint bound badge");
+
+    assert!(
+        signet
+            .verify(&badge, &bound_request("theia:member", 0, device))
+            .is_ok(),
+        "the bound device's badge grants membership"
+    );
+    assert!(
+        matches!(
+            signet.verify(&badge, &bound_request("theia:member", 0, stranger)),
+            Err(CapError::Denied(_))
+        ),
+        "a bound badge does not grant a foreign device"
+    );
+    assert!(
+        matches!(
+            signet.verify(&badge, &request("theia:member", 0)),
+            Err(CapError::Denied(_))
+        ),
+        "a bound badge requires the dialer to be proven; an unbound request cannot satisfy it"
+    );
+}
+
+#[test]
+fn an_unbound_cap_ignores_the_bound_device_fact() {
+    // A plain slip carries no binding block, so injecting a bound_device fact is monotone and cannot change
+    // its grant: an ordinary ssh slip still grants regardless of which dialer presents it.
+    let exposer = identity(1);
+    let anyone: NodeId = identity(9).node_id();
+    let slip = exposer.mint(&service("ssh"), at(3600)).expect("mint slip");
+    assert!(
+        exposer
+            .verify(&slip, &bound_request("ssh", 0, anyone))
+            .is_ok()
     );
 }
 

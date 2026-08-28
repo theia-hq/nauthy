@@ -44,7 +44,7 @@ impl Gate {
         match self {
             Gate::Open => Decision::Admit,
             Gate::Strict(allowed) => Decision::from(allowed.contains(&peer)),
-            Gate::Family(root, denylist) => admit_family(*root, denylist, presented, service),
+            Gate::Family(root, denylist) => admit_family(*root, denylist, presented, service, peer),
         }
     }
 
@@ -88,11 +88,12 @@ fn admit_family(
     denylist: &Denylist,
     presented: Option<&Cap>,
     service: &Service,
+    peer: NodeId,
 ) -> Decision {
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
-    if !grants(cap, root, &Service::membership()) && !grants(cap, root, service) {
+    if !grants(cap, root, &Service::membership(), peer) && !grants(cap, root, service, peer) {
         return Decision::Refuse(Refusal::NotGranted);
     }
     // Granted, but a revoked token is still refused: the offline recall a bare TTL cannot give. Checked
@@ -103,9 +104,16 @@ fn admit_family(
     Decision::Admit
 }
 
-/// Whether `cap` grants `service` rooted at `root`, evaluated now.
-fn grants(cap: &Cap, root: NodeId, service: &Service) -> bool {
-    verify_at_root(cap, &Request::now(Service::clone(service)), root).is_ok()
+/// Whether `cap` grants `service` rooted at `root` for the proven dialer `peer`, evaluated now. The `peer`
+/// is bound into the request so a device-bound membership badge admits only its device; an unbound cap
+/// ignores it.
+fn grants(cap: &Cap, root: NodeId, service: &Service, peer: NodeId) -> bool {
+    verify_at_root(
+        cap,
+        &Request::now(Service::clone(service)).bound_to(peer),
+        root,
+    )
+    .is_ok()
 }
 
 /// The gate's ruling on a connection attempt.
