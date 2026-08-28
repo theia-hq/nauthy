@@ -53,7 +53,32 @@ impl Gate {
     pub fn wants_capability(&self) -> bool {
         matches!(self, Gate::Family(..))
     }
+
+    /// Like [`admit`](Gate::admit) but yields an [`Admitted`] witness on success. The witness has no
+    /// public constructor, so a service handler that requires one (e.g. a keyless shell) CANNOT be reached
+    /// without a gate having permitted the peer: "authorize before serve" becomes a compile-time
+    /// precondition, not a statement order a refactor could quietly drop.
+    pub fn admit_witnessed(
+        &self,
+        peer: NodeId,
+        presented: Option<&Cap>,
+        service: &Service,
+    ) -> Result<Admitted, Refusal> {
+        match self.admit(peer, presented, service) {
+            Decision::Admit => Ok(Admitted(())),
+            Decision::Refuse(refusal) => Err(refusal),
+        }
+    }
 }
+
+/// Proof that a [`Gate`] admitted a connection.
+///
+/// An opaque witness with no public constructor: the only way to obtain one is [`Gate::admit_witnessed`]
+/// returning `Ok`. A service handler that takes an `Admitted` therefore cannot be called without a gate
+/// having permitted the peer, so "authorize before serve" is enforced by the type system, not by the order
+/// of statements. It carries nothing; it exists only to be un-forgeable outside nauthy.
+#[derive(Debug, Clone, Copy)]
+pub struct Admitted(());
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
 /// requested `service`. One signature, two meanings: a device carries a badge (the reserved membership
