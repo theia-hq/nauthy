@@ -1,6 +1,8 @@
 //! The authorization gate: the policy that decides whether a proven peer may connect.
 
-use crate::cap::{Cap, Request, verify_at_root};
+use std::time::SystemTime;
+
+use crate::cap::{Cap, Request, verify_at_root, verify_member_at_root};
 use crate::revocations::Denylist;
 use crate::{NodeId, Service};
 
@@ -81,8 +83,10 @@ impl Gate {
 pub struct Admitted(());
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
-/// requested `service`. One signature, two meanings: a device carries a badge (the reserved membership
-/// service, whole-node), a delegated friend carries a slip (the requested service); either authorizes.
+/// requested `service`. One signature, two meanings: a device carries a MEMBERSHIP badge (a `member(true)`
+/// authority fact, whole-node), a delegated friend carries a SLIP (a check for the requested service);
+/// either authorizes. The two are distinct questions — membership is not a service name — so a slip can
+/// never be widened into whole-node admission (see [`verify_member_at_root`]).
 fn admit_family(
     root: NodeId,
     denylist: &Denylist,
@@ -93,7 +97,7 @@ fn admit_family(
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
-    if !grants(cap, root, &Service::membership(), peer) && !grants(cap, root, service, peer) {
+    if !is_member(cap, root, peer) && !grants(cap, root, service, peer) {
         return Decision::Refuse(Refusal::NotGranted);
     }
     // Granted, but a revoked token is still refused: the offline recall a bare TTL cannot give. Checked
@@ -104,9 +108,14 @@ fn admit_family(
     Decision::Admit
 }
 
+/// Whether `cap` is a MEMBERSHIP badge rooted at `root` for the proven dialer `peer`, evaluated now: it
+/// carries the `member(true)` authority fact and its device binding holds for `peer`. Whole-node.
+fn is_member(cap: &Cap, root: NodeId, peer: NodeId) -> bool {
+    verify_member_at_root(cap, SystemTime::now(), peer, root).is_ok()
+}
+
 /// Whether `cap` grants `service` rooted at `root` for the proven dialer `peer`, evaluated now. The `peer`
-/// is bound into the request so a device-bound membership badge admits only its device; an unbound cap
-/// ignores it.
+/// is bound into the request so a device-bound cap admits only its device; an unbound slip ignores it.
 fn grants(cap: &Cap, root: NodeId, service: &Service, peer: NodeId) -> bool {
     verify_at_root(
         cap,

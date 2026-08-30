@@ -18,26 +18,10 @@ impl Service {
     /// The maximum length of a service name, in bytes. Bounded so a name cannot bloat a token.
     pub const MAX_LEN: usize = 128;
 
-    /// The reserved service a membership badge grants: `theia:member`.
-    ///
-    /// A cap minted for this service is not access to a named service but a claim of MEMBERSHIP: "the
-    /// bearer is one of my devices." A family gate honors it as whole-node admission. Only the signing
-    /// identity can mint one (minting needs the root secret), so a delegated capability can never become a
-    /// membership badge: attenuation only ever adds checks, so a cap for some other service can never come
-    /// to grant `theia:member`. The `theia:` prefix is reserved for such protocol services, kept distinct
-    /// from user service names like `ssh` or `web`.
-    pub const MEMBERSHIP: &str = "theia:member";
-
     /// The service name as a string slice.
     pub fn as_str(&self) -> &str {
         let Self(name) = self;
         name
-    }
-
-    /// The membership service, [`Service::MEMBERSHIP`]. Infallible: the constant is a valid name by
-    /// construction (a test pins that it parses), so this needs no error path.
-    pub fn membership() -> Self {
-        Self(Self::MEMBERSHIP.to_owned())
     }
 }
 

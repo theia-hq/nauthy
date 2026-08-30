@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use crate::NodeId;
-use crate::cap::{Cap, CapError, Identity, Request};
+use crate::cap::{Cap, CapError, Identity, Request, verify_member_at_root};
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -72,43 +72,10 @@ fn cap_does_not_verify_against_a_different_identity() {
 }
 
 #[test]
-fn the_membership_constant_is_a_valid_service_name() {
-    // membership() builds the Service directly from the constant; pin that the constant parses so the
-    // infallible constructor can never yield a malformed service name.
-    let parsed: Service = Service::MEMBERSHIP
-        .parse()
-        .expect("membership name is valid");
-    assert_eq!(parsed, Service::membership());
-    assert_eq!(Service::membership().as_str(), "theia:member");
-}
-
-#[test]
-fn a_membership_badge_is_a_cap_for_the_reserved_service() {
-    // A membership badge is a cap minted for the reserved `theia:member` service: the signet stamps a
-    // device as its own. It verifies AS membership (a family gate honors that as whole-node admission), but
-    // is not itself a grant to any named service -- membership is a distinct claim from a delegated cap.
-    let signet = identity(1);
-    let badge = signet
-        .mint(&Service::membership(), at(3600))
-        .expect("mint membership badge");
-    assert!(
-        signet.verify(&badge, &request("theia:member", 0)).is_ok(),
-        "a badge grants the membership service"
-    );
-    assert!(
-        matches!(
-            signet.verify(&badge, &request("ssh", 0)),
-            Err(CapError::Denied(_))
-        ),
-        "a membership badge is not itself an ssh grant"
-    );
-}
-
-#[test]
 fn a_bound_membership_badge_admits_only_its_device() {
-    // mint_member binds the badge to a specific device: it grants membership when the proven dialer IS that
-    // device, and no one else. A badge lifted onto another key (a leaked blob, a copied secret handed to the
-    // wrong machine) verifies against no one -- non-transferable by construction.
+    // mint_member stamps a device as the signet's own: a `member(true)` authority fact, bound to the
+    // device. The membership question grants when the proven dialer IS that device, and no one else -- a
+    // badge replayed from a different key verifies against no one, non-transferable by construction.
     let signet = identity(1);
     let device: NodeId = identity(2).node_id();
     let stranger: NodeId = identity(3).node_id();
@@ -117,25 +84,59 @@ fn a_bound_membership_badge_admits_only_its_device() {
         .expect("mint bound badge");
 
     assert!(
-        signet
-            .verify(&badge, &bound_request("theia:member", 0, device))
-            .is_ok(),
+        verify_member_at_root(&badge, at(0), device, signet.node_id()).is_ok(),
         "the bound device's badge grants membership"
     );
     assert!(
         matches!(
-            signet.verify(&badge, &bound_request("theia:member", 0, stranger)),
+            verify_member_at_root(&badge, at(0), stranger, signet.node_id()),
             Err(CapError::Denied(_))
         ),
         "a bound badge does not grant a foreign device"
     );
+}
+
+#[test]
+fn a_service_slip_is_not_membership() {
+    // A delegated service slip carries a service check, NOT the `member(true)` authority fact, so the
+    // membership question refuses it: a friend's ssh slip can never read as whole-node admission.
+    let signet = identity(1);
+    let peer: NodeId = identity(4).node_id();
+    let slip = signet.mint(&service("ssh"), at(3600)).expect("mint slip");
     assert!(
         matches!(
-            signet.verify(&badge, &request("theia:member", 0)),
+            verify_member_at_root(&slip, at(0), peer, signet.node_id()),
             Err(CapError::Denied(_))
         ),
-        "a bound badge requires the dialer to be proven; an unbound request cannot satisfy it"
+        "a service slip must not grant membership"
     );
+}
+
+#[test]
+fn an_appended_member_fact_does_not_grant_membership() {
+    // The origin wall -- the load-bearing proof. `mint_forged_member` builds a badge whose authority block
+    // has the SAME device-binding + expiry as a real one, but asserts `member(true)` in an ATTENUATION
+    // block. The only variable is the fact's origin. The gate refuses the forged badge (appended fact is
+    // untrusted, so `allow if member(true)` never sees it) yet admits the real one -- so membership is
+    // unforgeable by a delegated holder, enforced by biscuit's origin trust, not by our prose.
+    let signet = identity(1);
+    let device: NodeId = identity(2).node_id();
+    let forged = signet
+        .mint_forged_member(device, at(3600))
+        .expect("forge a member fact in an attenuation block");
+    assert!(
+        matches!(
+            verify_member_at_root(&forged, at(0), device, signet.node_id()),
+            Err(CapError::Denied(_))
+        ),
+        "member(true) in an attenuation block must not grant -- origin wall"
+    );
+    // Same shape, same device, `member(true)` in the AUTHORITY block: this DOES grant. Isolates origin as
+    // the sole cause of the refusal above.
+    let real = signet
+        .mint_member(device, at(3600))
+        .expect("mint real badge");
+    assert!(verify_member_at_root(&real, at(0), device, signet.node_id()).is_ok());
 }
 
 #[test]

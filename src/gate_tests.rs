@@ -31,13 +31,6 @@ fn hour() -> SystemTime {
     expires_in(Duration::from_secs(3600))
 }
 
-/// A membership badge minted by `seed`'s signet: a cap granting the reserved membership service.
-fn badge(seed: u8) -> Cap {
-    identity(seed)
-        .mint(&Service::membership(), hour())
-        .expect("mint badge")
-}
-
 /// A device-bound membership badge minted by `seed`'s signet for `device` (see `Identity::mint_member`).
 fn bound_badge(seed: u8, device: NodeId) -> Cap {
     identity(seed)
@@ -90,23 +83,6 @@ fn family_refuses_when_no_token_is_presented() {
 }
 
 #[test]
-fn family_admits_a_membership_badge_to_any_service_regardless_of_dialer() {
-    // A device presents its badge and is admitted whole-node (any service asked). The dialer's own key is
-    // irrelevant: the token, not who carries it, is the authority.
-    let gate = family_gate(1);
-    let badge = badge(1);
-    let stranger = identity(7).node_id();
-    assert_eq!(
-        gate.admit(stranger, Some(&badge), &service("ssh")),
-        Decision::Admit
-    );
-    assert_eq!(
-        gate.admit(stranger, Some(&badge), &service("web")),
-        Decision::Admit
-    );
-}
-
-#[test]
 fn family_admits_a_bound_badge_only_from_its_device() {
     // A device-bound badge (mint_member) is non-transferable: the family gate admits it whole-node ONLY when
     // the proven dialer is the bound device. The same badge presented by any other key is refused, so a
@@ -150,7 +126,11 @@ fn family_refuses_a_token_from_a_foreign_signet() {
     // A badge or slip minted by a different signet is refused: the gate trusts exactly one key.
     let gate = family_gate(1);
     assert_eq!(
-        gate.admit(some_peer(), Some(&badge(2)), &service("ssh")),
+        gate.admit(
+            some_peer(),
+            Some(&bound_badge(2, some_peer())),
+            &service("ssh")
+        ),
         Decision::Refuse(Refusal::NotGranted)
     );
     assert_eq!(
@@ -203,7 +183,7 @@ fn family_can_trust_a_foreign_signet_the_ci_model() {
     // admitted; a stranger's token is refused.
     let owner = identity(5);
     let gate = Gate::Family(owner.node_id(), Box::new(Denylist::empty(PathBuf::new())));
-    let owned = owner.mint(&Service::membership(), hour()).expect("mint");
+    let owned = owner.mint_member(some_peer(), hour()).expect("mint");
     assert_eq!(
         gate.admit(some_peer(), Some(&owned), &service("ssh")),
         Decision::Admit
