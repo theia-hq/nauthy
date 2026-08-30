@@ -5,7 +5,7 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use crate::NodeId;
-use crate::cap::{Cap, CapError, Identity, Request, verify_member_at_root};
+use crate::cap::{Cap, CapError, Identity, Request};
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -84,12 +84,12 @@ fn a_bound_membership_badge_admits_only_its_device() {
         .expect("mint bound badge");
 
     assert!(
-        verify_member_at_root(&badge, at(0), device, signet.node_id()).is_ok(),
+        badge.verify_member_at_root(at(0), device, signet.node_id()).is_ok(),
         "the bound device's badge grants membership"
     );
     assert!(
         matches!(
-            verify_member_at_root(&badge, at(0), stranger, signet.node_id()),
+            badge.verify_member_at_root(at(0), stranger, signet.node_id()),
             Err(CapError::Denied(_))
         ),
         "a bound badge does not grant a foreign device"
@@ -105,7 +105,7 @@ fn a_service_slip_is_not_membership() {
     let slip = signet.mint(&service("ssh"), at(3600)).expect("mint slip");
     assert!(
         matches!(
-            verify_member_at_root(&slip, at(0), peer, signet.node_id()),
+            slip.verify_member_at_root(at(0), peer, signet.node_id()),
             Err(CapError::Denied(_))
         ),
         "a service slip must not grant membership"
@@ -126,7 +126,7 @@ fn an_appended_member_fact_does_not_grant_membership() {
         .expect("forge a member fact in an attenuation block");
     assert!(
         matches!(
-            verify_member_at_root(&forged, at(0), device, signet.node_id()),
+            forged.verify_member_at_root(at(0), device, signet.node_id()),
             Err(CapError::Denied(_))
         ),
         "member(true) in an attenuation block must not grant -- origin wall"
@@ -136,7 +136,7 @@ fn an_appended_member_fact_does_not_grant_membership() {
     let real = signet
         .mint_member(device, at(3600))
         .expect("mint real badge");
-    assert!(verify_member_at_root(&real, at(0), device, signet.node_id()).is_ok());
+    assert!(real.verify_member_at_root(at(0), device, signet.node_id()).is_ok());
 }
 
 #[test]

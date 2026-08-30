@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::cap::{Cap, Request, verify_at_root, verify_member_at_root};
+use crate::cap::{Cap, Request};
 use crate::revocations::Denylist;
 use crate::{NodeId, Service};
 
@@ -89,7 +89,7 @@ pub struct Admitted(());
 /// requested `service`. One signature, two meanings: a device carries a MEMBERSHIP badge (a `member(true)`
 /// authority fact, whole-node), a delegated friend carries a SLIP (a check for the requested service);
 /// either authorizes. The two are distinct questions (membership is not a service name), so a slip can
-/// never be widened into whole-node admission (see [`verify_member_at_root`]).
+/// never be widened into whole-node admission (see [`Cap::verify_member_at_root`]).
 fn admit_family(
     root: NodeId,
     denylist: &Denylist,
@@ -114,18 +114,14 @@ fn admit_family(
 /// Whether `cap` is a MEMBERSHIP badge rooted at `root` for the proven dialer `peer`, evaluated now: it
 /// carries the `member(true)` authority fact and its device binding holds for `peer`. Whole-node.
 fn is_member(cap: &Cap, root: NodeId, peer: NodeId) -> bool {
-    verify_member_at_root(cap, SystemTime::now(), peer, root).is_ok()
+    cap.verify_member_at_root(SystemTime::now(), peer, root).is_ok()
 }
 
 /// Whether `cap` grants `service` rooted at `root` for the proven dialer `peer`, evaluated now. The `peer`
 /// is bound into the request so a device-bound cap admits only its device; an unbound slip ignores it.
 fn grants(cap: &Cap, root: NodeId, service: &Service, peer: NodeId) -> bool {
-    verify_at_root(
-        cap,
-        &Request::now(Service::clone(service)).bound_to(peer),
-        root,
-    )
-    .is_ok()
+    cap.verify_at_root(&Request::now(Service::clone(service)).bound_to(peer), root)
+        .is_ok()
 }
 
 /// The gate's ruling on a connection attempt.

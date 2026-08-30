@@ -114,7 +114,7 @@ impl Identity {
     /// badge (attenuation only adds checks, [`Cap::attenuate`]).
     pub fn mint_member(&self, bound_to: NodeId, expiry: SystemTime) -> Result<Cap, CapError> {
         // Membership is a STRUCTURAL fact in the authority block, not a service name. `member(true)` is
-        // asserted here and checked by the gate's `allow if member(true)` query ([`verify_member_at_root`]).
+        // asserted here and checked by the gate's `allow if member(true)` query ([`Cap::verify_member_at_root`]).
         // Because biscuit only trusts facts from the authority block (origin 0), a fact added in an
         // attenuation block is NEVER visible to that query, so a delegated service slip can never be
         // widened into membership, enforced by the crypto, not by a reserved name. And `Identity::mint`
@@ -145,76 +145,79 @@ impl Identity {
     /// service mismatch, an expired token, or a token narrowed past the request is a denial. Returns this
     /// node's [`NodeId`] on success so a caller can log which identity authorized the grant.
     pub fn verify(&self, cap: &Cap, request: &Request) -> Result<NodeId, CapError> {
-        verify_at_root(cap, request, self.node_id())
+        cap.verify_at_root(request, self.node_id())
     }
 }
 
-/// Verify a presented cap grants `request` and is rooted at `root`, returning the root identity on success.
-///
-/// Verification is pure public-key: a cap's signature chain is checked against its embedded root at
-/// [`Cap::parse`], so granting a request only needs the root to match `root` and every caveat to pass. No
-/// secret is involved, which is what lets a node gate on a root it merely TRUSTS rather than owns: a CI
-/// runner accepts caps rooted at YOUR key without ever holding your secret, so a compromised runner can
-/// never mint new access (see [`crate::Gate`]). [`Identity::verify`] is the self-rooted special case.
-pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<NodeId, CapError> {
-    if cap.root != root {
-        return Err(CapError::ForeignRoot);
+impl Cap {
+    /// Verify this cap grants `request` and is rooted at `root`, returning the root identity on success.
+    ///
+    /// Verification is pure public-key: a cap's signature chain is checked against its embedded root at
+    /// [`Cap::parse`], so granting a request only needs the root to match `root` and every caveat to pass.
+    /// No secret is involved, which is what lets a node gate on a root it merely TRUSTS rather than owns: a
+    /// CI runner accepts caps rooted at YOUR key without ever holding your secret, so a compromised runner
+    /// can never mint new access (see [`crate::Gate`]). [`Identity::verify`] is the self-rooted special case.
+    pub fn verify_at_root(&self, request: &Request, root: NodeId) -> Result<NodeId, CapError> {
+        if self.root != root {
+            return Err(CapError::ForeignRoot);
+        }
+        let mut builder = authorizer!(
+            r#"
+            time({now});
+            service({service});
+            allow if true;
+            "#,
+            now = request.now,
+            service = request.service.as_str(),
+        );
+        // Inject the proven dialer as a `bound_device` fact so a device-bound membership badge (see
+        // [`Identity::mint_member`]) grants only when the peer IS the bound device. An unbound cap (a slip,
+        // or a badge with no binding block) carries no `bound_device` check and is unaffected: monotone, so
+        // presenting the extra fact can never broaden a grant.
+        if let Some(peer) = request.bound_device {
+            builder = builder
+                .fact(fact!(r#"bound_device({peer})"#, peer = peer.to_string()))
+                .map_err(CapError::Authorize)?;
+        }
+        let mut authorizer = builder.build(&self.token).map_err(CapError::Authorize)?;
+        authorizer.authorize().map_err(CapError::Denied)?;
+        Ok(self.root)
     }
-    let mut builder = authorizer!(
-        r#"
-        time({now});
-        service({service});
-        allow if true;
-        "#,
-        now = request.now,
-        service = request.service.as_str(),
-    );
-    // Inject the proven dialer as a `bound_device` fact so a device-bound membership badge (see
-    // [`Identity::mint_member`]) grants only when the peer IS the bound device. An unbound cap (a slip, or
-    // a badge with no binding block) carries no `bound_device` check and is unaffected: monotone, so
-    // presenting the extra fact can never broaden a grant.
-    if let Some(peer) = request.bound_device {
-        builder = builder
-            .fact(fact!(r#"bound_device({peer})"#, peer = peer.to_string()))
-            .map_err(CapError::Authorize)?;
-    }
-    let mut authorizer = builder.build(&cap.token).map_err(CapError::Authorize)?;
-    authorizer.authorize().map_err(CapError::Denied)?;
-    Ok(cap.root)
-}
 
-/// Verify a presented cap is a MEMBERSHIP badge rooted at `root`: it carries the `member(true)` authority
-/// fact (see [`Identity::mint_member`]) and its device binding + expiry hold for the proven `peer` at
-/// `now`. Returns the root on success.
-///
-/// This is the membership question, distinct from the service question ([`verify_at_root`]): it provides
-/// NO service fact and admits on `allow if member(true)`. Because that query runs at DEFAULT scope, only a
-/// `member` fact in the token's AUTHORITY block satisfies it: a `member` fact forged into an attenuation
-/// block lives at a higher origin, is untrusted, and never grants (biscuit's own trust semantics). So a
-/// delegated service slip (no `member` fact) can never pass here, and a service slip can never be widened
-/// into membership. A membership badge carries no service check, so honoring it is whole-node admission.
-pub fn verify_member_at_root(
-    cap: &Cap,
-    now: SystemTime,
-    peer: NodeId,
-    root: NodeId,
-) -> Result<NodeId, CapError> {
-    if cap.root != root {
-        return Err(CapError::ForeignRoot);
+    /// Verify this cap is a MEMBERSHIP badge rooted at `root`: it carries the `member(true)` authority fact
+    /// (see [`Identity::mint_member`]) and its device binding + expiry hold for the proven `peer` at `now`.
+    /// Returns the root on success.
+    ///
+    /// This is the membership question, distinct from the service question ([`Cap::verify_at_root`]): it
+    /// provides NO service fact and admits on `allow if member(true)`. Because that query runs at DEFAULT
+    /// scope, only a `member` fact in the token's AUTHORITY block satisfies it: a `member` fact forged into
+    /// an attenuation block lives at a higher origin, is untrusted, and never grants (biscuit's own trust
+    /// semantics). So a delegated service slip (no `member` fact) can never pass here, and a service slip
+    /// can never be widened into membership. A membership badge carries no service check, so honoring it is
+    /// whole-node admission.
+    pub fn verify_member_at_root(
+        &self,
+        now: SystemTime,
+        peer: NodeId,
+        root: NodeId,
+    ) -> Result<NodeId, CapError> {
+        if self.root != root {
+            return Err(CapError::ForeignRoot);
+        }
+        let mut authorizer = authorizer!(
+            r#"
+            time({now});
+            bound_device({peer});
+            allow if member(true);
+            "#,
+            now = now,
+            peer = peer.to_string(),
+        )
+        .build(&self.token)
+        .map_err(CapError::Authorize)?;
+        authorizer.authorize().map_err(CapError::Denied)?;
+        Ok(self.root)
     }
-    let mut authorizer = authorizer!(
-        r#"
-        time({now});
-        bound_device({peer});
-        allow if member(true);
-        "#,
-        now = now,
-        peer = peer.to_string(),
-    )
-    .build(&cap.token)
-    .map_err(CapError::Authorize)?;
-    authorizer.authorize().map_err(CapError::Denied)?;
-    Ok(cap.root)
 }
 
 /// A capability: a token decoded and signature-verified against the root [`NodeId`] embedded in its link.
