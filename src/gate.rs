@@ -75,7 +75,13 @@ impl Gate {
 /// returning `Ok`. A service handler that takes an `Admitted` therefore cannot be called without a gate
 /// having permitted the peer, so "authorize before serve" is enforced by the type system, not by the order
 /// of statements. It carries nothing; it exists only to be un-forgeable outside nauthy.
-#[derive(Debug, Clone, Copy)]
+///
+/// It is deliberately NOT `Copy`: a witness is a per-stream proof, not a value to duplicate across streams.
+/// It binds no peer or service, so the "authorize before serve" guarantee holds only while the admit and
+/// the serve share one stream frame; a caller that hoists the admit above a per-stream loop would reuse one
+/// witness across peers the gate never ruled on. Serve on the stream the gate just authorized, and no other.
+#[derive(Debug, Clone)]
+#[must_use = "an Admitted witness proves a gate ran; serve the stream it authorized"]
 pub struct Admitted(());
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
