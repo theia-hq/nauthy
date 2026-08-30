@@ -180,3 +180,32 @@ fn family_can_trust_a_foreign_signet_the_ci_model() {
         Decision::Refuse(Refusal::NotGranted)
     );
 }
+
+#[tokio::test]
+async fn revocation_goes_live_without_reconstructing_the_denylist() {
+    // Blocker 3: a long-running exposer holds ONE Denylist; a `tightbeam revoke` in a SEPARATE process
+    // writes the revoked id to the file. The running gate must honor it on the next check, not at the next
+    // restart. Here the same live Denylist -- never reloaded or reconstructed -- refuses a cap after a
+    // separate handle revokes it, because is_revoked re-reads the file when its mtime changed.
+    let signet = identity(1);
+    let granted = signet.mint(&service("ssh"), hour()).expect("mint");
+    let path = std::env::temp_dir().join(format!("nauthy-live-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    // The running exposer's denylist: loaded once, empty (file absent).
+    let live = Denylist::load(path.clone()).await.expect("load");
+    assert!(!live.is_revoked(&granted), "unrevoked at first");
+
+    // A separate process revokes the cap by writing the file.
+    {
+        let mut revoker = Denylist::load(path.clone()).await.expect("load");
+        revoker.revoke(&granted).await.expect("revoke");
+    }
+
+    // Without any reload/reconstruction, the running denylist now refuses it -- live revocation.
+    assert!(
+        live.is_revoked(&granted),
+        "revocation must go live without a restart"
+    );
+    let _ = std::fs::remove_file(&path);
+}

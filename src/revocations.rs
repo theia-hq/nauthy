@@ -5,9 +5,18 @@
 //! the gate refuses any presented cap whose chain includes a revoked id (the cap itself, or an ancestor it
 //! was attenuated from). Pure-offline, node-local, and it survives restarts, which a short TTL cannot: a
 //! TTL ages a leaked cap out eventually but cannot recall it now.
+//!
+//! Revocation is LIVE: [`is_revoked`](Denylist::is_revoked) re-reads the file whenever its mtime changes,
+//! so a `tightbeam revoke` in a separate process takes effect on the next connection to a long-running
+//! exposer — it does not wait for a restart. The file's mtime is the freshness signal; the reload is a
+//! small, rare read (only when the file actually changed), guarded by interior mutability so the gate's
+//! synchronous admit path stays synchronous.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::PoisonError;
+use std::time::SystemTime;
 
 use data_encoding::BASE32_NOPAD;
 
@@ -16,35 +25,67 @@ use crate::cap::Cap;
 /// A persisted set of revoked capability ids (biscuit revocation identifiers), one base32 id per line.
 ///
 /// nauthy is cross-cutting, so the file location is the consumer's to choose (tightbeam keeps its own at
-/// `~/.config/tightbeam/revoked`); this type owns only the load / revoke / check logic over a path.
+/// `~/.config/tightbeam/revoked`); this type owns only the load / revoke / check logic over a path. The
+/// loaded set is behind a [`Mutex`] with the mtime it was read at, so a check can refresh it in place when
+/// the file changed underneath a running process.
 pub struct Denylist {
     path: PathBuf,
+    state: Mutex<State>,
+}
+
+/// The loaded ids and the file mtime they were read at (`None` = the file was absent when loaded).
+struct State {
     ids: HashSet<Vec<u8>>,
+    mtime: Option<SystemTime>,
 }
 
 impl Denylist {
     /// Load the denylist from `path`; an absent file is an empty set.
-    // `core::io::ErrorKind` is still unstable (the core_io feature), so the NotFound check reads from
-    // `std`; drop this once it lands in core.
-    #[allow(clippy::std_instead_of_core)]
     pub async fn load(path: PathBuf) -> Result<Self, DenylistError> {
-        let ids = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => text
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(decode_id)
-                .collect::<Result<HashSet<Vec<u8>>, _>>()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
-            Err(error) => return Err(DenylistError::Io(error)),
-        };
-        Ok(Self { path, ids })
+        let (ids, mtime) = read_ids(&path).await?;
+        Ok(Self {
+            path,
+            state: Mutex::new(State { ids, mtime }),
+        })
     }
 
     /// Whether a presented cap is revoked: any id in its chain (the cap's own blocks, including any it
     /// inherited from the grant it was attenuated from) is on the denylist.
+    ///
+    /// Refreshes from disk first if the file changed since the last read, so a revocation written by
+    /// another process (a `tightbeam revoke`) is honored by a long-running exposer without a restart. The
+    /// mtime check is a cheap stat; the file is re-read only when it actually changed.
     pub fn is_revoked(&self, cap: &Cap) -> bool {
-        cap.revocation_ids().iter().any(|id| self.ids.contains(id))
+        let chain = cap.revocation_ids();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.refresh(&mut state);
+        chain.iter().any(|id| state.ids.contains(id))
+    }
+
+    /// Reload the ids in place if the backing file's mtime differs from what we last read. Synchronous and
+    /// on the admit hot path, so it stats every call but re-reads only on change; a read/stat error leaves
+    /// the last-known set intact (fail closed: a transient FS hiccup never silently un-revokes a cap).
+    // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+    #[allow(clippy::std_instead_of_core)]
+    fn refresh(&self, state: &mut State) {
+        let current = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta.modified().ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return,
+        };
+        if current == state.mtime {
+            return;
+        }
+        let ids = match std::fs::read_to_string(&self.path) {
+            Ok(text) => match parse_ids(&text) {
+                Ok(ids) => ids,
+                Err(_) => return,
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            Err(_) => return,
+        };
+        state.ids = ids;
+        state.mtime = current;
     }
 
     /// Revoke a cap and persist. Records the cap's narrowest block id, which denies this exact cap and
@@ -56,8 +97,22 @@ impl Denylist {
         let Some(id) = ids.pop() else {
             return Ok(());
         };
-        if self.ids.insert(id) {
+        let inserted = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.ids.insert(id)
+        };
+        if inserted {
             self.persist().await?;
+            // Adopt the mtime we just wrote so our own write does not trigger a redundant reload.
+            if let Ok(mtime) = tokio::fs::metadata(&self.path)
+                .await
+                .and_then(|meta| meta.modified())
+            {
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .mtime = Some(mtime);
+            }
         }
         Ok(())
     }
@@ -67,7 +122,10 @@ impl Denylist {
     pub fn empty(path: PathBuf) -> Self {
         Self {
             path,
-            ids: HashSet::new(),
+            state: Mutex::new(State {
+                ids: HashSet::new(),
+                mtime: None,
+            }),
         }
     }
 
@@ -82,11 +140,14 @@ impl Denylist {
                 .await
                 .map_err(DenylistError::Io)?;
         }
-        let mut lines = self
-            .ids
-            .iter()
-            .map(|id| BASE32_NOPAD.encode(id))
-            .collect::<Vec<_>>();
+        let mut lines = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state
+                .ids
+                .iter()
+                .map(|id| BASE32_NOPAD.encode(id))
+                .collect::<Vec<_>>()
+        };
         lines.sort();
         let body = lines.join("\n") + "\n";
         // Atomic replace: write a temp sibling, then rename over the target. A crash mid-write can never
@@ -99,6 +160,33 @@ impl Denylist {
             .await
             .map_err(DenylistError::Io)
     }
+}
+
+/// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file mtime.
+// `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+#[allow(clippy::std_instead_of_core)]
+async fn read_ids(path: &Path) -> Result<(HashSet<Vec<u8>>, Option<SystemTime>), DenylistError> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(text) => {
+            let ids = parse_ids(&text)?;
+            let mtime = tokio::fs::metadata(path)
+                .await
+                .ok()
+                .and_then(|meta| meta.modified().ok());
+            Ok((ids, mtime))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((HashSet::new(), None)),
+        Err(error) => Err(DenylistError::Io(error)),
+    }
+}
+
+/// Decode a denylist file body into a set of raw revocation ids.
+fn parse_ids(text: &str) -> Result<HashSet<Vec<u8>>, DenylistError> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(decode_id)
+        .collect()
 }
 
 /// Decode one base32 revocation-id line into raw bytes.
