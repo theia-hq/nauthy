@@ -106,7 +106,7 @@ impl Identity {
     /// A device badge, not a service slip: it asserts "the bearer is one of my devices", which a
     /// [`Family`](crate::Gate::Family) gate honors as whole-node admission. It is BOUND to `bound_to`, so it
     /// grants only when the *proven* dialer is that device: a badge observed in flight and replayed from a
-    /// DIFFERENT key verifies against no one. That is the binding's real job — it defends the short-lived
+    /// DIFFERENT key verifies against no one. That is the binding's real job: it defends the short-lived
     /// SELF-SIGNED badge a signet holder mints per dial against cross-key replay. It does NOT harden a
     /// badge that travels beside its own device seed (as the provisioned authkey does: whoever steals that
     /// blob already holds the seed, so binding buys nothing there). Only the signet (this identity) can mint
@@ -116,7 +116,7 @@ impl Identity {
         // Membership is a STRUCTURAL fact in the authority block, not a service name. `member(true)` is
         // asserted here and checked by the gate's `allow if member(true)` query ([`verify_member_at_root`]).
         // Because biscuit only trusts facts from the authority block (origin 0), a fact added in an
-        // attenuation block is NEVER visible to that query — so a delegated service slip can never be
+        // attenuation block is NEVER visible to that query, so a delegated service slip can never be
         // widened into membership, enforced by the crypto, not by a reserved name. And `Identity::mint`
         // (the unbound, public mint) structurally cannot emit `member`, so there is no way to mint an
         // unbound whole-node badge: the "reserved service" footgun is unrepresentable. The badge stays
@@ -170,8 +170,8 @@ pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<Node
         service = request.service.as_str(),
     );
     // Inject the proven dialer as a `bound_device` fact so a device-bound membership badge (see
-    // [`Identity::mint_member`]) grants only when the peer IS the bound device. An unbound cap — a slip, or
-    // a badge with no binding block — carries no `bound_device` check and is unaffected: monotone, so
+    // [`Identity::mint_member`]) grants only when the peer IS the bound device. An unbound cap (a slip, or
+    // a badge with no binding block) carries no `bound_device` check and is unaffected: monotone, so
     // presenting the extra fact can never broaden a grant.
     if let Some(peer) = request.bound_device {
         builder = builder
@@ -189,7 +189,7 @@ pub fn verify_at_root(cap: &Cap, request: &Request, root: NodeId) -> Result<Node
 ///
 /// This is the membership question, distinct from the service question ([`verify_at_root`]): it provides
 /// NO service fact and admits on `allow if member(true)`. Because that query runs at DEFAULT scope, only a
-/// `member` fact in the token's AUTHORITY block satisfies it — a `member` fact forged into an attenuation
+/// `member` fact in the token's AUTHORITY block satisfies it: a `member` fact forged into an attenuation
 /// block lives at a higher origin, is untrusted, and never grants (biscuit's own trust semantics). So a
 /// delegated service slip (no `member` fact) can never pass here, and a service slip can never be widened
 /// into membership. A membership badge carries no service check, so honoring it is whole-node admission.
@@ -338,7 +338,7 @@ impl Cap {
 #[cfg(test)]
 impl Identity {
     /// Test-only: forge a would-be membership badge with `member(true)` in an ATTENUATION block instead of
-    /// the authority block — exactly what an attacker would attempt. The authority block carries the SAME
+    /// the authority block, exactly what an attacker would attempt. The authority block carries the SAME
     /// device-binding and expiry checks as a real [`mint_member`](Identity::mint_member) badge, so the only
     /// variable is the origin of the `member` fact. The gate must refuse it: an appended fact is untrusted
     /// origin, so `allow if member(true)` (default scope) never sees it. This is the prosecutable proof

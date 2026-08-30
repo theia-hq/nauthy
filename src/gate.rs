@@ -18,7 +18,7 @@ use crate::{NodeId, Service};
 ///   badge (a whole-node `member` cap, "this device is mine") OR a delegated SLIP (a [`Cap`] granting the
 ///   requested service, "this friend may reach this service"). One signature, two meanings, verified
 ///   offline against one key, revocable by the [`Denylist`]. This is the wedge: trust is a single key you
-///   own, not a list of keys to keep in sync — which is why there is no allowlist gate. A signet-rooted
+///   own, not a list of keys to keep in sync, which is why there is no allowlist gate. A signet-rooted
 ///   membership badge IS the allowlist, and a better one: delegatable, attenuable, revocable, no sync.
 pub enum Gate {
     /// Admit any peer.
@@ -36,7 +36,7 @@ impl Gate {
     /// Decide whether a peer presenting an optional capability may reach `service`.
     ///
     /// [`Open`](Gate::Open) admits unconditionally. [`Family`](Gate::Family) rules on the presented token,
-    /// not the dialer (the token, not who carries it, is the authority — but device-bound so only the named
+    /// not the dialer (the token, not who carries it, is the authority, but device-bound so only the named
     /// device may present it): it admits a membership badge or a slip for `service`, rooted at the trusted
     /// signet; a missing, non-granting, or revoked token is refused with a reason.
     pub fn admit(&self, peer: NodeId, presented: Option<&Cap>, service: &Service) -> Decision {
@@ -81,7 +81,7 @@ pub struct Admitted(());
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
 /// requested `service`. One signature, two meanings: a device carries a MEMBERSHIP badge (a `member(true)`
 /// authority fact, whole-node), a delegated friend carries a SLIP (a check for the requested service);
-/// either authorizes. The two are distinct questions — membership is not a service name — so a slip can
+/// either authorizes. The two are distinct questions (membership is not a service name), so a slip can
 /// never be widened into whole-node admission (see [`verify_member_at_root`]).
 fn admit_family(
     root: NodeId,

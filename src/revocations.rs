@@ -8,7 +8,7 @@
 //!
 //! Revocation is LIVE: [`is_revoked`](Denylist::is_revoked) re-reads the file whenever its mtime changes,
 //! so a `tightbeam revoke` in a separate process takes effect on the next connection to a long-running
-//! exposer — it does not wait for a restart. The file's mtime is the freshness signal; the reload is a
+//! exposer; it does not wait for a restart. The file's mtime is the freshness signal; the reload is a
 //! small, rare read (only when the file actually changed), guarded by interior mutability so the gate's
 //! synchronous admit path stays synchronous.
 
@@ -68,7 +68,7 @@ impl Denylist {
     /// on the admit hot path, so it stats every call but re-reads only on change.
     ///
     /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
-    /// leave the last-known set intact and return. Deletion is not "the denylist is now empty" — a `rm` of
+    /// leave the last-known set intact and return. Deletion is not "the denylist is now empty": a `rm` of
     /// the file (a botched cleanup, or a local attacker) must never silently un-revoke every recalled cap.
     /// A denylist that never had a file stays empty (nothing to un-revoke); revocations only ever grow a
     /// file, and a fresh file appearing is picked up through the `Ok` stat arm below.
