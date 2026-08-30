@@ -105,10 +105,13 @@ impl Identity {
     ///
     /// A device badge, not a service slip: it asserts "the bearer is one of my devices", which a
     /// [`Family`](crate::Gate::Family) gate honors as whole-node admission. It is BOUND to `bound_to`, so it
-    /// grants only when the *proven* dialer is that device: a badge lifted onto a different key (a leaked
-    /// blob, a copied secret handed to the wrong machine) verifies against no one. Only the signet (this
-    /// identity) can mint one, since minting needs the root secret; a delegated slip can never be attenuated
-    /// into a membership badge (attenuation only adds checks, [`Cap::attenuate`]).
+    /// grants only when the *proven* dialer is that device: a badge observed in flight and replayed from a
+    /// DIFFERENT key verifies against no one. That is the binding's real job — it defends the short-lived
+    /// SELF-SIGNED badge a signet holder mints per dial against cross-key replay. It does NOT harden a
+    /// badge that travels beside its own device seed (as the provisioned authkey does: whoever steals that
+    /// blob already holds the seed, so binding buys nothing there). Only the signet (this identity) can mint
+    /// one, since minting needs the root secret; a delegated slip can never be attenuated into a membership
+    /// badge (attenuation only adds checks, [`Cap::attenuate`]).
     pub fn mint_member(&self, bound_to: NodeId, expiry: SystemTime) -> Result<Cap, CapError> {
         let token = biscuit!(
             r#"
