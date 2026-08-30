@@ -3,10 +3,10 @@
 Decide whether an already-authenticated peer may connect. You hand it a peer's public key (which the
 transport has already proven) and a policy, and it returns admit or refuse. Trust roots at a single key
 you own: your own devices and anyone you delegate to are admitted by tokens that verify against that
-key, offline, with no server, no PKI, and no allowlist to keep in sync.
+key, offline, with no server, no PKI, and no allowlist to keep in sync. Everyone else, nauthy turns away.
 
-**The name.** nauthy is the authorization layer: it holds the gate and says who gets in. The name is
-*auth* with a wink at *naughty*. Uh huh, nauthy nauthy: the part that turns peers away.
+**The name.** *nauthy* is *auth* with a wink at *naughty*: the doorkeeper that waves your own in and
+turns the naughty away.
 
 The capabilities are [biscuit](https://www.biscuitsec.org) tokens; nauthy wraps them behind a small,
 misuse-resistant API rather than hand-rolling crypto.
