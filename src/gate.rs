@@ -76,12 +76,13 @@ impl Gate {
 /// having permitted the peer, so "authorize before serve" is enforced by the type system, not by the order
 /// of statements. It carries nothing; it exists only to be un-forgeable outside nauthy.
 ///
-/// It is deliberately NOT `Copy`: a witness is a per-stream proof, not a value to duplicate across streams.
-/// It binds no peer or service, so the "authorize before serve" guarantee holds only while the admit and
-/// the serve share one stream frame; a caller that hoists the admit above a per-stream loop would reuse one
-/// witness across peers the gate never ruled on. Serve on the stream the gate just authorized, and no other.
-#[derive(Debug, Clone)]
-#[must_use = "an Admitted witness proves a gate ran; serve the stream it authorized"]
+/// It is deliberately neither `Copy` nor `Clone`: a witness is a SINGLE-USE, per-stream proof. A consumer
+/// like [`sshh::serve`] takes it BY VALUE, so minting one witness authorizes exactly one serve; it cannot be
+/// duplicated and replayed onto a second stream the gate never ruled on. It binds no peer or service, so the
+/// guarantee still relies on admit and serve sharing one stream frame (never hoist the admit above a
+/// per-stream loop), but single-use consumption removes the accidental-reuse footgun by construction.
+#[derive(Debug)]
+#[must_use = "an Admitted witness proves a gate ran; serve the one stream it authorized"]
 pub struct Admitted(());
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
