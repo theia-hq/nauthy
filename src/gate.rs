@@ -4,12 +4,12 @@ use std::time::SystemTime;
 
 use crate::cap::{Cap, Request};
 use crate::revocations::Denylist;
-use crate::{NodeId, Service};
+use crate::{Service, VerifyKey};
 
 /// An authorization policy over proven peer identities.
 ///
 /// A caller that has already PROVEN a peer's identity (a transport handshake proves the peer holds the key
-/// behind its [`NodeId`]) asks a `Gate` whether that peer may reach a service. nauthy stays above any
+/// behind its [`VerifyKey`]) asks a `Gate` whether that peer may reach a service. nauthy stays above any
 /// transport: a gate decides on *identities and tokens*, never on how the peer was reached, so it is usable
 /// wherever a peer can be named by an ed25519 key.
 ///
@@ -23,13 +23,13 @@ use crate::{NodeId, Service};
 pub enum Gate {
     /// Admit any peer.
     Open,
-    /// Admit a peer that presents a signed token rooted at the trusted signet [`NodeId`], unexpired and
+    /// Admit a peer that presents a signed token rooted at the trusted signet [`VerifyKey`], unexpired and
     /// not on the revocation [`Denylist`], granting either MEMBERSHIP (a whole-node `member` badge) or the
     /// requested SERVICE (a delegated slip). The owner's own devices carry a badge their signet signed
     /// once; a delegated friend carries a service slip; both root at the same signet and are honored here.
     /// Only the signet can mint a badge, so a delegated slip can never be attenuated into one. The denylist
     /// is boxed to keep the enum small (clippy's `large_enum_variant`).
-    Family(NodeId, Box<Denylist>),
+    Family(VerifyKey, Box<Denylist>),
 }
 
 impl Gate {
@@ -39,7 +39,7 @@ impl Gate {
     /// not the dialer (the token, not who carries it, is the authority, but device-bound so only the named
     /// device may present it): it admits a membership badge or a slip for `service`, rooted at the trusted
     /// signet; a missing, non-granting, or revoked token is refused with a reason.
-    pub fn admit(&self, peer: NodeId, presented: Option<&Cap>, service: &Service) -> Decision {
+    pub fn admit(&self, peer: VerifyKey, presented: Option<&Cap>, service: &Service) -> Decision {
         match self {
             Gate::Open => Decision::Admit,
             Gate::Family(root, denylist) => admit_family(*root, denylist, presented, service, peer),
@@ -58,7 +58,7 @@ impl Gate {
     /// precondition, not a statement order a refactor could quietly drop.
     pub fn admit_witnessed(
         &self,
-        peer: NodeId,
+        peer: VerifyKey,
         presented: Option<&Cap>,
         service: &Service,
     ) -> Result<Admitted, Refusal> {
@@ -91,11 +91,11 @@ pub struct Admitted(());
 /// either authorizes. The two are distinct questions (membership is not a service name), so a slip can
 /// never be widened into whole-node admission (see [`Cap::verify_member_at_root`]).
 fn admit_family(
-    root: NodeId,
+    root: VerifyKey,
     denylist: &Denylist,
     presented: Option<&Cap>,
     service: &Service,
-    peer: NodeId,
+    peer: VerifyKey,
 ) -> Decision {
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
@@ -113,13 +113,14 @@ fn admit_family(
 
 /// Whether `cap` is a MEMBERSHIP badge rooted at `root` for the proven dialer `peer`, evaluated now: it
 /// carries the `member(true)` authority fact and its device binding holds for `peer`. Whole-node.
-fn is_member(cap: &Cap, root: NodeId, peer: NodeId) -> bool {
-    cap.verify_member_at_root(SystemTime::now(), peer, root).is_ok()
+fn is_member(cap: &Cap, root: VerifyKey, peer: VerifyKey) -> bool {
+    cap.verify_member_at_root(SystemTime::now(), peer, root)
+        .is_ok()
 }
 
 /// Whether `cap` grants `service` rooted at `root` for the proven dialer `peer`, evaluated now. The `peer`
 /// is bound into the request so a device-bound cap admits only its device; an unbound slip ignores it.
-fn grants(cap: &Cap, root: NodeId, service: &Service, peer: NodeId) -> bool {
+fn grants(cap: &Cap, root: VerifyKey, service: &Service, peer: VerifyKey) -> bool {
     cap.verify_at_root(&Request::now(Service::clone(service)).bound_to(peer), root)
         .is_ok()
 }

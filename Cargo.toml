@@ -6,9 +6,6 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# theia
-bifrost-core = { git = "https://github.com/theia-hq/bifrost" }
-
 biscuit-auth = "6"
 data-encoding = "2"
 thiserror = "2"

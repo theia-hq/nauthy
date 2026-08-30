@@ -2,7 +2,7 @@
 //! identity, with no central authority.
 //!
 //! A [`Cap`] is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable token. Its root key is
-//! the exposer's [`NodeId`] key, so verification asks one question, "does this token chain back to the
+//! the exposer's [`VerifyKey`] key, so verification asks one question, "does this token chain back to the
 //! key I am?", answered with pure pubkey identity and no PKI, registry, or server.
 //!
 //! A cap carries two kinds of check, both *monotone*: appending a block can only ever ADD checks, never
@@ -11,7 +11,7 @@
 //! - a **service** check (`check if service($s), $s == "ssh"`): the token is usable only for that service.
 //! - an **expiry** check (`check if time($t), $t <= <expiry>`): the token is usable only until that time.
 //!
-//! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the exposer's [`NodeId`] (its public
+//! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the exposer's [`VerifyKey`] (its public
 //! identity, never a secret) alongside the token, so any holder can decode, attenuate, and hand it off
 //! entirely offline, and a connector learns which node to dial from the link alone.
 //!
@@ -35,13 +35,13 @@ use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use data_encoding::BASE32_NOPAD;
 
-use crate::NodeId;
+use crate::VerifyKey;
 use crate::service::Service;
 
 /// The `sheer:` link scheme prefixing an encoded [`Cap`]. A share-link is `sheer:<node-id>.<base32>`.
 pub const SCHEME: &str = "sheer:";
 
-/// The separator between the embedded root [`NodeId`] and the token body inside a link.
+/// The separator between the embedded root [`VerifyKey`] and the token body inside a link.
 const SEPARATOR: char = '.';
 
 /// The maximum encoded token length [`Cap::parse`] accepts (~8 KiB decoded). A capability is a small
@@ -53,10 +53,10 @@ const MAX_ENCODED_LEN: usize = 13_200;
 /// chain. Verification is O(blocks) and a legitimate chain is short, so a many-block token is refused.
 const MAX_BLOCKS: usize = 16;
 
-/// An exposer's signing identity: the ed25519 keypair whose public half is a [`NodeId`].
+/// An exposer's signing identity: the ed25519 keypair whose public half is a [`VerifyKey`].
 ///
 /// This is the root of every cap it mints. Reconstructed from the exposer's persisted 32-byte secret so
-/// caps survive across runs, and it is the same key the transport binds under, so the [`NodeId`] a cap
+/// caps survive across runs, and it is the same key the transport binds under, so the [`VerifyKey`] a cap
 /// roots at *is* the node peers dial. Holds secret key material, so it never derives `Debug`/`Clone`; its
 /// bytes are wiped by [`biscuit_auth`] on drop.
 pub struct Identity {
@@ -66,7 +66,7 @@ pub struct Identity {
 impl Identity {
     /// Build the signing identity from a raw 32-byte ed25519 secret (the persisted node secret).
     ///
-    /// The one place a secret enters the cap layer. The public half equals this node's [`NodeId`] key,
+    /// The one place a secret enters the cap layer. The public half equals this node's [`VerifyKey`] key,
     /// so a cap minted here verifies against the identity peers already reach.
     pub fn from_secret(secret: &[u8; 32]) -> Result<Self, CapError> {
         let private = PrivateKey::from_bytes(secret, Algorithm::Ed25519).map_err(CapError::Key)?;
@@ -75,8 +75,8 @@ impl Identity {
         })
     }
 
-    /// This identity's [`NodeId`]: the public key a cap roots at and peers dial.
-    pub fn node_id(&self) -> NodeId {
+    /// This identity's [`VerifyKey`]: the public key a cap roots at and peers dial.
+    pub fn node_id(&self) -> VerifyKey {
         node_id_of(&self.root)
     }
 
@@ -112,7 +112,7 @@ impl Identity {
     /// blob already holds the seed, so binding buys nothing there). Only the signet (this identity) can mint
     /// one, since minting needs the root secret; a delegated slip can never be attenuated into a membership
     /// badge (attenuation only adds checks, [`Cap::attenuate`]).
-    pub fn mint_member(&self, bound_to: NodeId, expiry: SystemTime) -> Result<Cap, CapError> {
+    pub fn mint_member(&self, bound_to: VerifyKey, expiry: SystemTime) -> Result<Cap, CapError> {
         // Membership is a STRUCTURAL fact in the authority block, not a service name. `member(true)` is
         // asserted here and checked by the gate's `allow if member(true)` query ([`Cap::verify_member_at_root`]).
         // Because biscuit only trusts facts from the authority block (origin 0), a fact added in an
@@ -143,8 +143,8 @@ impl Identity {
     /// Grants iff the cap is rooted at this node's key AND every check in the chain passes for the
     /// request: the service matches and the token is unexpired at `request.now`. A foreign root, a
     /// service mismatch, an expired token, or a token narrowed past the request is a denial. Returns this
-    /// node's [`NodeId`] on success so a caller can log which identity authorized the grant.
-    pub fn verify(&self, cap: &Cap, request: &Request) -> Result<NodeId, CapError> {
+    /// node's [`VerifyKey`] on success so a caller can log which identity authorized the grant.
+    pub fn verify(&self, cap: &Cap, request: &Request) -> Result<VerifyKey, CapError> {
         cap.verify_at_root(request, self.node_id())
     }
 }
@@ -157,7 +157,11 @@ impl Cap {
     /// No secret is involved, which is what lets a node gate on a root it merely TRUSTS rather than owns: a
     /// CI runner accepts caps rooted at YOUR key without ever holding your secret, so a compromised runner
     /// can never mint new access (see [`crate::Gate`]). [`Identity::verify`] is the self-rooted special case.
-    pub fn verify_at_root(&self, request: &Request, root: NodeId) -> Result<NodeId, CapError> {
+    pub fn verify_at_root(
+        &self,
+        request: &Request,
+        root: VerifyKey,
+    ) -> Result<VerifyKey, CapError> {
         if self.root != root {
             return Err(CapError::ForeignRoot);
         }
@@ -198,9 +202,9 @@ impl Cap {
     pub fn verify_member_at_root(
         &self,
         now: SystemTime,
-        peer: NodeId,
-        root: NodeId,
-    ) -> Result<NodeId, CapError> {
+        peer: VerifyKey,
+        root: VerifyKey,
+    ) -> Result<VerifyKey, CapError> {
         if self.root != root {
             return Err(CapError::ForeignRoot);
         }
@@ -220,19 +224,19 @@ impl Cap {
     }
 }
 
-/// A capability: a token decoded and signature-verified against the root [`NodeId`] embedded in its link.
+/// A capability: a token decoded and signature-verified against the root [`VerifyKey`] embedded in its link.
 ///
 /// Holding a `Cap` proves the bytes were a biscuit that chains to `root`; whether it *grants* a specific
 /// request (right service, unexpired) is a separate question answered by [`Identity::verify`].
 pub struct Cap {
-    root: NodeId,
+    root: VerifyKey,
     token: Biscuit,
 }
 
 impl Cap {
     /// Decode a cap from a `sheer:<node-id>.<base32>` link.
     ///
-    /// parse-don't-validate at the wire edge: rejects a bad scheme, a malformed [`NodeId`], bad base32,
+    /// parse-don't-validate at the wire edge: rejects a bad scheme, a malformed [`VerifyKey`], bad base32,
     /// or bytes whose signature chain does not check against the embedded root. It does NOT evaluate the
     /// caveats (service, expiry); that is [`Identity::verify`]'s job at connect time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
@@ -245,13 +249,13 @@ impl Cap {
         if encoded.len() > MAX_ENCODED_LEN {
             return Err(CapError::TooLarge);
         }
-        let root = root.parse::<NodeId>().map_err(|_| CapError::Malformed)?;
+        let root = root.parse::<VerifyKey>().map_err(|_| CapError::Malformed)?;
         let bytes = BASE32_NOPAD
             .decode(encoded.to_uppercase().as_bytes())
             .map_err(|_| CapError::Encoding)?;
         let public = root_key(root)?;
         // Decoding with the embedded root verifies the signature chain back to it; a token that does not
-        // chain to the NodeId it claims is rejected here, before any caveat is ever considered.
+        // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
         let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Malformed)?;
         // A well-formed but deeply-attenuated token is still a DoS via O(blocks) work; a legitimate
         // delegation chain is short, so bound the block count too.
@@ -261,9 +265,9 @@ impl Cap {
         Ok(Self { root, token })
     }
 
-    /// The identity this cap is rooted at: the [`NodeId`] a connector should dial and the exposer must be
+    /// The identity this cap is rooted at: the [`VerifyKey`] a connector should dial and the exposer must be
     /// to verify it.
-    pub fn root(&self) -> NodeId {
+    pub fn root(&self) -> VerifyKey {
         self.root
     }
 
@@ -349,7 +353,7 @@ impl Identity {
     /// only append checks, never facts, so this reaches past the API on purpose).
     pub(crate) fn mint_forged_member(
         &self,
-        bound_to: NodeId,
+        bound_to: VerifyKey,
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
         let token = biscuit!(
@@ -384,7 +388,7 @@ pub struct Request {
     /// The proven identity of the dialer, when known. A device-bound membership badge (see
     /// [`Identity::mint_member`]) grants only when this matches the badge's bound device; `None`, or a cap
     /// with no binding, skips the check.
-    pub bound_device: Option<NodeId>,
+    pub bound_device: Option<VerifyKey>,
 }
 
 impl Request {
@@ -399,7 +403,7 @@ impl Request {
 
     /// Bind this request to the proven dialer `peer`, so a device-bound badge admits only that device. The
     /// gate sets this from the identity the transport handshake proved.
-    pub fn bound_to(mut self, peer: NodeId) -> Self {
+    pub fn bound_to(mut self, peer: VerifyKey) -> Self {
         self.bound_device = Some(peer);
         self
     }
@@ -417,17 +421,17 @@ pub fn expires_in(duration: Duration) -> SystemTime {
 /// practice, near enough that `SystemTime` arithmetic never overflows.
 const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
-/// The [`NodeId`] whose key is this keypair's public half.
-fn node_id_of(root: &KeyPair) -> NodeId {
-    let mut bytes = [0u8; NodeId::KEY_LEN];
-    // biscuit's PublicKey serializes to exactly 32 ed25519 bytes; the copy pins that into a NodeId key.
+/// The [`VerifyKey`] that is this keypair's public half.
+fn node_id_of(root: &KeyPair) -> VerifyKey {
+    let mut bytes = [0u8; VerifyKey::LEN];
+    // biscuit's PublicKey serializes to exactly 32 ed25519 bytes; the copy pins that into a VerifyKey.
     bytes.copy_from_slice(&root.public().to_bytes());
-    NodeId::new(bifrost_core::CryptoKind::Ed25519, bytes)
+    VerifyKey::new(bytes)
 }
 
-/// The biscuit root public key for a [`NodeId`]: the same ed25519 key, read as a verifier root.
-fn root_key(node: NodeId) -> Result<PublicKey, CapError> {
-    PublicKey::from_bytes(node.key(), Algorithm::Ed25519).map_err(CapError::Key)
+/// The biscuit root public key for a [`VerifyKey`]: the same ed25519 key, read as a verifier root.
+fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
+    PublicKey::from_bytes(node.bytes(), Algorithm::Ed25519).map_err(CapError::Key)
 }
 
 /// Why a capability operation failed.

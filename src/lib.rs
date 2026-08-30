@@ -2,7 +2,7 @@
 //! decide whether it may connect, with no server, no PKI, and no registry.
 //!
 //! Authorization here is policy on *proven* identities, not crypto: a transport handshake has already
-//! proven the peer holds the private key behind its [`NodeId`], so the question is only whether that
+//! proven the peer holds the private key behind its [`VerifyKey`], so the question is only whether that
 //! identity is permitted. nauthy sits above the transport and never reaches out itself, so it is usable
 //! wherever a peer can be named by an ed25519 key, theia or not.
 //!
@@ -19,6 +19,7 @@
 
 mod cap;
 mod gate;
+mod key;
 mod revocations;
 mod service;
 
@@ -27,9 +28,8 @@ mod cap_tests;
 #[cfg(test)]
 mod gate_tests;
 
-pub use bifrost_core::NodeId;
-
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in};
 pub use crate::gate::{Admitted, Decision, Gate, Refusal};
+pub use crate::key::{KeyParseError, VerifyKey};
 pub use crate::revocations::{Denylist, DenylistError};
 pub use crate::service::{Service, ServiceParseError};

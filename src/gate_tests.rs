@@ -4,7 +4,7 @@ use core::time::Duration;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::NodeId;
+use crate::VerifyKey;
 use crate::cap::{Cap, Identity, expires_in};
 use crate::gate::{Decision, Gate, Refusal};
 use crate::revocations::Denylist;
@@ -31,7 +31,7 @@ fn hour() -> SystemTime {
 }
 
 /// A device-bound membership badge minted by `seed`'s signet for `device` (see `Identity::mint_member`).
-fn bound_badge(seed: u8, device: NodeId) -> Cap {
+fn bound_badge(seed: u8, device: VerifyKey) -> Cap {
     identity(seed)
         .mint_member(device, hour())
         .expect("mint bound badge")
@@ -44,7 +44,7 @@ fn slip(seed: u8, svc: &str) -> Cap {
         .expect("mint slip")
 }
 
-fn some_peer() -> NodeId {
+fn some_peer() -> VerifyKey {
     identity(9).node_id()
 }
 

@@ -4,7 +4,7 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
-use crate::NodeId;
+use crate::VerifyKey;
 use crate::cap::{Cap, CapError, Identity, Request};
 use crate::service::Service;
 
@@ -35,7 +35,7 @@ fn request(name: &str, now_secs: i64) -> Request {
 }
 
 /// A request carrying the proven dialer, for verifying device-bound membership badges.
-fn bound_request(name: &str, now_secs: i64, peer: NodeId) -> Request {
+fn bound_request(name: &str, now_secs: i64, peer: VerifyKey) -> Request {
     request(name, now_secs).bound_to(peer)
 }
 
@@ -77,14 +77,16 @@ fn a_bound_membership_badge_admits_only_its_device() {
     // device. The membership question grants when the proven dialer IS that device, and no one else -- a
     // badge replayed from a different key verifies against no one, non-transferable by construction.
     let signet = identity(1);
-    let device: NodeId = identity(2).node_id();
-    let stranger: NodeId = identity(3).node_id();
+    let device: VerifyKey = identity(2).node_id();
+    let stranger: VerifyKey = identity(3).node_id();
     let badge = signet
         .mint_member(device, at(3600))
         .expect("mint bound badge");
 
     assert!(
-        badge.verify_member_at_root(at(0), device, signet.node_id()).is_ok(),
+        badge
+            .verify_member_at_root(at(0), device, signet.node_id())
+            .is_ok(),
         "the bound device's badge grants membership"
     );
     assert!(
@@ -101,7 +103,7 @@ fn a_service_slip_is_not_membership() {
     // A delegated service slip carries a service check, NOT the `member(true)` authority fact, so the
     // membership question refuses it: a friend's ssh slip can never read as whole-node admission.
     let signet = identity(1);
-    let peer: NodeId = identity(4).node_id();
+    let peer: VerifyKey = identity(4).node_id();
     let slip = signet.mint(&service("ssh"), at(3600)).expect("mint slip");
     assert!(
         matches!(
@@ -120,7 +122,7 @@ fn an_appended_member_fact_does_not_grant_membership() {
     // untrusted, so `allow if member(true)` never sees it) yet admits the real one -- so membership is
     // unforgeable by a delegated holder, enforced by biscuit's origin trust, not by our prose.
     let signet = identity(1);
-    let device: NodeId = identity(2).node_id();
+    let device: VerifyKey = identity(2).node_id();
     let forged = signet
         .mint_forged_member(device, at(3600))
         .expect("forge a member fact in an attenuation block");
@@ -136,7 +138,10 @@ fn an_appended_member_fact_does_not_grant_membership() {
     let real = signet
         .mint_member(device, at(3600))
         .expect("mint real badge");
-    assert!(real.verify_member_at_root(at(0), device, signet.node_id()).is_ok());
+    assert!(
+        real.verify_member_at_root(at(0), device, signet.node_id())
+            .is_ok()
+    );
 }
 
 #[test]
@@ -144,7 +149,7 @@ fn an_unbound_cap_ignores_the_bound_device_fact() {
     // A plain slip carries no binding block, so injecting a bound_device fact is monotone and cannot change
     // its grant: an ordinary ssh slip still grants regardless of which dialer presents it.
     let exposer = identity(1);
-    let anyone: NodeId = identity(9).node_id();
+    let anyone: VerifyKey = identity(9).node_id();
     let slip = exposer.mint(&service("ssh"), at(3600)).expect("mint slip");
     assert!(
         exposer
