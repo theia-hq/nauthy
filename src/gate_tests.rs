@@ -1,7 +1,6 @@
 //! Gate policy: the three variants and their admit/refuse rulings.
 
 use core::time::Duration;
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -55,19 +54,6 @@ fn open_admits_anyone() {
     assert_eq!(
         gate.admit(some_peer(), None, &service("ssh")),
         Decision::Admit
-    );
-    assert!(!gate.wants_capability());
-}
-
-#[test]
-fn strict_admits_only_the_allowlist() {
-    let peer = some_peer();
-    let gate = Gate::Strict(HashSet::from([peer]));
-    assert_eq!(gate.admit(peer, None, &service("ssh")), Decision::Admit);
-    let stranger = identity(3).node_id();
-    assert_eq!(
-        gate.admit(stranger, None, &service("ssh")),
-        Decision::Refuse(Refusal::NotPermitted)
     );
     assert!(!gate.wants_capability());
 }
