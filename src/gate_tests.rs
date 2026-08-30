@@ -209,3 +209,27 @@ async fn revocation_goes_live_without_reconstructing_the_denylist() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn a_deleted_denylist_file_does_not_un_revoke() {
+    // Fail closed: deleting the backing file is NOT "the denylist is empty". A running exposer that revoked
+    // a cap must keep refusing it even if the file disappears (a botched cleanup, or a local attacker who
+    // `rm`s it to un-revoke a lost device). The last-known set stands until a real file replaces it.
+    let signet = identity(1);
+    let granted = signet.mint(&service("ssh"), hour()).expect("mint");
+    let path = std::env::temp_dir().join(format!("nauthy-delete-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let mut live = Denylist::load(path.clone()).await.expect("load");
+    live.revoke(&granted).await.expect("revoke");
+    assert!(live.is_revoked(&granted), "revoked after the write");
+
+    // Delete the file out from under the running denylist.
+    std::fs::remove_file(&path).expect("remove");
+
+    assert!(
+        live.is_revoked(&granted),
+        "a deleted denylist file must not silently un-revoke a recalled cap"
+    );
+    let _ = std::fs::remove_file(&path);
+}

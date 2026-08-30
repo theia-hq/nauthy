@@ -33,19 +33,21 @@ pub struct Denylist {
     state: Mutex<State>,
 }
 
-/// The loaded ids and the file mtime they were read at (`None` = the file was absent when loaded).
+/// The loaded ids and the `(mtime, len)` stamp of the file they were read at (`None` = the file was absent
+/// when loaded). The length pairs with mtime so a change within one coarse mtime tick is still seen: a
+/// revoke only ever GROWS the file, so a differing length is a reliable "changed" signal on its own.
 struct State {
     ids: HashSet<Vec<u8>>,
-    mtime: Option<SystemTime>,
+    stamp: Option<(SystemTime, u64)>,
 }
 
 impl Denylist {
     /// Load the denylist from `path`; an absent file is an empty set.
     pub async fn load(path: PathBuf) -> Result<Self, DenylistError> {
-        let (ids, mtime) = read_ids(&path).await?;
+        let (ids, stamp) = read_ids(&path).await?;
         Ok(Self {
             path,
-            state: Mutex::new(State { ids, mtime }),
+            state: Mutex::new(State { ids, stamp }),
         })
     }
 
@@ -63,17 +65,22 @@ impl Denylist {
     }
 
     /// Reload the ids in place if the backing file's mtime differs from what we last read. Synchronous and
-    /// on the admit hot path, so it stats every call but re-reads only on change; a read/stat error leaves
-    /// the last-known set intact (fail closed: a transient FS hiccup never silently un-revokes a cap).
+    /// on the admit hot path, so it stats every call but re-reads only on change.
+    ///
+    /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
+    /// leave the last-known set intact and return. Deletion is not "the denylist is now empty" — a `rm` of
+    /// the file (a botched cleanup, or a local attacker) must never silently un-revoke every recalled cap.
+    /// A denylist that never had a file stays empty (nothing to un-revoke); revocations only ever grow a
+    /// file, and a fresh file appearing is picked up through the `Ok` stat arm below.
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
     fn refresh(&self, state: &mut State) {
         let current = match std::fs::metadata(&self.path) {
-            Ok(meta) => meta.modified().ok(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(meta) => meta.modified().ok().map(|mtime| (mtime, meta.len())),
+            // Missing file: keep the last-known set. If one was ever loaded, this is deletion, not empty.
             Err(_) => return,
         };
-        if current == state.mtime {
+        if current == state.stamp {
             return;
         }
         let ids = match std::fs::read_to_string(&self.path) {
@@ -81,11 +88,11 @@ impl Denylist {
                 Ok(ids) => ids,
                 Err(_) => return,
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+            // Raced away between stat and read: keep last-known rather than dropping revocations.
             Err(_) => return,
         };
         state.ids = ids;
-        state.mtime = current;
+        state.stamp = current;
     }
 
     /// Revoke a cap and persist. Records the cap's narrowest block id, which denies this exact cap and
@@ -103,15 +110,15 @@ impl Denylist {
         };
         if inserted {
             self.persist().await?;
-            // Adopt the mtime we just wrote so our own write does not trigger a redundant reload.
-            if let Ok(mtime) = tokio::fs::metadata(&self.path)
+            // Adopt the (mtime, len) we just wrote so our own write does not trigger a redundant reload.
+            if let Ok((mtime, len)) = tokio::fs::metadata(&self.path)
                 .await
-                .and_then(|meta| meta.modified())
+                .and_then(|meta| Ok((meta.modified()?, meta.len())))
             {
                 self.state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .mtime = Some(mtime);
+                    .stamp = Some((mtime, len));
             }
         }
         Ok(())
@@ -124,7 +131,7 @@ impl Denylist {
             path,
             state: Mutex::new(State {
                 ids: HashSet::new(),
-                mtime: None,
+                stamp: None,
             }),
         }
     }
@@ -162,18 +169,22 @@ impl Denylist {
     }
 }
 
-/// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file mtime.
+/// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file's
+/// `(mtime, len)` stamp (`None` if absent).
 // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
 #[allow(clippy::std_instead_of_core)]
-async fn read_ids(path: &Path) -> Result<(HashSet<Vec<u8>>, Option<SystemTime>), DenylistError> {
+#[allow(clippy::type_complexity)]
+async fn read_ids(
+    path: &Path,
+) -> Result<(HashSet<Vec<u8>>, Option<(SystemTime, u64)>), DenylistError> {
     match tokio::fs::read_to_string(path).await {
         Ok(text) => {
             let ids = parse_ids(&text)?;
-            let mtime = tokio::fs::metadata(path)
+            let stamp = tokio::fs::metadata(path)
                 .await
                 .ok()
-                .and_then(|meta| meta.modified().ok());
-            Ok((ids, mtime))
+                .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+            Ok((ids, stamp))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((HashSet::new(), None)),
         Err(error) => Err(DenylistError::Io(error)),
