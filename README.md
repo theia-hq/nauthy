@@ -1,8 +1,12 @@
 # nauthy
 
 Decide whether an already-authenticated peer may connect. You hand it a peer's public key (which the
-transport has already proven) and a policy, and it returns admit or refuse. The policies range from a
-fixed allowlist to bearer capabilities you can expire, narrow, and hand on without any central server.
+transport has already proven) and a policy, and it returns admit or refuse. Trust roots at a single key
+you own: your own devices and anyone you delegate to are admitted by tokens that verify against that
+key, offline, with no server, no PKI, and no allowlist to keep in sync.
+
+**The name.** nauthy is the authorization layer: it holds the gate and says who gets in. The name is
+*auth* with a wink at *naughty*. Uh huh, nauthy nauthy: the part that turns peers away.
 
 The capabilities are [biscuit](https://www.biscuitsec.org) tokens; nauthy wraps them behind a small,
 misuse-resistant API rather than hand-rolling crypto.
@@ -16,21 +20,22 @@ match gate.admit(peer_id, presented_cap, &service) {
 }
 ```
 
-> Experimental. The capability layer is v1; short-expiry is the only revocation story (see below).
+> Experimental. The capability layer is v1; revocation is a node-local denylist plus short expiry (see
+> below).
 
 ## The gate
 
-A `Gate` is the policy a server applies to an inbound, already-authenticated peer. Four variants, from
-simplest to most capable:
+A `Gate` is the policy a server applies to an inbound, already-authenticated peer. Two variants:
 
-- `Open` permits any peer that reached the key.
-- `Strict(set)` permits a fixed set of node ids: an allowlist.
-- `Paired(approvals)` permits a persisted set you grow by approving peers as they arrive.
-- `Cap(identity)` permits a peer that presents a **capability** which verifies against this node's own
-  identity for the requested service.
+- `Open` permits any peer that reached the key: the one deliberate opt-out.
+- `Family(signet)` permits a peer that presents a signed token rooted at a trusted **signet** (a
+  `NodeId` you own). One signature carries two meanings: a **membership badge** ("this is my device",
+  admitting the whole node) or a **service slip** ("this friend may reach this service"). Both root at
+  the same signet and are verified offline against it.
 
-The first three gate on *who* the peer is. The fourth gates on *what token* the peer presents, which is
-the thing an allowlist cannot do: expire, narrow, and hand on a grant, with no central authority.
+The signet is a single key you own, not a list of keys to keep in sync. A membership badge *is* the
+allowlist, and a better one: delegatable, attenuable, revocable, with nothing to synchronize. That is
+the thing a plain allowlist cannot do.
 
 ## The capability (`sheer`)
 
@@ -38,18 +43,20 @@ A `Cap` is a bearer token that carries its own grant, verifiable offline. It is 
 [biscuit](https://www.biscuitsec.org): an ed25519-signed, datalog-attenuable token. nauthy does not
 hand-roll crypto; it wraps biscuit behind a small parse-don't-validate `Cap`.
 
-The root key of a cap is the **exposer's own `NodeId`**, so verification asks one question: "does this
-token chain back to the key I am?" No PKI, no registry, no server.
+The root key of a cap is the **signet's own `NodeId`**, so verification asks one question: "does this
+token chain back to the signet I trust?" No PKI, no registry, no server.
 
-- **mint** (exposer): `Identity::from_secret(&secret)?.mint(&service, expiry)` signs a fresh cap.
+- **mint** (signet): `Identity::from_secret(&secret)?.mint(&service, expiry)` signs a fresh service
+  slip. `mint_member(device, expiry)` instead signs a membership badge bound to a specific device.
 - **attenuate** (any holder, offline): `cap.attenuate(Some(&service), Some(shorter_expiry))` appends a
-  narrower check. Monotone by construction: a block can only ADD checks, so broadening is impossible.
-- **delegate** (any holder, offline): attenuate, then hand the narrower link onward. The exposer verifies
+  narrower check. Monotone by construction: a block can only ADD checks, so broadening is impossible,
+  and a service slip can never be widened into a membership badge.
+- **delegate** (any holder, offline): attenuate, then hand the narrower link onward. The signet verifies
   the whole chain without ever seeing the delegation.
-- **verify** (exposer): `identity.verify(&cap, &request)` grants iff the cap roots at this identity, the
+- **verify** (signet): `identity.verify(&cap, &request)` grants iff the cap roots at this signet, the
   service matches, and the token is unexpired.
 
-A share-link is `sheer:<node-id>.<base32-biscuit>`: it carries the exposer's public `NodeId` alongside
+A share-link is `sheer:<node-id>.<base32-biscuit>`: it carries the signet's public `NodeId` alongside
 the token, so a holder can decode and narrow it offline, and a connector learns which node to dial from
 the link alone.
 
@@ -57,22 +64,23 @@ the link alone.
 use core::time::Duration;
 use nauthy::{Cap, Identity, Request, Service, expires_in};
 
-let exposer = Identity::from_secret(&secret)?;
-let cap = exposer.mint(&"ssh".parse::<Service>()?, expires_in(Duration::from_secs(3600)))?;
+let signet = Identity::from_secret(&secret)?;
+let cap = signet.mint(&"ssh".parse::<Service>()?, expires_in(Duration::from_secs(3600)))?;
 let link = cap.link()?; // sheer:bf01….<token>  -> hand this out
 
 // a holder narrows it, offline, before delegating
 let tighter = Cap::parse(&link)?.attenuate(None, Some(expires_in(Duration::from_secs(600))))?;
 
-// the exposer verifies a presented cap at connect time
-exposer.verify(&Cap::parse(&tighter.link()?)?, &Request::now("ssh".parse()?))?;
+// the signet verifies a presented cap at connect time
+signet.verify(&Cap::parse(&tighter.link()?)?, &Request::now("ssh".parse()?))?;
 ```
 
 ## Revocation
 
-**Open, not built.** Biscuits do not revoke cleanly. The v1 answer is **short expiry only**: the expiry
-check *is* the revocation story. A revocation-hint channel or short-expiry-plus-refresh is a later design
-point, logged, not built.
+A `Family` gate consults a node-local **denylist**: `tightbeam revoke` (or the equivalent) appends a
+token to a file the next server run reads, and a listed grant is refused offline, with no server to ask.
+Short expiry backs it up: a cap that outlives its usefulness expires on its own. Revoking a broad grant
+before it expires is the denylist's job.
 
 ## License
 

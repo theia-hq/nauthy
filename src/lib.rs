@@ -6,13 +6,12 @@
 //! identity is permitted. nauthy sits above the transport and never reaches out itself, so it is usable
 //! wherever a peer can be named by an ed25519 key, theia or not.
 //!
-//! Three policies:
+//! Two policies:
 //! - [`Gate::Open`] permits any peer.
-//! - [`Gate::Strict`] permits a fixed allowlist of keys: the signet-less floor.
 //! - [`Gate::Family`] permits a peer that *presents a signed token* ([`Cap`]) rooted at a trusted signet,
-//!   granting either MEMBERSHIP (a badge for [`Service::membership`], admitting to the whole node) or the
-//!   requested SERVICE (a delegated slip). One key you own authorizes both your own devices and anyone you
-//!   delegate to, offline and revocably: the thing `authorized_keys` cannot do.
+//!   granting either MEMBERSHIP (a whole-node `member(true)` badge) or the requested SERVICE (a delegated
+//!   slip). One key you own authorizes both your own devices and anyone you delegate to, offline and
+//!   revocably: the thing `authorized_keys` cannot do.
 //!
 //! The token is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable capability. nauthy never
 //! hand-rolls crypto; it wraps a vetted library behind a small parse-don't-validate [`Cap`] type, adds a
