@@ -33,6 +33,8 @@ A `Gate` is the policy a server applies to an inbound, already-authenticated pee
   admitting the whole node) or a **service slip** ("this friend may reach this service"). Both root at
   the same signet and are verified offline against it.
 
+Build a family gate with `Gate::family(signet, denylist)`; `Gate::Open` is the constructor for the open variant.
+
 The signet is a single key you own, not a list of keys to keep in sync. A membership badge *is* the
 allowlist, and a better one: delegatable, attenuable, revocable, with nothing to synchronize. That is
 the thing a plain allowlist cannot do.
