@@ -16,10 +16,7 @@ fn identity(seed: u8) -> Identity {
 
 /// A family gate trusting `seed`'s signet, with an empty (no-file) revocation denylist.
 fn family_gate(seed: u8) -> Gate {
-    Gate::Family(
-        identity(seed).node_id(),
-        Box::new(Denylist::empty(PathBuf::new())),
-    )
+    Gate::family(identity(seed).node_id(), Denylist::empty(PathBuf::new()))
 }
 
 fn service(name: &str) -> Service {

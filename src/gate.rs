@@ -33,6 +33,16 @@ pub enum Gate {
 }
 
 impl Gate {
+    /// Build a [`Family`](Gate::Family) gate trusting `signet`, unless a presented token is on `denylist`.
+    ///
+    /// The constructor for the boxed variant, so a caller never hand-writes the `Box::new(denylist)` the
+    /// enum's size discipline forces. The caller loads the denylist (from wherever it keeps revocations)
+    /// and passes it by value; `--public` is the caller's own choice, so [`Open`](Gate::Open) is built at
+    /// the call site, not here.
+    pub fn family(signet: VerifyKey, denylist: Denylist) -> Gate {
+        Gate::Family(signet, Box::new(denylist))
+    }
+
     /// Decide whether a peer presenting an optional capability may reach `service`.
     ///
     /// [`Open`](Gate::Open) admits unconditionally. [`Family`](Gate::Family) rules on the presented token,
