@@ -13,12 +13,31 @@
 use core::fmt;
 use core::str::FromStr;
 
+use ed25519_dalek::{Signature, VerifyingKey};
+
 use crate::VerifyKey;
 
 /// The domain-separating prefix over the signed bytes: a `MAGIC`-prefixed message this key signs can never
 /// be confused with a cap or anything else it signs, and the trailing version byte lets a later layout bump
 /// it so an old verifier refuses rather than misreads.
 const MAGIC: &[u8] = b"theia-roster\x01";
+
+/// The maximum number of members [`SignedRoster::decode`] will parse from an untrusted blob. A DoS bound: a
+/// personal fleet is tiny, and a hostile courier must not make a puller allocate for a huge count before the
+/// signature is even checked.
+const MAX_MEMBERS: usize = 4096;
+
+/// The detached signature length (ed25519).
+const SIG_LEN: usize = 64;
+
+/// Take `n` bytes from `bytes` at `*cur`, advancing the cursor, or [`RosterError::Truncated`] if the input
+/// runs out. Bounds-checked so untrusted input is a clean error, never a panic.
+fn take<'a>(bytes: &'a [u8], cur: &mut usize, n: usize) -> Result<&'a [u8], RosterError> {
+    let end = cur.checked_add(n).ok_or(RosterError::Truncated)?;
+    let slice = bytes.get(*cur..end).ok_or(RosterError::Truncated)?;
+    *cur = end;
+    Ok(slice)
+}
 
 /// A monotonically-increasing version of an operator's roster, bumped each time the snapshot is re-cut (a
 /// member added or removed). It orders two snapshots a device might see from two courier nodes: the higher
@@ -138,6 +157,128 @@ impl RosterDoc {
         }
         out
     }
+
+    /// Parse canonical bytes back into a doc, returning the doc and the number of bytes consumed. The inverse
+    /// of [`canonical_bytes`](Self::canonical_bytes), bounds-checked so untrusted input is a clean error.
+    /// Re-runs [`new`](Self::new)'s sort + dedup, so a blob with out-of-order or duplicate members is
+    /// rejected rather than trusted.
+    fn parse_canonical(bytes: &[u8]) -> Result<(Self, usize), RosterError> {
+        let mut cur = 0;
+        if take(bytes, &mut cur, MAGIC.len())? != MAGIC {
+            return Err(RosterError::BadMagic);
+        }
+        let epoch = Epoch(u64::from_be_bytes(
+            take(bytes, &mut cur, 8)?
+                .try_into()
+                .map_err(|_| RosterError::Truncated)?,
+        ));
+        let count = u32::from_be_bytes(
+            take(bytes, &mut cur, 4)?
+                .try_into()
+                .map_err(|_| RosterError::Truncated)?,
+        ) as usize;
+        if count > MAX_MEMBERS {
+            return Err(RosterError::TooManyMembers);
+        }
+        let mut members = Vec::with_capacity(count);
+        for _ in 0..count {
+            let node: [u8; VerifyKey::LEN] = take(bytes, &mut cur, VerifyKey::LEN)?
+                .try_into()
+                .map_err(|_| RosterError::Truncated)?;
+            let label_len = usize::from(u16::from_be_bytes(
+                take(bytes, &mut cur, 2)?
+                    .try_into()
+                    .map_err(|_| RosterError::Truncated)?,
+            ));
+            let label = core::str::from_utf8(take(bytes, &mut cur, label_len)?)
+                .map_err(|_| RosterError::LabelBadByte)?
+                .parse()?;
+            members.push(Member {
+                node: VerifyKey::new(node),
+                label,
+            });
+        }
+        Ok((Self::new(epoch, members)?, cur))
+    }
+}
+
+/// A [`RosterDoc`] plus a detached ed25519 signature over its canonical bytes and the key that signed it.
+/// Holding one proves NOTHING: [`verify`](SignedRoster::verify) against the signet you actually trust is the
+/// security seam, and the ONLY path from a decoded blob to a `&RosterDoc` a caller may trust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedRoster {
+    doc: RosterDoc,
+    signer: VerifyKey,
+    signature: [u8; SIG_LEN],
+}
+
+impl SignedRoster {
+    /// Assemble from a freshly-signed doc. Crate-internal: the only signer is `Identity::sign_roster`, which
+    /// signs with the signet secret, so a `SignedRoster` a caller can construct is always genuinely signed.
+    pub(crate) fn from_parts(doc: RosterDoc, signer: VerifyKey, signature: [u8; SIG_LEN]) -> Self {
+        Self {
+            doc,
+            signer,
+            signature,
+        }
+    }
+
+    /// Verify this blob was signed by `signet` and return the enclosed doc ONLY on success. This is the whole
+    /// trust check: a doc signed by a FOREIGN key, or tampered after signing, is rejected here, before any
+    /// contact is touched. Mirrors a cap's "roots at the key I trust or nothing".
+    pub fn verify(&self, signet: VerifyKey) -> Result<&RosterDoc, RosterError> {
+        if self.signer != signet {
+            return Err(RosterError::ForeignSigner);
+        }
+        let verifying =
+            VerifyingKey::from_bytes(signet.bytes()).map_err(|_| RosterError::BadSignature)?;
+        let signature = Signature::from_bytes(&self.signature);
+        verifying
+            .verify_strict(&self.doc.canonical_bytes(), &signature)
+            .map_err(|_| RosterError::BadSignature)?;
+        Ok(&self.doc)
+    }
+
+    /// The doc WITHOUT a trust check. Named to shame misuse: for display/debug only, never to hydrate.
+    pub fn doc_unverified(&self) -> &RosterDoc {
+        &self.doc
+    }
+
+    /// The key this blob claims to be signed by (unverified until [`verify`](Self::verify)).
+    pub fn signer(&self) -> VerifyKey {
+        self.signer
+    }
+
+    /// The wire blob the `roster:` handler serves and the puller reads: the doc's canonical bytes (which are
+    /// self-delimiting), then the 32-byte signer, then the 64-byte signature.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.doc.canonical_bytes();
+        out.extend_from_slice(self.signer.bytes());
+        out.extend_from_slice(&self.signature);
+        out
+    }
+
+    /// Parse a wire blob into an UNVERIFIED `SignedRoster` (parse-don't-validate: NO trust check here, call
+    /// [`verify`](Self::verify) against the signet you trust). Bounds-checked throughout, so a truncated,
+    /// oversized, or trailing-garbage blob is a clean error, never a panic or an allocation blow-up.
+    pub fn decode(bytes: &[u8]) -> Result<Self, RosterError> {
+        let (doc, consumed) = RosterDoc::parse_canonical(bytes)?;
+        let mut cur = consumed;
+        let signer: [u8; VerifyKey::LEN] = take(bytes, &mut cur, VerifyKey::LEN)?
+            .try_into()
+            .map_err(|_| RosterError::Truncated)?;
+        let signature: [u8; SIG_LEN] = take(bytes, &mut cur, SIG_LEN)?
+            .try_into()
+            .map_err(|_| RosterError::Truncated)?;
+        if cur != bytes.len() {
+            return Err(RosterError::Truncated);
+        }
+        Ok(Self {
+            doc,
+            signer: VerifyKey::new(signer),
+            signature,
+        })
+    }
 }
 
 /// Why a roster could not be built (or, in [`cap`](crate::cap), verified).
@@ -158,4 +299,19 @@ pub enum RosterError {
     /// Two members shared one node identity.
     #[error("roster lists node {0} twice")]
     DuplicateNode(VerifyKey),
+    /// The blob's leading magic did not match: not a roster, or a version this build does not know.
+    #[error("not a roster (bad magic)")]
+    BadMagic,
+    /// The blob ended before a field was complete, or carried trailing bytes.
+    #[error("roster blob is truncated or malformed")]
+    Truncated,
+    /// The blob claimed more members than the decode bound allows.
+    #[error("roster lists too many members")]
+    TooManyMembers,
+    /// The blob's signer is not the signet the puller trusts.
+    #[error("roster is signed by a key other than the trusted signet")]
+    ForeignSigner,
+    /// The signature did not verify against the signet.
+    #[error("roster signature is invalid")]
+    BadSignature,
 }

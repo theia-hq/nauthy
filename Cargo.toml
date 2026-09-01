@@ -8,6 +8,10 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 biscuit-auth = "6"
 data-encoding = "2"
+# The raw ed25519 signer/verifier for the roster document (a detached signature over a blob, not a biscuit
+# token). Already in the tree transitively via biscuit-auth; declared directly so the roster primitive signs
+# with a plain, obvious ed25519 signature rather than smuggling a document into an authorization token.
+ed25519-dalek = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs"] }
 

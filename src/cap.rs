@@ -34,8 +34,10 @@ use biscuit_auth::builder::Algorithm;
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use data_encoding::BASE32_NOPAD;
+use ed25519_dalek::{Signer as _, SigningKey};
 
 use crate::VerifyKey;
+use crate::roster::{RosterDoc, SignedRoster};
 use crate::service::Service;
 
 /// The `sheer:` link scheme prefixing an encoded [`Cap`]. A share-link is `sheer:<node-id>.<base32>`.
@@ -61,6 +63,10 @@ const MAX_BLOCKS: usize = 16;
 /// bytes are wiped by [`biscuit_auth`] on drop.
 pub struct Identity {
     root: KeyPair,
+    /// The same ed25519 secret as `root`, as a raw signer for detached signatures over documents (the
+    /// roster). Derived from the same 32-byte seed at construction, so its public half equals
+    /// [`node_id`](Self::node_id): a roster this signs verifies against the same key a cap roots at.
+    signing: SigningKey,
 }
 
 impl Identity {
@@ -72,12 +78,23 @@ impl Identity {
         let private = PrivateKey::from_bytes(secret, Algorithm::Ed25519).map_err(CapError::Key)?;
         Ok(Self {
             root: KeyPair::from(&private),
+            signing: SigningKey::from_bytes(secret),
         })
     }
 
     /// This identity's [`VerifyKey`]: the public key a cap roots at and peers dial.
     pub fn node_id(&self) -> VerifyKey {
         node_id_of(&self.root)
+    }
+
+    /// Sign a roster snapshot with this signet's ed25519 key, producing a self-verifying blob. The signer is
+    /// the SIGNET, never the courier that serves it: only the signet secret can produce a signature that
+    /// verifies against the signet's [`VerifyKey`], so any member node may hold and serve this blob and none
+    /// can forge it. Reuses the same key that mints caps (no new secret material), as a plain detached
+    /// ed25519 signature over the roster's canonical bytes: a signed document, not a capability.
+    pub fn sign_roster(&self, doc: &RosterDoc) -> SignedRoster {
+        let signature = self.signing.sign(&doc.canonical_bytes());
+        SignedRoster::from_parts(doc.clone(), self.node_id(), signature.to_bytes())
     }
 
     /// Mint a fresh cap granting `service` until `expiry`, signed by this identity.

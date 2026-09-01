@@ -5,8 +5,17 @@
 
 use core::str::FromStr as _;
 
-use crate::VerifyKey;
-use crate::roster::{Epoch, Member, RosterDoc, RosterError, RosterLabel};
+use crate::roster::{Epoch, Member, RosterDoc, RosterError, RosterLabel, SignedRoster};
+use crate::{Identity, VerifyKey};
+
+/// A deterministic signing identity for the sign/verify tests.
+fn identity(seed: u8) -> Identity {
+    Identity::from_secret(&[seed; 32]).unwrap()
+}
+
+fn sample_doc() -> RosterDoc {
+    RosterDoc::new(Epoch(9), vec![member(1, "desk"), member(2, "ci-runner")]).unwrap()
+}
 
 fn key(n: u8) -> VerifyKey {
     VerifyKey::new([n; 32])
@@ -76,4 +85,68 @@ fn new_sorts_members_by_node() {
     let doc = RosterDoc::new(Epoch(1), vec![member(5, "e"), member(1, "a"), member(3, "c")]).unwrap();
     let nodes: Vec<_> = doc.members().iter().map(|m| *m.node.bytes()).collect();
     assert_eq!(nodes, vec![[1u8; 32], [3u8; 32], [5u8; 32]]);
+}
+
+#[test]
+fn a_signed_roster_verifies_against_its_signer() {
+    // The signer key equals the identity's node_id (so biscuit and ed25519-dalek derive the SAME public key
+    // from one secret), and the doc comes back ONLY through verify against that key.
+    let id = identity(7);
+    let doc = sample_doc();
+    let signed = id.sign_roster(&doc);
+    assert_eq!(signed.signer(), id.node_id());
+    assert_eq!(signed.verify(id.node_id()), Ok(&doc));
+}
+
+#[test]
+fn verify_rejects_a_foreign_signet() {
+    let signed = identity(7).sign_roster(&sample_doc());
+    let stranger = identity(8).node_id();
+    assert_eq!(signed.verify(stranger), Err(RosterError::ForeignSigner));
+}
+
+#[test]
+fn verify_rejects_a_tampered_signature() {
+    let id = identity(7);
+    let mut blob = id.sign_roster(&sample_doc()).encode();
+    let last = blob.len() - 1;
+    blob[last] ^= 0xff;
+    let tampered = SignedRoster::decode(&blob).unwrap();
+    assert_eq!(tampered.verify(id.node_id()), Err(RosterError::BadSignature));
+}
+
+#[test]
+fn verify_rejects_a_tampered_doc() {
+    // Flip an epoch byte: the blob still decodes (any u64 is a valid epoch), but its canonical bytes no
+    // longer match what the signature covers, so verify fails.
+    let id = identity(7);
+    let mut blob = id.sign_roster(&sample_doc()).encode();
+    blob[15] ^= 0xff;
+    let tampered = SignedRoster::decode(&blob).unwrap();
+    assert_eq!(tampered.verify(id.node_id()), Err(RosterError::BadSignature));
+}
+
+#[test]
+fn encode_then_decode_round_trips_and_verifies() {
+    let id = identity(7);
+    let signed = id.sign_roster(&sample_doc());
+    let decoded = SignedRoster::decode(&signed.encode()).unwrap();
+    assert_eq!(decoded, signed);
+    assert_eq!(decoded.verify(id.node_id()), Ok(&sample_doc()));
+}
+
+#[test]
+fn decode_rejects_truncated_trailing_and_bad_magic() {
+    let blob = identity(7).sign_roster(&sample_doc()).encode();
+    assert_eq!(
+        SignedRoster::decode(&blob[..blob.len() - 1]),
+        Err(RosterError::Truncated)
+    );
+    let mut trailing = blob.clone();
+    trailing.push(0);
+    assert_eq!(SignedRoster::decode(&trailing), Err(RosterError::Truncated));
+    assert_eq!(
+        SignedRoster::decode(b"not-a-roster-blob-here"),
+        Err(RosterError::BadMagic)
+    );
 }

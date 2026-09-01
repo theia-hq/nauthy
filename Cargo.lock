@@ -411,6 +411,7 @@ version = "0.0.0"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
+ "ed25519-dalek",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -971,10 +972,6 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
-
-[[patch.unused]]
-name = "sshh"
-version = "0.0.0"
 
 [[patch.unused]]
 name = "quirk"
