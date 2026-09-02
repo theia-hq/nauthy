@@ -32,7 +32,11 @@ impl Signed {
     /// [`Identity::sign_document`](crate::Identity::sign_document), which signs with a real secret, so a
     /// `Signed` a caller can construct is always genuinely signed (a foreign or forged signer can only
     /// enter through [`decode`](Signed::decode), where [`verify`](Signed::verify) then rejects it).
-    pub(crate) fn from_parts(payload: Vec<u8>, signer: VerifyKey, signature: [u8; SIG_LEN]) -> Self {
+    pub(crate) fn from_parts(
+        payload: Vec<u8>,
+        signer: VerifyKey,
+        signature: [u8; SIG_LEN],
+    ) -> Self {
         Self {
             payload,
             signer,
