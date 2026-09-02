@@ -39,6 +39,7 @@ use ed25519_dalek::{Signer as _, SigningKey};
 use crate::VerifyKey;
 use crate::roster::{RosterDoc, SignedRoster};
 use crate::service::Service;
+use crate::signed::Signed;
 
 /// The `sheer:` link scheme prefixing an encoded [`Cap`]. A share-link is `sheer:<node-id>.<base32>`.
 pub const SCHEME: &str = "sheer:";
@@ -85,6 +86,17 @@ impl Identity {
     /// This identity's [`VerifyKey`]: the public key a cap roots at and peers dial.
     pub fn node_id(&self) -> VerifyKey {
         node_id_of(&self.root)
+    }
+
+    /// Sign an opaque document with this identity's ed25519 key, producing a self-verifying blob. The signer
+    /// is THIS identity, never a courier that later serves it: only this secret can produce a signature that
+    /// verifies against this identity's [`VerifyKey`], so any node may hold and relay the blob and none can
+    /// forge it. Reuses the same key that mints caps (no new secret material), as a plain detached ed25519
+    /// signature over the caller's bytes: a signed document, not a capability. The bytes are OPAQUE here (a
+    /// consumer canonicalizes and parses its own payload); this only proves who signed them.
+    pub fn sign_document(&self, bytes: &[u8]) -> Signed {
+        let signature = self.signing.sign(bytes);
+        Signed::from_parts(bytes.to_vec(), self.node_id(), signature.to_bytes())
     }
 
     /// Sign a roster snapshot with this signet's ed25519 key, producing a self-verifying blob. The signer is
