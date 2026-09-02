@@ -72,28 +72,102 @@ impl Gate {
         presented: Option<&Cap>,
         service: &Service,
     ) -> Result<Admitted, Refusal> {
-        match self.admit(peer, presented, service) {
-            Decision::Admit => Ok(Admitted(())),
-            Decision::Refuse(refusal) => Err(refusal),
+        match self {
+            // A public node proves nothing about a peer, so it cannot have admitted a MEMBER: the kind is
+            // `Slip` (fail-closed). `is_member()` is therefore false on an open node, exactly as a caller
+            // layering a member-only ceiling must see it. A default-to-`Member` here would be a trust break.
+            Gate::Open => Ok(Admitted { peer, kind: Admission::Slip }),
+            // A family gate DID rule on a token. Re-read the same member-vs-grant distinction the ruling
+            // used (`is_member` before `grants`, gate.rs `admit_family`): a whole-node membership badge is
+            // `Member`, a per-service delegated slip is `Slip`. Any other outcome is a refusal, never a
+            // witness. `is_member` is checked first, so a badge is `Member` even where it would also grant.
+            Gate::Family(root, denylist) => {
+                match admit_family(*root, denylist, presented, service, peer) {
+                    Decision::Admit => {
+                        let kind = match presented {
+                            Some(cap) if is_member(cap, *root, peer) => Admission::Member,
+                            // Admitted but not via a badge: a delegated slip. Fail-closed on ambiguity.
+                            _ => Admission::Slip,
+                        };
+                        Ok(Admitted { peer, kind })
+                    }
+                    Decision::Refuse(refusal) => Err(refusal),
+                }
+            }
         }
     }
 }
 
-/// Proof that a [`Gate`] admitted a connection.
+/// Proof that a [`Gate`] admitted a connection, naming WHO was admitted and by WHAT KIND of authority.
 ///
 /// An opaque witness with no public constructor: the only way to obtain one is [`Gate::admit_witnessed`]
 /// returning `Ok`. A service handler that takes an `Admitted` therefore cannot be called without a gate
 /// having permitted the peer, so "authorize before serve" is enforced by the type system, not by the order
-/// of statements. It carries nothing; it exists only to be un-forgeable outside nauthy.
+/// of statements. The gate mints exactly one per ruling, in `admit_witnessed`; there is no other way to make
+/// one, so a handler that receives it can trust it without re-checking.
 ///
-/// It is deliberately neither `Copy` nor `Clone`: a witness is a SINGLE-USE, per-stream proof. A consumer
-/// like [`sshh::serve`] takes it BY VALUE, so minting one witness authorizes exactly one serve; it cannot be
-/// duplicated and replayed onto a second stream the gate never ruled on. It binds no peer or service, so the
-/// guarantee still relies on admit and serve sharing one stream frame (never hoist the admit above a
-/// per-stream loop), but single-use consumption removes the accidental-reuse footgun by construction.
+/// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
+/// SINGLE-USE, per-stream proof. A consumer like [`sshh::serve`] takes it BY VALUE, so minting one witness
+/// authorizes exactly one serve; it cannot be duplicated and replayed onto a second stream the gate never
+/// ruled on. It now carries the verified [`peer`](Admitted::peer) and the [`kind`](Admitted::kind) of
+/// admission, so a handler MAY layer a finer per-request policy on the gate's floor (an owner-only lifecycle
+/// verb reads [`is_member`](Admitted::is_member)); the single-use guarantee still relies on admit and serve
+/// sharing one stream frame (never hoist the admit above a per-stream loop), but single-use consumption
+/// removes the accidental-reuse footgun by construction. Adding a `Clone` derive here re-arms that replay,
+/// so the negative-trait assertion below is a fail-if-you-try guard, not documentation.
 #[derive(Debug)]
 #[must_use = "an Admitted witness proves a gate ran; serve the one stream it authorized"]
-pub struct Admitted(());
+pub struct Admitted {
+    peer: VerifyKey,
+    kind: Admission,
+}
+
+impl Admitted {
+    /// The verified identity the gate admitted. The transport handshake proved this key before the gate
+    /// ruled, so it is an un-forgeable fact, not a claim the peer made.
+    pub fn peer(&self) -> VerifyKey {
+        self.peer
+    }
+
+    /// By WHAT authority this peer was admitted: a whole-node [`Member`](Admission::Member) badge or a
+    /// per-service [`Slip`](Admission::Slip). A handler layering an owner-only ceiling reads this.
+    pub fn kind(&self) -> Admission {
+        self.kind
+    }
+
+    /// Whether this peer was admitted as a whole-node MEMBER (a `member(true)` badge), not via a per-service
+    /// slip. False on a public node, where nothing about the peer is proven (the kind is [`Slip`]). A
+    /// lifecycle verb that only an owner device may trigger gates on this.
+    ///
+    /// [`Slip`]: Admission::Slip
+    pub fn is_member(&self) -> bool {
+        matches!(self.kind, Admission::Member)
+    }
+}
+
+/// The AUTHORITY a [`Gate`] admitted a peer under: the two meanings a family token can carry.
+///
+/// A whole-node membership badge and a per-service slip are one signature verified against one signet, but
+/// they mean different things (delib-32 floor+ceiling), so a handler that must tell an owner device from a
+/// delegated friend needs the distinction on the witness, not just "admitted or not". It carries no data and
+/// is a plain `Copy` tag, unlike [`Admitted`] itself, whose absence of `Copy`/`Clone` is the single-use
+/// guarantee; distinguishing the two is deliberate (the witness is single-use, its kind is a fact you may
+/// read as often as you like).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Admission {
+    /// Admitted via a whole-node membership badge (`member(true)`): an owner's own device.
+    Member,
+    /// Admitted via a per-service capability grant (a delegated slip), or over an open gate where nothing
+    /// about the peer is proven. The fail-closed kind: any admission that is not provably a member is `Slip`.
+    Slip,
+}
+
+// `Admitted` is a SINGLE-USE witness: cloning or copying it would let a caller replay one gate ruling onto a
+// second stream the gate never saw (an sshd shell re-served to an unadmitted peer). This assertion fails to
+// compile if anyone adds a `Clone` or `Copy` derive, so the invariant is enforced by the compiler, not by a
+// reviewer remembering it. `Admission` (the read-only kind tag) may be `Copy`; only the witness may not.
+#[cfg(test)]
+static_assertions::assert_not_impl_any!(Admitted: Clone, Copy);
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
 /// requested `service`. One signature, two meanings: a device carries a MEMBERSHIP badge (a `member(true)`

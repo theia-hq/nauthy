@@ -412,6 +412,7 @@ dependencies = [
  "biscuit-auth",
  "data-encoding",
  "ed25519-dalek",
+ "static_assertions",
  "thiserror 2.0.20",
  "tokio",
 ]
@@ -787,6 +788,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -974,12 +981,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "quirk"
-version = "0.0.0"
-
-[[patch.unused]]
 name = "tightbeam"
 version = "0.3.0"
+
+[[patch.unused]]
+name = "quirk"
+version = "0.0.0"
 
 [[patch.unused]]
 name = "bifrost"

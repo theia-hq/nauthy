@@ -16,6 +16,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
+# Compile-time NEGATIVE-trait assertion that the single-use `Admitted` witness stays !Clone + !Copy: a
+# `#[derive(Clone)]` slip would re-arm replay, and this crate fails to compile (test build) if one lands.
+static_assertions = "1"
 tokio = { version = "1", features = ["macros", "rt", "fs"] }
 
 [lints.clippy]
