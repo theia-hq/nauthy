@@ -7,15 +7,14 @@
 //! TTL ages a leaked cap out eventually but cannot recall it now.
 //!
 //! Revocation is LIVE: [`is_revoked`](Denylist::is_revoked) re-reads the file whenever its mtime changes,
-//! so a `tightbeam revoke` in a separate process takes effect on the next connection to a long-running
+//! so a revocation written by a separate process takes effect on the next connection to a long-running
 //! exposer; it does not wait for a restart. The file's mtime is the freshness signal; the reload is a
 //! small, rare read (only when the file actually changed), guarded by interior mutability so the gate's
 //! synchronous admit path stays synchronous.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::PoisonError;
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
 use data_encoding::BASE32_NOPAD;
@@ -24,10 +23,9 @@ use crate::cap::Cap;
 
 /// A persisted set of revoked capability ids (biscuit revocation identifiers), one base32 id per line.
 ///
-/// nauthy is cross-cutting, so the file location is the consumer's to choose (tightbeam keeps its own at
-/// `~/.config/tightbeam/revoked`); this type owns only the load / revoke / check logic over a path. The
-/// loaded set is behind a [`Mutex`] with the mtime it was read at, so a check can refresh it in place when
-/// the file changed underneath a running process.
+/// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
+/// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the mtime it was
+/// read at, so a check can refresh it in place when the file changed underneath a running process.
 pub struct Denylist {
     path: PathBuf,
     state: Mutex<State>,
@@ -55,7 +53,7 @@ impl Denylist {
     /// inherited from the grant it was attenuated from) is on the denylist.
     ///
     /// Refreshes from disk first if the file changed since the last read, so a revocation written by
-    /// another process (a `tightbeam revoke`) is honored by a long-running exposer without a restart. The
+    /// another process is honored by a long-running exposer without a restart. The
     /// mtime check is a cheap stat; the file is re-read only when it actually changed.
     pub fn is_revoked(&self, cap: &Cap) -> bool {
         let chain = cap.revocation_ids();

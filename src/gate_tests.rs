@@ -180,8 +180,8 @@ fn family_can_trust_a_foreign_signet_the_ci_model() {
 
 #[tokio::test]
 async fn revocation_goes_live_without_reconstructing_the_denylist() {
-    // Blocker 3: a long-running exposer holds ONE Denylist; a `tightbeam revoke` in a SEPARATE process
-    // writes the revoked id to the file. The running gate must honor it on the next check, not at the next
+    // Blocker 3: a long-running exposer holds ONE Denylist; a revocation in a SEPARATE process writes the
+    // revoked id to the file. The running gate must honor it on the next check, not at the next
     // restart. Here the same live Denylist -- never reloaded or reconstructed -- refuses a cap after a
     // separate handle revokes it, because is_revoked re-reads the file when its mtime changed.
     let signet = identity(1);

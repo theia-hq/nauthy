@@ -166,7 +166,7 @@ pub enum Admission {
 }
 
 // `Admitted` is a SINGLE-USE witness: cloning or copying it would let a caller replay one gate ruling onto a
-// second stream the gate never saw (an sshd shell re-served to an unadmitted peer). This assertion fails to
+// second stream the gate never admitted (a shell re-served to an unadmitted peer). This assertion fails to
 // compile if anyone adds a `Clone` or `Copy` derive, so the invariant is enforced by the compiler, not by a
 // reviewer remembering it. `Admission` (the read-only kind tag) may be `Copy`; only the witness may not.
 #[cfg(test)]
