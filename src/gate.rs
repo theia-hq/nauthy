@@ -37,8 +37,8 @@ impl Gate {
     ///
     /// The constructor for the boxed variant, so a caller never hand-writes the `Box::new(denylist)` the
     /// enum's size discipline forces. The caller loads the denylist (from wherever it keeps revocations)
-    /// and passes it by value; `--public` is the caller's own choice, so [`Open`](Gate::Open) is built at
-    /// the call site, not here.
+    /// and passes it by value; building an [`Open`](Gate::Open) gate is the caller's own choice, so it is
+    /// built at the call site, not here.
     pub fn family(signet: VerifyKey, denylist: Denylist) -> Gate {
         Gate::Family(signet, Box::new(denylist))
     }
@@ -76,7 +76,10 @@ impl Gate {
             // A public node proves nothing about a peer, so it cannot have admitted a MEMBER: the kind is
             // `Slip` (fail-closed). `is_member()` is therefore false on an open node, exactly as a caller
             // layering a member-only ceiling must see it. A default-to-`Member` here would be a trust break.
-            Gate::Open => Ok(Admitted { peer, kind: Admission::Slip }),
+            Gate::Open => Ok(Admitted {
+                peer,
+                kind: Admission::Slip,
+            }),
             // A family gate DID rule on a token. Re-read the same member-vs-grant distinction the ruling
             // used (`is_member` before `grants`, gate.rs `admit_family`): a whole-node membership badge is
             // `Member`, a per-service delegated slip is `Slip`. Any other outcome is a refusal, never a
@@ -107,7 +110,7 @@ impl Gate {
 /// one, so a handler that receives it can trust it without re-checking.
 ///
 /// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
-/// SINGLE-USE, per-stream proof. A consumer like [`sshh::serve`] takes it BY VALUE, so minting one witness
+/// SINGLE-USE, per-stream proof. A consumer takes it BY VALUE, so minting one witness
 /// authorizes exactly one serve; it cannot be duplicated and replayed onto a second stream the gate never
 /// ruled on. It now carries the verified [`peer`](Admitted::peer) and the [`kind`](Admitted::kind) of
 /// admission, so a handler MAY layer a finer per-request policy on the gate's floor (an owner-only lifecycle
