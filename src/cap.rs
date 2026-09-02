@@ -37,7 +37,6 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use crate::VerifyKey;
-use crate::roster::{RosterDoc, SignedRoster};
 use crate::service::Service;
 use crate::signed::Signed;
 
@@ -97,16 +96,6 @@ impl Identity {
     pub fn sign_document(&self, bytes: &[u8]) -> Signed {
         let signature = self.signing.sign(bytes);
         Signed::from_parts(bytes.to_vec(), self.node_id(), signature.to_bytes())
-    }
-
-    /// Sign a roster snapshot with this signet's ed25519 key, producing a self-verifying blob. The signer is
-    /// the SIGNET, never the courier that serves it: only the signet secret can produce a signature that
-    /// verifies against the signet's [`VerifyKey`], so any member node may hold and serve this blob and none
-    /// can forge it. Reuses the same key that mints caps (no new secret material), as a plain detached
-    /// ed25519 signature over the roster's canonical bytes: a signed document, not a capability.
-    pub fn sign_roster(&self, doc: &RosterDoc) -> SignedRoster {
-        let signature = self.signing.sign(&doc.canonical_bytes());
-        SignedRoster::from_parts(doc.clone(), self.node_id(), signature.to_bytes())
     }
 
     /// Mint a fresh cap granting `service` until `expiry`, signed by this identity.

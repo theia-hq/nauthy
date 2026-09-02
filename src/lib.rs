@@ -21,7 +21,6 @@ mod cap;
 mod gate;
 mod key;
 mod revocations;
-mod roster;
 mod service;
 mod signed;
 
@@ -30,14 +29,11 @@ mod cap_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
-mod roster_tests;
-#[cfg(test)]
 mod signed_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in};
 pub use crate::gate::{Admitted, Decision, Gate, Refusal};
 pub use crate::key::{KeyParseError, VerifyKey};
-pub use crate::roster::{Epoch, Member, RosterDoc, RosterError, RosterLabel, SignedRoster};
 pub use crate::revocations::{Denylist, DenylistError};
 pub use crate::service::{Service, ServiceParseError};
 pub use crate::signed::{SignError, Signed};
