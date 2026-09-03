@@ -15,3 +15,14 @@ All notable changes to nauthy, newest first.
 - **Root revocation.** `Denylist::revoke_root` refuses a grant and every narrower link delegated from it,
   in one entry; `Cap::root_revocation_id` recovers the id to key it on. `Denylist::revoke` still refuses
   a single link.
+- **`RevocationId`** the revocation-id newtype a denylist entry is stored under, parsed at the boundary
+  (`from_hex` / `from_bytes`). `Cap::revocation_ids` reads the ids a link carries and `Denylist::revoke_id`
+  refuses one directly, so an issuer can persist revocations and re-apply them by id.
+- **`Admitted` names the peer and the admission kind.** The gate's admit witness now carries who was
+  admitted and by what authority, `Admission::Member` (a device under this signet) or `Admission::Slip` (a
+  delegated capability); `Admitted::is_member` reads it, fail-closed to `Slip` on anything not provably a
+  member. A handler can gate on the identity behind an admitted stream.
+- **`Signed`, a generic signed-document primitive.** `Identity::sign_document` signs any opaque payload
+  with the identity's ed25519 key, and `Signed::verify` roots it at the key you trust. The bytes are
+  opaque here, so a consumer canonicalizes and parses its own document; the earlier roster-specific payload
+  is gone.
