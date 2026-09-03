@@ -37,6 +37,7 @@ use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 
 use crate::VerifyKey;
+use crate::revocations::RevocationId;
 use crate::service::Service;
 use crate::signed::Signed;
 
@@ -157,6 +158,79 @@ impl Identity {
         })
     }
 
+    /// Mint a device-bound service slip granting `service` until `expiry`, usable only by the proven device
+    /// `bound_to`.
+    ///
+    /// The standing-access primitive for an outsider's single device. Like [`Identity::mint`] it grants a
+    /// named SERVICE (never `member`, so it is per-service access, never whole-node admission), but it
+    /// carries the same `check if bound_device` binding a membership badge does (see
+    /// [`Identity::mint_member`]). So a copy observed in flight and replayed from a DIFFERENT key verifies
+    /// against no one, and a slip presented with no proven dialer (`request.bound_device` is `None`) grants
+    /// nothing: theft-resistant, inert unless the presenter IS the bound device. It needs no new verify
+    /// path, [`Cap::verify_at_root`] already injects the proven dialer as `bound_device`, so the binding
+    /// check falls out of the existing service verification. Only the signet (this identity) can mint one
+    /// (minting needs the root secret), and attenuation only ADDS checks, so a device-bound slip can never be
+    /// widened into an unbound slip or a badge.
+    pub fn mint_bound(
+        &self,
+        service: &Service,
+        bound_to: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if bound_device($d), $d == {bound};
+            "#,
+            service = service.as_str(),
+            expiry = expiry,
+            bound = bound_to.to_string(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.node_id(),
+            token,
+        })
+    }
+
+    /// Mint a service slip granting `service` until `expiry`, usable only by a device that proves membership
+    /// under the foreign signet `foreign_root` (a whole FLEET, not one device).
+    ///
+    /// The work-sim primitive: issue ONCE to a PERSON (their signet `X`), and every device that person's
+    /// signet vouches for may use it, at their discretion. `X` is pinned as a CONSTANT authority fact
+    /// (`signet_bound(X)`), so it is trusted transitively (this signet asserted it) and can NEVER be
+    /// overridden by a presenter. Inert alone: it carries `check if signet_bound($x), fleet_member($x)`, a
+    /// check no plain verification injects, so it FAILS [`verify_at_root`](Cap::verify_at_root) and grants
+    /// nothing unless the gate's two-cap flow first proves membership under `X` (see
+    /// [`Cap::verify_signet_bound_at_root`]). Only the signet (this identity) can mint one; attenuation only
+    /// ADDS checks, so it can never be widened.
+    pub fn mint_signet_slip(
+        &self,
+        service: &Service,
+        foreign_root: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            signet_bound({fleet});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if signet_bound($x), fleet_member($x);
+            "#,
+            fleet = foreign_root.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.node_id(),
+            token,
+        })
+    }
+
     /// Verify a presented cap grants `request` against this identity, returning the identity it roots at.
     ///
     /// Grants iff the cap is rooted at this node's key AND every check in the chain passes for the
@@ -241,6 +315,89 @@ impl Cap {
         authorizer.authorize().map_err(CapError::Denied)?;
         Ok(self.root)
     }
+
+    /// Verify this cap is a valid SIGNET-BOUND slip rooted at `root` for `request`, returning the FOREIGN
+    /// fleet root `X` it names. Grants (and returns `X`) iff: the cap roots at `root`, its service matches,
+    /// it is unexpired at `request.now`, and it carries a `signet_bound(X)` AUTHORITY fact. The gate then
+    /// verifies a membership badge at the RETURNED `X` (never a presenter-supplied root) before admitting.
+    ///
+    /// `X` is read from the authority block ONLY (biscuit `query` sees origin-0 facts, never attenuation
+    /// blocks), so a `signet_bound` fact forged into a delegation block is invisible: the bound fleet is
+    /// exactly the one THIS signet signed. A plain slip or a membership badge carries no `signet_bound`
+    /// fact, so this returns [`CapError::NotSignetBound`] for them: this method is the sole detector AND
+    /// extractor.
+    pub fn verify_signet_bound_at_root(
+        &self,
+        request: &Request,
+        root: VerifyKey,
+    ) -> Result<VerifyKey, CapError> {
+        if self.root != root {
+            return Err(CapError::ForeignRoot);
+        }
+        // Read the pinned foreign root from the authority block (origin-0 only, so an attenuation-block
+        // `signet_bound` is invisible). A missing fact is a clean "not this kind".
+        let x_text = self.signet_bound_text()?.ok_or(CapError::NotSignetBound)?;
+        let x = x_text
+            .parse::<VerifyKey>()
+            .map_err(|_| CapError::Malformed)?;
+        // Authorize the slip's service + expiry checks AND satisfy its `fleet_member($x)` check by injecting
+        // the fleet it named. This is what makes it authorize HERE and NOWHERE else; the gate still ANDs an
+        // independent badge check under `x` before it admits, so this method never admits on its own.
+        let mut authorizer = authorizer!(
+            r#"
+            time({now});
+            service({service});
+            fleet_member({fleet});
+            allow if true;
+            "#,
+            now = request.now,
+            service = request.service.as_str(),
+            fleet = x.to_string(),
+        )
+        .build(&self.token)
+        .map_err(CapError::Authorize)?;
+        authorizer.authorize().map_err(CapError::Denied)?;
+        Ok(x)
+    }
+
+    /// Whether this cap is a SIGNET-BOUND slip: it carries a `signet_bound` fact in its AUTHORITY block.
+    ///
+    /// A cheap, offline, root-free check the DIALER uses to decide whether to attach a fleet membership
+    /// badge (slot 2) beside a presented slip: a plain, bearer, or device-bound slip is NOT signet-bound, so
+    /// the dialer attaches no badge and never leaks its own device-to-signet linkage on a non-signet dial.
+    /// Reads origin-0 facts only (see [`signet_bound_text`](Self::signet_bound_text)), so an
+    /// attenuation-block fact never reads as signet-bound.
+    pub fn is_signet_bound(&self) -> bool {
+        matches!(self.signet_bound_text(), Ok(Some(_)))
+    }
+
+    /// The foreign fleet key `X` this cap's `signet_bound` AUTHORITY fact pins, as a typed [`VerifyKey`], if
+    /// any. `None` for a plain, bearer, or device-bound slip (no such fact). Reads origin-0 facts only, so an
+    /// attenuation-block fact is invisible: the pinned fleet is exactly the one this signet signed.
+    ///
+    /// The typed, offline, root-free extractor a DIALER uses to decide whether its own fleet membership
+    /// badge (slot 2) can ever help: a badge for a fleet you are not in never verifies at that fleet's gate,
+    /// so a dialer attaches slot 2 ONLY when `X` equals the fleet its own badge roots under. Distinct from
+    /// [`verify_signet_bound_at_root`](Self::verify_signet_bound_at_root), which is the GATE's path (it needs
+    /// the root and a request, and gates admission); this is a pure read of the pinned fleet.
+    pub fn signet_bound_fleet(&self) -> Result<Option<VerifyKey>, CapError> {
+        self.signet_bound_text()?
+            .map(|x| x.parse::<VerifyKey>().map_err(|_| CapError::Malformed))
+            .transpose()
+    }
+
+    /// The encoded foreign fleet key this cap's `signet_bound` AUTHORITY fact pins, if any. Reads origin-0
+    /// facts only: `query` (not `query_all`) defaults its rule scope to the authority block, so a
+    /// `signet_bound` fact forged into an attenuation block is invisible and the bound fleet is exactly the
+    /// one this signet signed. `None` for a plain slip or a membership badge (no such fact). No root or
+    /// secret: a pure offline read of the token's own authority block.
+    fn signet_bound_text(&self) -> Result<Option<String>, CapError> {
+        let mut authorizer = self.token.authorizer().map_err(CapError::Authorize)?;
+        let rows: Vec<(String,)> = authorizer
+            .query("bound($x) <- signet_bound($x)")
+            .map_err(CapError::Authorize)?;
+        Ok(rows.into_iter().next().map(|(x,)| x))
+    }
 }
 
 /// A capability: a token decoded and signature-verified against the root [`VerifyKey`] embedded in its link.
@@ -294,8 +451,20 @@ impl Cap {
     /// Each is a pure, offline function of the block's signature. Recording one in a
     /// [`Denylist`](crate::Denylist) revokes that token and every token attenuated from it (all of which
     /// carry that block, hence that id).
-    pub fn revocation_ids(&self) -> Vec<Vec<u8>> {
-        self.token.revocation_identifiers()
+    pub fn revocation_ids(&self) -> Vec<RevocationId> {
+        self.token
+            .revocation_identifiers()
+            .into_iter()
+            .map(RevocationId::from_bytes)
+            .collect()
+    }
+
+    /// This cap's ROOT revocation id: the authority-block id (the first of [`revocation_ids`](Self::revocation_ids))
+    /// that every cap attenuated or delegated from it inherits. Recording it in a [`Denylist`](crate::Denylist)
+    /// revokes this cap AND its whole delegation tree in one entry, whereas recording the narrowest id revokes
+    /// only this leaf. `None` only for a token with no blocks, which a well-formed biscuit never is.
+    pub fn root_revocation_id(&self) -> Option<RevocationId> {
+        self.revocation_ids().into_iter().next()
     }
 
     /// Encode this cap as a `sheer:<node-id>.<base32>` share-link.
@@ -392,6 +561,30 @@ impl Identity {
             root: self.node_id(),
             token,
         })
+    }
+
+    /// Test-only: mint a real signet-bound slip naming `real_fleet` in the AUTHORITY block, then append a
+    /// second `signet_bound(forged_fleet)` fact in an ATTENUATION block, exactly what an attacker would
+    /// attempt to redirect the bound fleet to a fleet THEY control. [`Cap::verify_signet_bound_at_root`]
+    /// must still return `real_fleet`: `query` reads origin-0 facts only, so an appended `signet_bound` is
+    /// untrusted origin and invisible. Reaches past the public API on purpose (the public [`Cap::attenuate`]
+    /// can only append CHECKS, never facts), the prosecutable proof that the bound fleet is exactly the one
+    /// this signet signed.
+    pub(crate) fn mint_signet_slip_with_forged_binding(
+        &self,
+        service: &Service,
+        real_fleet: VerifyKey,
+        forged_fleet: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let Cap { root, token } = self.mint_signet_slip(service, real_fleet, expiry)?;
+        let token = token
+            .append(block!(
+                r#"signet_bound({forged});"#,
+                forged = forged_fleet.to_string(),
+            ))
+            .map_err(CapError::Attenuate)?;
+        Ok(Cap { root, token })
     }
 }
 
@@ -500,4 +693,9 @@ pub enum CapError {
     /// The token chained to the root, but its checks denied the request (wrong service or expired).
     #[error("capability does not grant this request")]
     Denied(#[source] biscuit_auth::error::Token),
+    /// The token is not a signet-bound slip: it carries no `signet_bound` authority fact, so it names no
+    /// foreign fleet. A clean "not this kind", distinct from [`Denied`](Self::Denied); the gate treats both
+    /// as "not admitted on the signet-bound arm".
+    #[error("capability is not a signet-bound slip")]
+    NotSignetBound,
 }

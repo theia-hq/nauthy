@@ -985,10 +985,6 @@ name = "tightbeam"
 version = "0.3.0"
 
 [[patch.unused]]
-name = "quirk"
-version = "0.0.0"
-
-[[patch.unused]]
 name = "bifrost"
 version = "0.0.0"
 
@@ -1014,4 +1010,8 @@ version = "0.0.0"
 
 [[patch.unused]]
 name = "bifrost-wire"
+version = "0.0.0"
+
+[[patch.unused]]
+name = "quirk"
 version = "0.0.0"

@@ -8,10 +8,20 @@
 //!
 //! Two policies:
 //! - [`Gate::Open`] permits any peer.
-//! - [`Gate::Family`] permits a peer that *presents a signed token* ([`Cap`]) rooted at a trusted signet,
-//!   granting either MEMBERSHIP (a whole-node `member(true)` badge) or the requested SERVICE (a delegated
-//!   slip). One key you own authorizes both your own devices and anyone you delegate to, offline and
-//!   revocably: the thing `authorized_keys` cannot do.
+//! - [`Gate::Family`] permits a peer that *presents a signed token* ([`Cap`]) rooted at a trusted signet
+//!   (a `NodeId` you own). One key you own authorizes both your own devices and anyone you delegate to,
+//!   offline and revocably: the thing `authorized_keys` cannot do.
+//!
+//! One signet signs four grant shapes, verified offline against it:
+//! - a **membership badge** ([`Identity::mint_member`]): whole-node admission, bound to one device;
+//! - a **device-bound slip** ([`Identity::mint_bound`]): one service, bound to one device;
+//! - a **signet-bound slip** ([`Identity::mint_signet_slip`]): one service, open to every device a foreign
+//!   signet vouches for;
+//! - an **unbound slip** ([`Identity::mint`]): one service, bearer, delegable by attenuation.
+//!
+//! A bound grant is theft-resistant and non-delegable; a bearer grant is delegable and short-lived.
+//! Attenuation only ADDS checks, so a slip can never be widened into a badge, nor a narrower link
+//! broadened back.
 //!
 //! The token is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable capability. nauthy never
 //! hand-rolls crypto; it wraps a vetted library behind a small parse-don't-validate [`Cap`] type, adds a
@@ -29,11 +39,13 @@ mod cap_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
+mod revocations_tests;
+#[cfg(test)]
 mod signed_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME, expires_in};
 pub use crate::gate::{Admitted, Decision, Gate, Refusal};
 pub use crate::key::{KeyParseError, VerifyKey};
-pub use crate::revocations::{Denylist, DenylistError};
+pub use crate::revocations::{Denylist, DenylistError, RevocationId, RevocationIdParseError};
 pub use crate::service::{Service, ServiceParseError};
 pub use crate::signed::{SignError, Signed};

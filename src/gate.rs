@@ -48,11 +48,22 @@ impl Gate {
     /// [`Open`](Gate::Open) admits unconditionally. [`Family`](Gate::Family) rules on the presented token,
     /// not the dialer (the token, not who carries it, is the authority, but device-bound so only the named
     /// device may present it): it admits a membership badge or a slip for `service`, rooted at the trusted
-    /// signet; a missing, non-granting, or revoked token is refused with a reason.
-    pub fn admit(&self, peer: VerifyKey, presented: Option<&Cap>, service: &Service) -> Decision {
+    /// signet; a missing, non-granting, or revoked token is refused with a reason. `membership` is a SECOND
+    /// slot, a badge under the foreign fleet a signet-bound slip names, consulted only on that arm.
+    pub fn admit(
+        &self,
+        peer: VerifyKey,
+        presented: Option<&Cap>, // slot 1: the grant (member badge | plain slip | signet-bound slip)
+        membership: Option<&Cap>, // slot 2: a badge under the foreign fleet, only for a signet-bound slip
+        service: &Service,
+    ) -> Decision {
         match self {
+            // `Gate::Open` proves nothing and needs no token, so a signet-bound `membership` slot is
+            // irrelevant here: an open node admits regardless.
             Gate::Open => Decision::Admit,
-            Gate::Family(root, denylist) => admit_family(*root, denylist, presented, service, peer),
+            Gate::Family(root, denylist) => {
+                admit_family(*root, denylist, presented, membership, service, peer)
+            }
         }
     }
 
@@ -70,6 +81,7 @@ impl Gate {
         &self,
         peer: VerifyKey,
         presented: Option<&Cap>,
+        membership: Option<&Cap>,
         service: &Service,
     ) -> Result<Admitted, Refusal> {
         match self {
@@ -85,11 +97,14 @@ impl Gate {
             // `Member`, a per-service delegated slip is `Slip`. Any other outcome is a refusal, never a
             // witness. `is_member` is checked first, so a badge is `Member` even where it would also grant.
             Gate::Family(root, denylist) => {
-                match admit_family(*root, denylist, presented, service, peer) {
+                match admit_family(*root, denylist, presented, membership, service, peer) {
                     Decision::Admit => {
                         let kind = match presented {
                             Some(cap) if is_member(cap, *root, peer) => Admission::Member,
-                            // Admitted but not via a badge: a delegated slip. Fail-closed on ambiguity.
+                            // Admitted but not via a whole-node badge: a delegated slip OR a signet-bound
+                            // slip (a FOREIGN fleet's member). Both are `Slip`, never `Member`: a foreign
+                            // member must not read as a whole-node member of THIS node, so owner-only
+                            // lifecycle verbs stay closed to them. Fail-closed on ambiguity.
                             _ => Admission::Slip,
                         };
                         Ok(Admitted { peer, kind })
@@ -173,25 +188,57 @@ pub enum Admission {
 static_assertions::assert_not_impl_any!(Admitted: Clone, Copy);
 
 /// Admit a peer that presents a token rooted at the signet `root`, unrevoked, granting membership OR the
-/// requested `service`. One signature, two meanings: a device carries a MEMBERSHIP badge (a `member(true)`
-/// authority fact, whole-node), a delegated friend carries a SLIP (a check for the requested service);
-/// either authorizes. The two are distinct questions (membership is not a service name), so a slip can
-/// never be widened into whole-node admission (see [`Cap::verify_member_at_root`]).
+/// requested `service`. One signature, two meanings on the plain path: a device carries a MEMBERSHIP badge
+/// (a `member(true)` authority fact, whole-node), a delegated friend carries a SLIP (a check for the
+/// requested service); either authorizes. The two are distinct questions (membership is not a service
+/// name), so a slip can never be widened into whole-node admission (see [`Cap::verify_member_at_root`]).
+///
+/// A THIRD shape is the signet-bound slip: a slip `root` signed that names a FOREIGN fleet `X`. It grants
+/// nothing on the plain path (its inert-alone `fleet_member` check is unsatisfied there); it admits only
+/// when `membership` ALSO carries a badge that verifies under the `X` the slip names, the two-token AND.
 fn admit_family(
     root: VerifyKey,
     denylist: &Denylist,
     presented: Option<&Cap>,
+    membership: Option<&Cap>,
     service: &Service,
     peer: VerifyKey,
 ) -> Decision {
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
-    if !is_member(cap, root, peer) && !grants(cap, root, service, peer) {
-        return Decision::Refuse(Refusal::NotGranted);
+    // Plain path (unchanged): a whole-node member badge OR a plain/device-bound per-service slip rooted at
+    // `root`. Either admits on its own, so `membership` is never consulted here.
+    if is_member(cap, root, peer) || grants(cap, root, service, peer) {
+        return revoked_or_admit(denylist, cap);
     }
-    // Granted, but a revoked token is still refused: the offline recall a bare TTL cannot give. Checked
-    // after the grant so a token that never granted (foreign root, wrong service) reports NotGranted.
+    // Signet-bound path: `cap` is a slip rooted at `root` naming a FOREIGN fleet `X`; the presenter must
+    // ALSO prove membership under `X`. `X` comes from the SLIP (never the badge); the proven `peer` (the
+    // transport-proven dialer) is bound into both checks. This is the two-token AND.
+    let request = Request::now(Service::clone(service)).bound_to(peer);
+    if let Ok(x) = cap.verify_signet_bound_at_root(&request, root) {
+        // `X` is the fleet the slip named, fed straight into the badge's root check. There is no path that
+        // reads a badge-supplied root: `verify_member_at_root` only compares the badge's own root AGAINST
+        // this `x`, so a badge under the wrong root fails `ForeignRoot`. The badge is device-bound, so a
+        // stolen slip+badge replayed from a different key fails the bound-device check.
+        let member_under_x = membership.is_some_and(|badge| {
+            badge
+                .verify_member_at_root(SystemTime::now(), peer, x)
+                .is_ok()
+        });
+        if member_under_x {
+            return revoked_or_admit(denylist, cap);
+        }
+    }
+    Decision::Refuse(Refusal::NotGranted)
+}
+
+/// A granted cap that is on the denylist is still refused; else admit. The denylist governs the SLIP
+/// (rooted at `root`); a signet-bound slip's foreign badge (rooted at `X`) is out of this node's revocation
+/// authority (the hire revokes a lost DEVICE in their own fleet; the owner revokes the PERSON by revoking
+/// the slip). Checked after the grant so a token that never granted (foreign root, wrong service) reports
+/// `NotGranted`, not `Revoked`.
+fn revoked_or_admit(denylist: &Denylist, cap: &Cap) -> Decision {
     if denylist.is_revoked(cap) {
         return Decision::Refuse(Refusal::Revoked);
     }

@@ -17,9 +17,49 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 
-use data_encoding::BASE32_NOPAD;
+use data_encoding::{BASE32_NOPAD, HEXLOWER};
 
 use crate::cap::Cap;
+
+/// A biscuit revocation identifier: the opaque, per-block id whose presence in a [`Denylist`] revokes a cap
+/// (one entry of [`Cap::revocation_ids`]). It is an OPAQUE HANDLE: nauthy never interprets its bytes and
+/// construction does NOT verify they name a real block. A bogus id simply never matches a presented cap's
+/// chain, so a wrong id can only ever over-deny, never grant, which is why [`from_bytes`](Self::from_bytes)
+/// and [`from_hex`](Self::from_hex) are plain wrappers, not validating parsers.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RevocationId(Box<[u8]>);
+
+impl RevocationId {
+    /// Wrap raw id bytes. No validation: an id that names no real block just never matches (over-deny only).
+    pub fn from_bytes(bytes: impl Into<Box<[u8]>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// The raw id bytes, for a caller that encodes them for its own store.
+    pub fn as_bytes(&self) -> &[u8] {
+        let Self(bytes) = self;
+        bytes
+    }
+
+    /// The id as lowercase hex, the form an issuer's audit log records it in.
+    pub fn to_hex(&self) -> String {
+        HEXLOWER.encode(self.as_bytes())
+    }
+
+    /// Parse an id from the lowercase hex [`to_hex`](Self::to_hex) writes. Decodes hex only; it does not (and
+    /// cannot) verify the bytes name a real block, so a decoded-but-bogus id simply never matches.
+    pub fn from_hex(text: &str) -> Result<Self, RevocationIdParseError> {
+        HEXLOWER
+            .decode(text.as_bytes())
+            .map(|bytes| Self(bytes.into()))
+            .map_err(|_| RevocationIdParseError)
+    }
+}
+
+/// The text passed to [`RevocationId::from_hex`] was not valid hex.
+#[derive(Debug, thiserror::Error)]
+#[error("parse revocation id")]
+pub struct RevocationIdParseError;
 
 /// A persisted set of revoked capability ids (biscuit revocation identifiers), one base32 id per line.
 ///
@@ -35,7 +75,7 @@ pub struct Denylist {
 /// when loaded). The length pairs with mtime so a change within one coarse mtime tick is still seen: a
 /// revoke only ever GROWS the file, so a differing length is a reliable "changed" signal on its own.
 struct State {
-    ids: HashSet<Vec<u8>>,
+    ids: HashSet<RevocationId>,
     stamp: Option<(SystemTime, u64)>,
 }
 
@@ -97,11 +137,36 @@ impl Denylist {
     /// every cap attenuated from it, but not the ancestors it was narrowed from. Revoking a freshly minted
     /// cap (one block) denies it and all its delegations.
     pub async fn revoke(&mut self, cap: &Cap) -> Result<(), DenylistError> {
-        let mut ids = cap.revocation_ids();
         // A biscuit always has at least its authority block, so `pop` yields the narrowest id; stay total.
-        let Some(id) = ids.pop() else {
+        let Some(id) = cap.revocation_ids().pop() else {
             return Ok(());
         };
+        self.revoke_id(id).await
+    }
+
+    /// Revoke a cap at its ROOT authority block and persist. Records the cap's FIRST (authority-block) id,
+    /// the one every cap attenuated or delegated from it inherits, so this denies the WHOLE tree at once: the
+    /// root grant AND every narrower cap descended from it, however deep the delegation chain. Contrast
+    /// [`revoke`](Self::revoke), which records only the NARROWEST block and so denies a single leaf while its
+    /// ancestors keep granting. Revoking the root of a token you issued cuts off its holder and everyone they
+    /// re-shared it to in one entry, because [`is_revoked`](Self::is_revoked) checks the whole chain and every
+    /// descendant carries this root id.
+    pub async fn revoke_root(&mut self, cap: &Cap) -> Result<(), DenylistError> {
+        // `revocation_ids` is authority-block-first, so the first id is the root's; a biscuit always has an
+        // authority block, but stay total against an empty chain rather than indexing.
+        let Some(root) = cap.revocation_ids().into_iter().next() else {
+            return Ok(());
+        };
+        self.revoke_id(root).await
+    }
+
+    /// Revoke one raw biscuit revocation id and persist. The single primitive both [`revoke`](Self::revoke)
+    /// and [`revoke_root`](Self::revoke_root) funnel through: it inserts the id and, only if it was new,
+    /// atomically rewrites the file and adopts the `(mtime, len)` stamp so our OWN write triggers no
+    /// redundant reload on the next check. A caller that already holds an id it recorded when the cap was
+    /// minted (an issuer's audit index from grantee to root id) can revoke by that id directly, without still
+    /// holding the cap the id came from.
+    pub async fn revoke_id(&mut self, id: RevocationId) -> Result<(), DenylistError> {
         let inserted = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.ids.insert(id)
@@ -150,7 +215,7 @@ impl Denylist {
             state
                 .ids
                 .iter()
-                .map(|id| BASE32_NOPAD.encode(id))
+                .map(|id| BASE32_NOPAD.encode(id.as_bytes()))
                 .collect::<Vec<_>>()
         };
         lines.sort();
@@ -174,7 +239,7 @@ impl Denylist {
 #[allow(clippy::type_complexity)]
 async fn read_ids(
     path: &Path,
-) -> Result<(HashSet<Vec<u8>>, Option<(SystemTime, u64)>), DenylistError> {
+) -> Result<(HashSet<RevocationId>, Option<(SystemTime, u64)>), DenylistError> {
     match tokio::fs::read_to_string(path).await {
         Ok(text) => {
             let ids = parse_ids(&text)?;
@@ -189,8 +254,8 @@ async fn read_ids(
     }
 }
 
-/// Decode a denylist file body into a set of raw revocation ids.
-fn parse_ids(text: &str) -> Result<HashSet<Vec<u8>>, DenylistError> {
+/// Decode a denylist file body into a set of revocation ids.
+fn parse_ids(text: &str) -> Result<HashSet<RevocationId>, DenylistError> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -198,10 +263,11 @@ fn parse_ids(text: &str) -> Result<HashSet<Vec<u8>>, DenylistError> {
         .collect()
 }
 
-/// Decode one base32 revocation-id line into raw bytes.
-fn decode_id(line: &str) -> Result<Vec<u8>, DenylistError> {
+/// Decode one base32 revocation-id line into a [`RevocationId`].
+fn decode_id(line: &str) -> Result<RevocationId, DenylistError> {
     BASE32_NOPAD
         .decode(line.to_uppercase().as_bytes())
+        .map(RevocationId::from_bytes)
         .map_err(|_| DenylistError::Parse)
 }
 
