@@ -1,114 +1,223 @@
 # nauthy
 
-Decide whether an already-authenticated peer may connect. You hand it a peer's public key (which the
-transport has already proven) and a policy, and it returns admit or refuse. Trust roots at a single key
-you own: your own devices and anyone you delegate to are admitted by tokens that verify against that
-key, offline, with no server, no PKI, and no allowlist to keep in sync. Everyone else, nauthy turns away.
+Offline capability tokens rooted at one key you hold. Mint a grant to reach a service, narrow it, hand
+it on, revoke it, all verified against your key with no server, no PKI, and no control plane.
 
-**The name.** *nauthy* is *auth* with a wink at *naughty*: the doorkeeper that waves your own in and
-turns the naughty away.
-
-The capabilities are [biscuit](https://www.biscuitsec.org) tokens; nauthy wraps them behind a small,
-misuse-resistant API rather than hand-rolling crypto.
+The one thing that sets nauthy apart: a grant roots at the **same ed25519 key a peer already dials you
+at**. Where that key is your transport identity (iroh, libp2p, Noise, any ed25519 p2p), authorization
+collapses into the key the handshake already proved. There is no second identity to manage, nothing to
+phone home to, and verification is local arithmetic against one public key.
 
 ```rust
-use nauthy::{Gate, Decision};
-
-match gate.admit(peer_id, presented_cap, &service) {
-    Decision::Admit => serve(peer_id).await,
+match gate.admit(peer, presented, &service) {
+    Decision::Admit => serve(peer).await,
     Decision::Refuse(why) => reject(why),
 }
 ```
 
-> Experimental. The capability layer is v1; revocation is a node-local denylist plus short expiry (see
-> below).
+> Experimental. The token core is stable; the surrounding API may still change before 1.0.
 
-## The gate
+## Install
 
-A `Gate` is the policy a node applies to an inbound peer the transport has already authenticated. Two
-variants:
+```sh
+cargo add nauthy
+```
 
-- `Gate::Open` admits any peer that reached the key: the one deliberate opt-out.
-- `Gate::Family(signet)` admits a peer that presents a token rooted at a **signet**, a `NodeId` you own.
-  Everyone else is turned away.
+The defaults (`tokio-fs`, `os-rng`) give you the shipped file-backed revocation store and one-line key
+generation. For a build with no async runtime at all, take the core alone:
 
-The signet is a single key you own, not a list of keys to keep in sync. Verification asks one question:
-does this token chain back to the signet I trust? It is answered on the node, offline. No PKI, no
-registry, no server.
+```toml
+nauthy = { version = "0.1", default-features = false }
+```
 
-Build a family gate with `Gate::family(signet, denylist)`; `Gate::Open` is the constructor for the open
-variant.
+The core (`Gate`, `Cap`, `Identity`, the `Revocations` trait) needs no runtime. `--no-default-features`
+drops `FileDenylist` (bring your own `Revocations`) and `Identity::generate` (use `Identity::from_rng`
+with any CSPRNG you supply).
+
+## What you verify, and the one precondition
+
+You verify a presented token offline against one key you hold. No server is ever contacted. The whole
+check is: does this token chain back to my key, and do its checks pass right now.
+
+nauthy authorizes an identity; it does not authenticate one. It rests on **one precondition it cannot
+check itself**: that a transport handshake has already proven the peer holds the private key behind its
+public key. That is what `ProvenPeer::from_handshake` marks. It is a well-marked contract at a single
+seam you audit, not a guarantee the type system proves: nauthy has no transport to check, so you must
+call it only from the code that finished the handshake, with the key the handshake proved. Every
+device-bound grant rests on that one call being honest.
 
 ## The grants
 
-One signet signs every grant. Each is a `Cap` (a token) verified offline against that signet. There are
-four shapes, for four questions:
+One key signs four token shapes, plus one policy that needs no token. Each answers one question:
 
-- **Membership badge** (`Identity::mint_member`) answers "this device is mine." Bound to one device's
-  key, it admits that device to the whole node, every service. This is how your own machines get in.
-- **Device-bound slip** (`Identity::mint_bound`) answers "this one device may reach this one service."
-  Bound to the device's key, so a copy is inert for anyone else, and it cannot be delegated. Standing
-  access for a single machine.
-- **Signet-bound slip** (`Identity::mint_signet_slip`) answers "every device in this person's fleet may
-  reach this one service." It pins a foreign signet you name, so every device that signet vouches for,
-  now or later, may use it. Theft-resistant, non-delegable. Issue it once to admit a whole person.
-- **Unbound slip** (`Identity::mint`) answers "whoever holds this link may reach this one service." A
-  bearer token: anyone with a copy may present it. It carries no binding, so a holder can narrow it and
-  pass it on. Short expiry is its revocation story.
+| Grant | Question | Bound to | Delegable |
+| ----- | -------- | -------- | --------- |
+| open gate (`Gate::Open`) | anyone who reached me | nothing | n/a |
+| membership badge (`Identity::mint_member`) | is this device mine? (whole node) | one device | no |
+| device-bound slip (`Identity::mint_bound`) | may this device reach this service? | one device | no |
+| authority-bound slip (`Identity::mint_authority_slip`) | may any device a named authority vouches for reach this service? | that authority | no |
+| bearer slip (`Identity::mint`) | may whoever holds this link reach this service? | nothing | yes |
 
-The law the crypto enforces: a **bound** grant (device or signet) is theft-resistant and cannot be
-widened or delegated; a **bearer** grant can be narrowed and delegated but should be short-lived.
-Attenuation only ever ADDS checks, so a slip can never be widened into a badge, and a narrower link can
-never be broadened back.
+The law the crypto enforces: a **bound** grant is theft-resistant and non-delegable, because a copy
+replayed from a different key verifies against no one. A **bearer** grant is delegable and should be
+short-lived, because whoever holds an unexpired copy can use it. Narrowing a token only ever ADDS checks,
+so a slip can never be widened into a badge, and a narrowed link can never be broadened back.
 
-The root key of every grant is the **signet's own `NodeId`**, so verification asks one question: "does
-this token chain back to the signet I trust?" A share-link is `sheer:<node-id>.<base32-token>`: it
-carries the signet's public `NodeId` beside the token, so a holder can decode and narrow it offline, and
-a connector learns which node to dial from the link alone.
-
-- **mint** (signet): `Identity::from_secret(&secret)?.mint(&service, expiry)` signs a bearer service
-  slip. `mint_member`, `mint_bound`, and `mint_signet_slip` sign the bound forms above.
-- **attenuate** (any holder, offline): `cap.attenuate(Some(&service), Some(shorter_expiry))` appends a
-  narrower check. Monotone by construction: a block can only ADD checks, so broadening is impossible.
-- **delegate** (any holder, offline): attenuate, then hand the narrower link onward. The signet verifies
-  the whole chain without ever seeing the delegation. Only a bearer slip is delegable; a bound one is
-  inert for anyone but the device or fleet it names.
-- **verify** (signet): the gate grants iff the cap roots at this signet, its binding holds for the proven
-  dialer, the service matches, and the token is unexpired.
+## From zero: generate, mint, narrow, verify, revoke
 
 ```rust
 use core::time::Duration;
-use nauthy::{Cap, Identity, Request, Service, expires_in};
 
-let signet = Identity::from_secret(&secret)?;
-let cap = signet.mint(&"ssh".parse::<Service>()?, expires_in(Duration::from_secs(3600)))?;
-let link = cap.link()?; // sheer:bf01….<token>  -> hand this out
+use nauthy::{Cap, Decision, FileDenylist, Gate, Identity, ProvenPeer, Refusal, Request, Service};
 
-// a holder narrows it, offline, before delegating
-let tighter = Cap::parse(&link)?.attenuate(None, Some(expires_in(Duration::from_secs(600))))?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. One key is your whole trust root. Generate a fresh ed25519 identity
+    //    (or load a persisted 32-byte secret with `Identity::from_secret`).
+    let authority = Identity::generate()?;
 
-// the signet verifies a presented cap at connect time
-signet.verify(&Cap::parse(&tighter.link()?)?, &Request::now("ssh".parse()?))?;
+    // 2. Mint a grant: reach the "ssh" service, good for one hour.
+    let ssh: Service = "ssh".parse()?;
+    let cap = authority.mint(&ssh, Request::expires_in(Duration::from_secs(3600)))?;
+
+    // 3. Hand it out as a link. A holder can narrow it further, offline, with no secret.
+    let link = cap.link()?;
+    let narrowed =
+        Cap::parse(&link)?.attenuate(None, Some(Request::expires_in(Duration::from_secs(600))))?;
+
+    // The transport handshake proved which key the peer holds; mark that fact here.
+    // (In a real service this key comes from your transport, not a fresh identity.)
+    let peer = ProvenPeer::from_handshake(Identity::generate()?.verifying_key());
+
+    // 4. On your node, decide whether the peer may connect. The gate trusts one key: yours.
+    let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
+    match gate.admit(peer, Some(&narrowed), &ssh) {
+        Decision::Admit => println!("admitted"),
+        Decision::Refuse(why) => println!("refused: {why}"),
+    }
+
+    // 5. Revoke the whole grant. Records the root id, so the cap and every link
+    //    narrowed from it are refused from now on, offline.
+    let mut denylist = FileDenylist::empty("caps.deny".into());
+    denylist.revoke_root(&cap).await?;
+
+    // A gate reading the same denylist now refuses the narrowed link with Refusal::Revoked.
+    let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
+    assert!(matches!(
+        gate.admit(peer, Some(&narrowed), &ssh),
+        Decision::Refuse(Refusal::Revoked),
+    ));
+    Ok(())
+}
 ```
+
+For a compile-time proof that a service handler cannot run without a ruling, use `admit_witnessed`, which
+returns an `Admitted` witness (single-use, no public constructor) instead of a plain `Decision`. A
+handler that takes an `Admitted` cannot be reached without a gate having permitted the peer.
+
+A link is `sheer:<key>.<token>`: it carries the authority's public key beside the token, so a holder can
+decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone.
 
 ## Revocation
 
-A `Family` gate consults a node-local **denylist**. Revoking a grant appends its id to a file the node
-reads; from then on the grant is refused, offline, with no server to ask. `Denylist::revoke` refuses one
-link; `Denylist::revoke_root` refuses a grant and every narrower link delegated from it, in one entry.
+A token verifies offline, so there is no server to ask "is this revoked?". Instead the issuer keeps a set
+of revoked ids, and the gate refuses any presented token whose chain includes one. This survives a
+restart, which a short expiry cannot: an expiry ages a leaked token out eventually but cannot recall it
+now.
 
-Revocation is checked at connect time and fails closed: a new connection presenting a revoked grant is
-turned away. It does not evict a session already in progress. Short expiry backs it up, a grant that
-outlives its use expires on its own; revoking a broad grant before it expires is the denylist's job.
+- `revoke` records a token's narrowest id: refuses that exact link, but not the grants it was narrowed
+  from.
+- `revoke_root` records the authority-block id every descendant inherits: refuses the grant and its whole
+  delegation tree in one entry.
 
-Because the denylist is node-local, an owner running several nodes revokes on each; a revoke on one
-does not reach the others.
+The shipped `FileDenylist` is a set of ids on disk, checked at connect time and fails closed. It reloads
+live when the file changes, so a revocation written by another process takes effect on the next
+connection without a restart. Revocation does not evict a session already in progress; short expiry backs
+it up.
 
-A signet-bound slip carries one limit worth naming. A gate keys its denylist on grant ids and the
-signet a slip pins, never on the fleet's individual devices, which it never sees. So when a device
-leaves that fleet (lost or stolen), the fleet's owner can drop it on their side, but a node that
-granted the whole fleet cannot tell that one device apart: it stays admitted until the signet-bound
-slip itself is revoked or expires. Keep signet-bound slips short-lived so a stray device ages out.
+## The seams: what you bring
+
+nauthy is the authorization layer, and no more. Three seams are yours:
+
+- **A transport-proven peer.** You call `ProvenPeer::from_handshake` from the code that finished the
+  handshake. nauthy consumes the proof; it does not perform the handshake.
+- **A revocation store.** Use the shipped `FileDenylist`, or implement the one-method `Revocations` trait
+  over whatever you keep (a database, Redis, a gossip set). The gate consults it synchronously.
+- **Where secrets come from.** An identity is any 32-byte ed25519 secret. Deriving many device secrets
+  from one root seed (so one person's devices share an authority) is your identity layer's job; nauthy
+  mints a badge for whatever key you name.
+
+nauthy brings the grant vocabulary, offline verification, device binding against replay, the single-use
+`Admitted` witness, and the shipped revocation store.
+
+## Recipes
+
+Two patterns you build on nauthy's own primitives.
+
+**An authority directory on `sign_document`.** `Identity::sign_document` signs opaque bytes with the same
+key that mints tokens, producing a self-verifying blob. Publish records (a name-to-key mapping, a roster,
+a config) that any node may relay and only the authority can forge; a reader verifies each against the
+key it trusts before parsing.
+
+```rust
+let signed = authority.sign_document(record_bytes);
+let wire = signed.encode();                       // serve or gossip this
+// on the reader:
+let payload = Signed::decode(&wire)?.verify(authority.verifying_key())?;
+```
+
+**An audit index on `root_revocation_id`.** A control-plane-free system has no queryable "who has access
+now". If you need one, build it: at mint time record `cap.root_revocation_id()` beside the grantee. Later
+you can list outstanding grants, and revoke one by its id alone, without still holding the token.
+
+```rust
+let root_id = cap.root_revocation_id().expect("a minted cap has an authority block");
+index.insert("alice", root_id.to_hex());          // your directory
+// later, revoke by that id:
+denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
+```
+
+## The honest limits
+
+- **A bearer slip is a bearer token.** Whoever holds an unexpired, un-revoked one gets that service until
+  it expires or you revoke it. Keep bearer slips short-lived; prefer a bound grant where you can.
+- **Revocation is node-local.** Revoking on one node does not reach others. An owner running several
+  nodes revokes on each. The `FileDenylist` file must live on durable storage: a restart on ephemeral
+  storage resurrects every revoked token.
+- **An authority-bound slip cannot single out one device** of the foreign authority it names; it sees
+  only that authority, never its individual devices. When a device leaves that authority, revoke the slip
+  or let it expire. Keep these short-lived.
+- **No queryable source of truth.** There is no central "who has access right now"; you revoke by id
+  after the fact, and see outstanding grants only if you keep the audit index above. This is the trade:
+  auditability for zero infrastructure. If you must answer "who has access" from a central authority for
+  compliance, nauthy is the wrong tool.
+- **The clock matters.** Expiry is checked against the local clock; a badly-wrong clock widens or voids a
+  grant's window.
+
+## nauthy and UCAN, and why the fusion
+
+nauthy sits in the same niche as [UCAN](https://github.com/ucan-wg/spec): offline-verifiable, attenuable,
+delegable capability tokens with no control plane. Over UCAN, nauthy roots at the transport key rather
+than a separate DID identity layer (UCAN recommends per-context keys that do NOT move between contexts);
+its device binding falls out of the transport proof rather than a second signature on every use; and it
+is one small Rust dependency, not a spec ecosystem. Over [DPoP (RFC 9449)](https://www.rfc-editor.org/info/rfc9449),
+which standardizes the same replay defense, nauthy needs no OAuth server and binds to the key the
+transport already proved rather than a fresh one.
+
+Own what they have that nauthy does not: UCAN has cross-language libraries, spec governance, and adopters;
+DPoP is a finalized IETF standard in broad production use. The token core under nauthy is
+[Eclipse Biscuit](https://www.biscuitsec.org), which gives full datalog where nauthy gives five fixed
+shapes, and has been through external security review nauthy has not. If you are not already a
+pubkey-transport system, or you need central mutable policy, reach for those.
+
+nauthy is deliberately none of those. It is not a policy engine, not a workload-identity server, and not a
+relationship store. It is the zero-infrastructure, capability side of that fork, for systems where your
+key is already your identity, and it stays there.
+
+## The name
+
+*nauthy* is *auth* with a wink at *naughty*: the doorkeeper that waves your own in and turns the naughty
+away.
 
 ## License
 

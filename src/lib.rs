@@ -4,7 +4,7 @@
 //! Authorization here is policy on *proven* identities, not crypto: a transport handshake has already
 //! proven the peer holds the private key behind its [`VerifyKey`], so the question is only whether that
 //! identity is permitted. nauthy sits above the transport and never reaches out itself, so it is usable
-//! wherever a peer can be named by an ed25519 key, theia or not.
+//! wherever a peer can be named by an ed25519 key.
 //!
 //! Two policies:
 //! - [`Gate::Open`] permits any peer.

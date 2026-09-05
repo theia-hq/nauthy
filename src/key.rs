@@ -20,9 +20,9 @@ const TAG: &str = "bf01";
 /// A peer identity nauthy authorizes: a raw 32-byte ed25519 public (verifying) key.
 ///
 /// This is the key a cap roots at and a transport handshake proves the peer holds. Its string form is a
-/// four-character suite tag `bf01` then the base32-lowercase key body, identical to a `bifrost_core::NodeId`
-/// for the same key, so a `sheer:` link is portable across the nauthy/bifrost boundary with no conversion at
-/// the wire.
+/// four-character suite tag `bf01` then the base32-lowercase key body. The bytes are a plain ed25519 public
+/// key, so a `VerifyKey` is interchangeable with any transport that identifies a peer by its ed25519 key: a
+/// `sheer:` link embeds this string form and round-trips across that boundary with no conversion at the wire.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct VerifyKey([u8; Self::LEN]);
 
