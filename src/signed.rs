@@ -3,13 +3,14 @@
 //! The generic primitive under any signed artifact rooted at an identity. [`Identity::sign_document`]
 //! signs a payload with the same ed25519 key the identity mints caps with, and [`Signed::verify`] against
 //! the key you actually trust is the whole security seam: only that key's secret makes a signature the
-//! key verifies, so any courier may hold and relay the blob and none can forge it. The payload is OPAQUE
+//! key verifies, so any holder may relay the blob and none can forge it. The payload is OPAQUE
 //! here (nauthy attaches no meaning to the bytes): a consumer canonicalizes and parses its own document,
 //! and this layer only proves who signed the bytes and that they were not tampered.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::VerifyKey;
+use crate::cap::SIGNED_DOCUMENT_CONTEXT;
 
 /// The detached signature length (ed25519).
 const SIG_LEN: usize = 64;
@@ -44,29 +45,38 @@ impl Signed {
         }
     }
 
-    /// Verify this blob was signed by `signet` and return the enclosed payload ONLY on success. This is the
-    /// whole trust check: a blob signed by a FOREIGN key, or tampered after signing, is rejected here.
+    /// Verify this blob was signed by `authority` and return the enclosed payload ONLY on success. This is
+    /// the whole trust check: a blob signed by a FOREIGN key, or tampered after signing, is rejected here.
     ///
     /// The claimed `signer` field is used ONLY for the equality gate; the actual signature check keys off
-    /// the caller's trusted `signet`, so a blob claiming a signer it did not sign for cannot slip through.
+    /// the caller's trusted `authority`, so a blob claiming a signer it did not sign for cannot slip
+    /// through. The signature is checked over the domain-separation tag `SIGNED_DOCUMENT_CONTEXT` followed
+    /// by the payload, the same message [`sign_document`](crate::Identity::sign_document) signed, so a
+    /// document signature can never be replayed as any other kind of signature this identity makes.
     /// `verify_strict` rejects the ed25519 malleability (non-canonical `S`, small-order `R`) that would let
     /// a second valid signature exist over the same bytes. Proves AUTHENTICITY, not freshness: a caller that
     /// needs to reject a stale-but-genuine replay owns that check (there is no epoch memory here).
-    pub fn verify(&self, signet: VerifyKey) -> Result<&[u8], SignError> {
-        if self.signer != signet {
+    pub fn verify(&self, authority: VerifyKey) -> Result<&[u8], SignError> {
+        if self.signer != authority {
             return Err(SignError::ForeignSigner);
         }
         let verifying =
-            VerifyingKey::from_bytes(signet.bytes()).map_err(|_| SignError::BadSignature)?;
+            VerifyingKey::from_bytes(authority.bytes()).map_err(|_| SignError::BadSignature)?;
         let signature = Signature::from_bytes(&self.signature);
+        // Verify over TAG || payload, matching sign_document. The tag domain-separates a document signature
+        // from a biscuit authority-block signature made by the same key (see SIGNED_DOCUMENT_CONTEXT).
+        let mut message = SIGNED_DOCUMENT_CONTEXT.to_vec();
+        message.extend_from_slice(&self.payload);
         verifying
-            .verify_strict(&self.payload, &signature)
+            .verify_strict(&message, &signature)
             .map_err(|_| SignError::BadSignature)?;
         Ok(&self.payload)
     }
 
-    /// The wire blob a courier serves and a puller reads: the 32-byte signer, the 64-byte signature, then
-    /// the payload bytes verbatim (which run to the end of the blob, so no length prefix is needed).
+    /// The on-wire form one node serves and another reads: the 32-byte signer, the 64-byte signature, then
+    /// the payload bytes verbatim (which run to the end of the blob, so no length prefix is needed). The
+    /// domain-separation tag is a signing-time prefix only, never stored, so the payload here is exactly the
+    /// caller's opaque bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(VerifyKey::LEN + SIG_LEN + self.payload.len());
         out.extend_from_slice(self.signer.bytes());

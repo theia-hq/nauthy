@@ -407,14 +407,16 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "nauthy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "biscuit-auth",
  "data-encoding",
  "ed25519-dalek",
+ "rand_core",
  "static_assertions",
  "thiserror 2.0.20",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -981,8 +983,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[patch.unused]]
-name = "tightbeam"
-version = "0.3.0"
+name = "quirk"
+version = "0.0.0"
 
 [[patch.unused]]
 name = "bifrost"
@@ -1013,5 +1015,5 @@ name = "bifrost-wire"
 version = "0.0.0"
 
 [[patch.unused]]
-name = "quirk"
-version = "0.0.0"
+name = "tightbeam"
+version = "0.3.0"

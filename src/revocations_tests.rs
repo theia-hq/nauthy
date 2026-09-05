@@ -1,12 +1,12 @@
-//! The denylist's two revocation reaches: a narrowest-block [`revoke`](Denylist::revoke) that kills one
-//! leaf, and a root-block [`revoke_root`](Denylist::revoke_root) that kills a grant and every cap descended
-//! from it.
+//! The denylist's two revocation reaches: a narrowest-block [`revoke`](FileDenylist::revoke) that kills one
+//! leaf, and a root-block [`revoke_root`](FileDenylist::revoke_root) that kills a grant and every cap
+//! descended from it.
 
 use core::time::Duration;
 use std::time::SystemTime;
 
 use crate::cap::Identity;
-use crate::revocations::Denylist;
+use crate::revocations::FileDenylist;
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -24,22 +24,22 @@ fn far_expiry() -> SystemTime {
 }
 
 /// A fresh denylist backed by a unique temp path, so parallel tests never share a file.
-fn denylist(tag: &str) -> Denylist {
+fn denylist(tag: &str) -> FileDenylist {
     let path = std::env::temp_dir().join(format!(
         "nauthy-denylist-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = std::fs::remove_file(&path);
-    Denylist::empty(path)
+    FileDenylist::empty(path)
 }
 
 #[tokio::test]
 async fn revoke_root_refuses_the_root_cap_and_a_child_delegated_from_it() {
     // A root grant, and a child a holder attenuated (delegated) from it. Both carry the root's authority
     // block, hence its revocation id, so revoking the root must refuse BOTH in one entry.
-    let exposer = identity(1);
-    let root = exposer.mint(&service("ssh"), far_expiry()).expect("mint");
+    let issuer = identity(1);
+    let root = issuer.mint(&service("ssh"), far_expiry()).expect("mint");
     let child = root
         .attenuate(None, Some(far_expiry()))
         .expect("holder narrows and re-shares");
@@ -61,8 +61,8 @@ async fn revoke_root_refuses_the_root_cap_and_a_child_delegated_from_it() {
 async fn plain_revoke_refuses_only_the_leaf_not_its_parent() {
     // Contrast: plain `revoke` records only the narrowest block. Revoking the CHILD leaf refuses that leaf
     // but leaves its parent (the wider grant it was narrowed from) still granting.
-    let exposer = identity(1);
-    let parent = exposer.mint(&service("ssh"), far_expiry()).expect("mint");
+    let issuer = identity(1);
+    let parent = issuer.mint(&service("ssh"), far_expiry()).expect("mint");
     let child = parent
         .attenuate(None, Some(far_expiry()))
         .expect("holder narrows");

@@ -1,9 +1,18 @@
 [package]
 name = "nauthy"
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
+
+[features]
+default = ["tokio-fs", "os-rng"]
+# The file-backed revocation store (`FileDenylist`) and its async fs I/O. Off in a no-runtime core: the
+# `Revocations` trait, `Gate`, `Cap`, and `Identity` build with no async runtime at all.
+tokio-fs = ["dep:tokio"]
+# The no-argument `Identity::generate`, seeded from the OS CSPRNG. Off for a no-OS consumer, which still
+# has `Identity::from_rng` with a caller-supplied CSPRNG.
+os-rng = ["rand_core/getrandom"]
 
 [dependencies]
 biscuit-auth = "6"
@@ -12,8 +21,14 @@ data-encoding = "2"
 # token). Already in the tree transitively via biscuit-auth; declared directly so the roster primitive signs
 # with a plain, obvious ed25519 signature rather than smuggling a document into an authorization token.
 ed25519-dalek = "2"
+# The CSPRNG traits `Identity::from_rng` accepts, so keygen needs no OS dependency in the core; the
+# OS-seeded `Identity::generate` is behind `os-rng`, which turns on rand_core's own `getrandom`.
+rand_core = "0.6"
 thiserror = "2"
-tokio = { version = "1", features = ["fs"] }
+# The file-backed denylist's async fs I/O; optional so the core carries no async runtime (see `tokio-fs`).
+tokio = { version = "1", features = ["fs"], optional = true }
+# Wipe the 32 secret bytes off the stack after a fresh keypair is built (`Identity::from_rng`).
+zeroize = "1"
 
 [dev-dependencies]
 # Compile-time NEGATIVE-trait assertion that the single-use `Admitted` witness stays !Clone + !Copy: a

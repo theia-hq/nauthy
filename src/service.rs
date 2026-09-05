@@ -3,7 +3,8 @@
 use core::fmt;
 use core::str::FromStr;
 
-/// A service name, as passed to `expose name=addr` and carried in a [`Cap`](crate::Cap).
+/// A service name, carried in a [`Cap`](crate::Cap) to name the service a grant reaches (for example
+/// `ssh`, `web`, `docker`).
 ///
 /// Newtyped and validated at the edge because the name is embedded into a biscuit datalog check
 /// (`service == "<name>"`). Restricting it to a small, quote-free alphabet keeps a service name from

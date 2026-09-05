@@ -1,31 +1,56 @@
-//! A persisted denylist of revoked capability ids: the offline revocation story for `sheer:` bearer caps.
+//! Offline revocation for `sheer:` bearer caps: the [`Revocations`] oracle the gate consults, and a
+//! file-backed [`FileDenylist`] that implements it.
 //!
-//! A cap is offline-verifiable, so there is no server to ask "is this revoked?". Instead the exposer keeps
-//! its own denylist of biscuit revocation identifiers: revoking a cap records its narrowest block's id, and
-//! the gate refuses any presented cap whose chain includes a revoked id (the cap itself, or an ancestor it
-//! was attenuated from). Pure-offline, node-local, and it survives restarts, which a short TTL cannot: a
-//! TTL ages a leaked cap out eventually but cannot recall it now.
+//! A cap is offline-verifiable, so there is no server to ask "is this revoked?". Instead the issuer keeps
+//! its own set of biscuit revocation identifiers: revoking a cap records its narrowest block's id, and the
+//! gate refuses any presented cap whose chain includes a revoked id (the cap itself, or an ancestor it was
+//! attenuated from). Pure-offline, node-local, and it survives restarts, which a short TTL cannot: a TTL
+//! ages a leaked cap out eventually but cannot recall it now.
 //!
-//! Revocation is LIVE: [`is_revoked`](Denylist::is_revoked) re-reads the file whenever its mtime changes,
-//! so a revocation written by a separate process takes effect on the next connection to a long-running
-//! exposer; it does not wait for a restart. The file's mtime is the freshness signal; the reload is a
-//! small, rare read (only when the file actually changed), guarded by interior mutability so the gate's
-//! synchronous admit path stays synchronous.
+//! [`Revocations`] is the seam. It is a synchronous, one-method trait, so a consumer whose distributed
+//! system keeps revocations in Redis, a database, or a gossip set implements it over that store and needs
+//! no file and no async runtime. The batteries-included impl is [`FileDenylist`] (behind the `tokio-fs`
+//! feature), a persisted set of ids on disk.
+//!
+//! Revocation through [`FileDenylist`] is LIVE: [`is_revoked`](FileDenylist::is_revoked) re-reads the file
+//! when its mtime changes, so a revocation written by a separate process takes effect on the next
+//! connection to a long-running issuer; it does not wait for a restart. The file's mtime is the freshness
+//! signal; the reload is a small, rare read (only when the file actually changed), guarded by interior
+//! mutability so the gate's synchronous admit path stays synchronous.
 
+#[cfg(feature = "tokio-fs")]
+use core::time::Duration;
+#[cfg(feature = "tokio-fs")]
 use std::collections::HashSet;
+#[cfg(feature = "tokio-fs")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "tokio-fs")]
 use std::sync::{Mutex, PoisonError};
-use std::time::SystemTime;
+#[cfg(feature = "tokio-fs")]
+use std::time::{Instant, SystemTime};
 
-use data_encoding::{BASE32_NOPAD, HEXLOWER};
+use data_encoding::HEXLOWER;
 
 use crate::cap::Cap;
 
-/// A biscuit revocation identifier: the opaque, per-block id whose presence in a [`Denylist`] revokes a cap
-/// (one entry of [`Cap::revocation_ids`]). It is an OPAQUE HANDLE: nauthy never interprets its bytes and
-/// construction does NOT verify they name a real block. A bogus id simply never matches a presented cap's
-/// chain, so a wrong id can only ever over-deny, never grant, which is why [`from_bytes`](Self::from_bytes)
-/// and [`from_hex`](Self::from_hex) are plain wrappers, not validating parsers.
+/// The revocation oracle a [`Gate::Rooted`](crate::Gate::Rooted) consults on the admit hot path.
+///
+/// Synchronous by design: admission is synchronous policy, so a revocation check must never require an
+/// async runtime. A consumer whose distributed system keeps revocations in Redis, a database, or a gossip
+/// set implements this over that store; nauthy's core needs no file and no runtime. The provided
+/// file-backed impl is [`FileDenylist`] behind the `tokio-fs` feature.
+pub trait Revocations {
+    /// Whether a presented cap is revoked: any id in its chain (the cap's own blocks, including any it
+    /// inherited from the grant it was attenuated from) is recalled. See [`Cap::revocation_ids`].
+    fn is_revoked(&self, cap: &Cap) -> bool;
+}
+
+/// A biscuit revocation identifier: the opaque, per-block id whose presence in a revocation set (see
+/// [`Revocations`]) revokes a cap (one entry of [`Cap::revocation_ids`]). It is an OPAQUE HANDLE: nauthy
+/// never interprets its bytes and construction does NOT verify they name a real block. A bogus id simply
+/// never matches a presented cap's chain, so a wrong id can only ever over-deny, never grant, which is why
+/// [`from_bytes`](Self::from_bytes) and [`from_hex`](Self::from_hex) are plain wrappers, not validating
+/// parsers.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct RevocationId(Box<[u8]>);
 
@@ -41,7 +66,8 @@ impl RevocationId {
         bytes
     }
 
-    /// The id as lowercase hex, the form an issuer's audit log records it in.
+    /// The id as lowercase hex, the form an issuer's audit log records it in AND the exact form a
+    /// [`FileDenylist`] writes one per line, so a grep of `to_hex` output against the file finds it.
     pub fn to_hex(&self) -> String {
         HEXLOWER.encode(self.as_bytes())
     }
@@ -61,31 +87,53 @@ impl RevocationId {
 #[error("parse revocation id")]
 pub struct RevocationIdParseError;
 
-/// A persisted set of revoked capability ids (biscuit revocation identifiers), one base32 id per line.
+/// A persisted set of revoked capability ids (biscuit revocation identifiers), one lowercase-hex id per
+/// line, and the batteries-included [`Revocations`] impl.
 ///
 /// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
 /// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the mtime it was
 /// read at, so a check can refresh it in place when the file changed underneath a running process.
-pub struct Denylist {
+///
+/// DURABILITY IS A HARD PRECONDITION: the backing file must live on durable storage that survives a
+/// restart. A restart on ephemeral storage resurrects every revoked cap, because [`load`](Self::load) of an
+/// absent file is an empty set, and an empty set revokes nothing.
+#[cfg(feature = "tokio-fs")]
+pub struct FileDenylist {
     path: PathBuf,
     state: Mutex<State>,
 }
 
-/// The loaded ids and the `(mtime, len)` stamp of the file they were read at (`None` = the file was absent
-/// when loaded). The length pairs with mtime so a change within one coarse mtime tick is still seen: a
-/// revoke only ever GROWS the file, so a differing length is a reliable "changed" signal on its own.
+/// The loaded ids, the `(mtime, len)` stamp of the file they were read at (`None` = the file was absent
+/// when loaded), and the last moment we stat'd the file. The length pairs with mtime so a change within one
+/// coarse mtime tick is still seen: a revoke only ever GROWS the file, so a differing length is a reliable
+/// "changed" signal on its own.
+#[cfg(feature = "tokio-fs")]
 struct State {
     ids: HashSet<RevocationId>,
     stamp: Option<(SystemTime, u64)>,
+    last_stat: Option<Instant>,
 }
 
-impl Denylist {
+/// The admit hot path calls [`is_revoked`](FileDenylist::is_revoked) once per connection, but a revocation
+/// written by another process only needs to be seen within a short window. So the refresh stats the file at
+/// most once per this interval rather than on every admit under the lock; a revocation goes live within one
+/// interval, which is well inside "the next connection" the doc promises. `pub(crate)` so a timing-sensitive
+/// test can wait past it deterministically.
+#[cfg(feature = "tokio-fs")]
+pub(crate) const STAT_DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "tokio-fs")]
+impl FileDenylist {
     /// Load the denylist from `path`; an absent file is an empty set.
     pub async fn load(path: PathBuf) -> Result<Self, DenylistError> {
         let (ids, stamp) = read_ids(&path).await?;
         Ok(Self {
             path,
-            state: Mutex::new(State { ids, stamp }),
+            state: Mutex::new(State {
+                ids,
+                stamp,
+                last_stat: None,
+            }),
         })
     }
 
@@ -93,8 +141,8 @@ impl Denylist {
     /// inherited from the grant it was attenuated from) is on the denylist.
     ///
     /// Refreshes from disk first if the file changed since the last read, so a revocation written by
-    /// another process is honored by a long-running exposer without a restart. The
-    /// mtime check is a cheap stat; the file is re-read only when it actually changed.
+    /// another process is honored by a long-running issuer without a restart. The stat is debounced (see
+    /// `STAT_DEBOUNCE`); the file is re-read only when it actually changed.
     pub fn is_revoked(&self, cap: &Cap) -> bool {
         let chain = cap.revocation_ids();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -103,7 +151,8 @@ impl Denylist {
     }
 
     /// Reload the ids in place if the backing file's mtime differs from what we last read. Synchronous and
-    /// on the admit hot path, so it stats every call but re-reads only on change.
+    /// on the admit hot path, so it debounces the stat to at most once per [`STAT_DEBOUNCE`] and re-reads
+    /// only on change.
     ///
     /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
     /// leave the last-known set intact and return. Deletion is not "the denylist is now empty": a `rm` of
@@ -113,6 +162,15 @@ impl Denylist {
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
     fn refresh(&self, state: &mut State) {
+        // Debounce: skip the stat entirely if we checked within the last STAT_DEBOUNCE. The first check
+        // after construction (`last_stat` is None) always stats, so a freshly-loaded denylist sees the
+        // current file at once.
+        if let Some(last) = state.last_stat {
+            if last.elapsed() < STAT_DEBOUNCE {
+                return;
+            }
+        }
+        state.last_stat = Some(Instant::now());
         let current = match std::fs::metadata(&self.path) {
             Ok(meta) => meta.modified().ok().map(|mtime| (mtime, meta.len())),
             // Missing file: keep the last-known set. If one was ever loaded, this is deletion, not empty.
@@ -195,6 +253,7 @@ impl Denylist {
             state: Mutex::new(State {
                 ids: HashSet::new(),
                 stamp: None,
+                last_stat: None,
             }),
         }
     }
@@ -212,10 +271,12 @@ impl Denylist {
         }
         let mut lines = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            // Encode through RevocationId::to_hex so the file and the API encoding cannot diverge: the file
+            // is exactly what to_hex writes, and decode_id reads it back through from_hex.
             state
                 .ids
                 .iter()
-                .map(|id| BASE32_NOPAD.encode(id.as_bytes()))
+                .map(RevocationId::to_hex)
                 .collect::<Vec<_>>()
         };
         lines.sort();
@@ -232,9 +293,17 @@ impl Denylist {
     }
 }
 
+#[cfg(feature = "tokio-fs")]
+impl Revocations for FileDenylist {
+    fn is_revoked(&self, cap: &Cap) -> bool {
+        FileDenylist::is_revoked(self, cap)
+    }
+}
+
 /// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file's
 /// `(mtime, len)` stamp (`None` if absent).
 // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+#[cfg(feature = "tokio-fs")]
 #[allow(clippy::std_instead_of_core)]
 #[allow(clippy::type_complexity)]
 async fn read_ids(
@@ -255,6 +324,7 @@ async fn read_ids(
 }
 
 /// Decode a denylist file body into a set of revocation ids.
+#[cfg(feature = "tokio-fs")]
 fn parse_ids(text: &str) -> Result<HashSet<RevocationId>, DenylistError> {
     text.lines()
         .map(str::trim)
@@ -263,21 +333,21 @@ fn parse_ids(text: &str) -> Result<HashSet<RevocationId>, DenylistError> {
         .collect()
 }
 
-/// Decode one base32 revocation-id line into a [`RevocationId`].
+/// Decode one lowercase-hex revocation-id line into a [`RevocationId`], through the same
+/// [`RevocationId::from_hex`] the API uses, so the file and API encodings can never diverge.
+#[cfg(feature = "tokio-fs")]
 fn decode_id(line: &str) -> Result<RevocationId, DenylistError> {
-    BASE32_NOPAD
-        .decode(line.to_uppercase().as_bytes())
-        .map(RevocationId::from_bytes)
-        .map_err(|_| DenylistError::Parse)
+    RevocationId::from_hex(line).map_err(|_| DenylistError::Parse)
 }
 
 /// Why loading or persisting the denylist failed.
+#[cfg(feature = "tokio-fs")]
 #[derive(Debug, thiserror::Error)]
 pub enum DenylistError {
     /// The backing file could not be read or written.
     #[error("access revocation denylist")]
     Io(#[source] std::io::Error),
-    /// A line in the file was not a valid base32 revocation id.
+    /// A line in the file was not a valid lowercase-hex revocation id.
     #[error("parse revocation id")]
     Parse,
 }

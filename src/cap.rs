@@ -1,8 +1,8 @@
-//! The capability primitive: a `sheer` bearer token, offline-verifiable, rooted at an exposer's own
+//! The capability primitive: a `sheer` bearer token, offline-verifiable, rooted at an issuer's own
 //! identity, with no central authority.
 //!
 //! A [`Cap`] is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable token. Its root key is
-//! the exposer's [`VerifyKey`] key, so verification asks one question, "does this token chain back to the
+//! the issuer's [`VerifyKey`] key, so verification asks one question, "does this token chain back to the
 //! key I am?", answered with pure pubkey identity and no PKI, registry, or server.
 //!
 //! A cap carries two kinds of check, both *monotone*: appending a block can only ever ADD checks, never
@@ -11,16 +11,16 @@
 //! - a **service** check (`check if service($s), $s == "ssh"`): the token is usable only for that service.
 //! - an **expiry** check (`check if time($t), $t <= <expiry>`): the token is usable only until that time.
 //!
-//! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the exposer's [`VerifyKey`] (its public
+//! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the issuer's [`VerifyKey`] (its public
 //! identity, never a secret) alongside the token, so any holder can decode, attenuate, and hand it off
-//! entirely offline, and a connector learns which node to dial from the link alone.
+//! entirely offline, and a dialer learns which node to dial from the link alone.
 //!
-//! The lifecycle, all offline except the initial mint (which needs only the exposer's own secret, still
+//! The lifecycle, all offline except the initial mint (which needs only the issuer's own secret, still
 //! no network):
-//! - [`Identity::mint`] signs a fresh cap for a service until an expiry (the exposer).
+//! - [`Identity::mint`] signs a fresh cap for a service until an expiry (the issuer).
 //! - [`Cap::attenuate`] appends a narrower service and/or shorter expiry (any holder, no secret).
 //! - delegation is just [`Cap::attenuate`] by a third party: hand the narrowed token onward, and the
-//!   exposer still verifies the whole chain without ever seeing the delegation.
+//!   issuer still verifies the whole chain without ever seeing the delegation.
 //! - [`Identity::verify`] checks a presented cap against this identity for a [`Request`] (service + now).
 //!
 //! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes and whose signature
@@ -35,6 +35,8 @@ use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
+use rand_core::{CryptoRng, RngCore};
+use zeroize::Zeroize;
 
 use crate::VerifyKey;
 use crate::revocations::RevocationId;
@@ -49,24 +51,54 @@ const SEPARATOR: char = '.';
 
 /// The maximum encoded token length [`Cap::parse`] accepts (~8 KiB decoded). A capability is a small
 /// token, so this is generous; it bounds the base32 decode and the O(blocks) signature-chain work, which
-/// run before any trust check, so an oversized link cannot burn a verifier's CPU un-refused.
+/// run before any trust check, so an oversized link cannot burn a verifier's CPU un-refused. This is the
+/// TRUE cap on the pre-trust verify work: it bounds the byte length, and so the number of blocks that can
+/// possibly fit.
 const MAX_ENCODED_LEN: usize = 13_200;
 
 /// The maximum number of blocks [`Cap::parse`] accepts: the authority block plus a bounded delegation
-/// chain. Verification is O(blocks) and a legitimate chain is short, so a many-block token is refused.
+/// chain. A legitimate chain is short, so a many-block token is refused. This is a secondary structural
+/// sanity bound checked AFTER verification; the actual pre-trust CPU cap is [`MAX_ENCODED_LEN`], which
+/// bounds the bytes (hence the blocks) before the O(blocks) signature check runs.
 const MAX_BLOCKS: usize = 16;
 
-/// An exposer's signing identity: the ed25519 keypair whose public half is a [`VerifyKey`].
+/// Domain-separation tag prepended to a document's bytes before signing (and required on verify), so a
+/// document signature can never double as a biscuit authority-block signature (the confused-deputy forgery,
+/// F1: a victim who signs attacker-influenced bytes must not thereby emit a valid biscuit block signature).
 ///
-/// This is the root of every cap it mints. Reconstructed from the exposer's persisted 32-byte secret so
+/// LOAD-BEARING INVARIANT: the tag's FIRST byte must be one that cannot begin a valid biscuit
+/// authority-block signing payload of ANY supported biscuit version. Today this holds two ways at once:
+/// - a biscuit v1 signing payload begins with `\0` (`\0BLOCK\0...`); ours begins with `n` (0x6e), so the
+///   signed message `TAG || bytes` can never equal a v1 payload.
+/// - a biscuit v0 signing payload begins with the block protobuf, whose first byte must be a valid protobuf
+///   field key (`(field << 3) | wire_type`, wire_type in {0,1,2,5}). `n` = 0x6e is field 13 wire-type 6,
+///   which is not a legal protobuf wire type, so a would-be v0 forgery cannot both begin with the tag and
+///   parse as a block: it dies at block deserialization.
+///
+/// Changing this tag (a future rename, a version bump) is therefore a DELIBERATE re-check of that property,
+/// not a free edit. The `-v1` suffix IS the on-wire signed-document version. See the two-version forgery
+/// regression tests in `cap_tests`. `pub(crate)` so `signed.rs` verifies over the exact same constant.
+pub(crate) const SIGNED_DOCUMENT_CONTEXT: &[u8] = b"nauthy-signed-document-v1\0";
+
+/// An issuer's signing identity: the ed25519 keypair whose public half is a [`VerifyKey`].
+///
+/// This is the root of every cap it mints. Reconstructed from the issuer's persisted 32-byte secret so
 /// caps survive across runs, and it is the same key the transport binds under, so the [`VerifyKey`] a cap
 /// roots at *is* the node peers dial. Holds secret key material, so it never derives `Debug`/`Clone`; its
 /// bytes are wiped by [`biscuit_auth`] on drop.
+///
+/// nauthy authorizes PROVEN identities; it does not provision them. An identity is any 32-byte ed25519
+/// secret ([`from_secret`](Self::from_secret)), generated fresh ([`generate`](Self::generate) /
+/// [`from_rng`](Self::from_rng)) or supplied by your identity layer. Deriving many device secrets from one
+/// root seed (HD-style, so one person's devices share an authority) is that identity layer's job, not
+/// nauthy's: nauthy mints a device badge for whatever [`VerifyKey`] you name in `bound_to`, and where that
+/// device's secret comes from is above the auth layer.
 pub struct Identity {
     root: KeyPair,
     /// The same ed25519 secret as `root`, as a raw signer for detached signatures over documents (the
     /// roster). Derived from the same 32-byte seed at construction, so its public half equals
-    /// [`node_id`](Self::node_id): a roster this signs verifies against the same key a cap roots at.
+    /// [`verifying_key`](Self::verifying_key): a roster this signs verifies against the same key a cap roots
+    /// at.
     signing: SigningKey,
 }
 
@@ -83,20 +115,43 @@ impl Identity {
         })
     }
 
+    /// Generate a fresh identity from `rng`. Runtime- and OS-free: bring any CSPRNG. The 32 secret bytes are
+    /// zeroized off the stack after the keypair is built; where a device's seed comes from (random here, or
+    /// derived per device by your identity layer) is above nauthy, see the type docs.
+    pub fn from_rng<R: RngCore + CryptoRng + ?Sized>(rng: &mut R) -> Result<Self, CapError> {
+        let mut secret = [0u8; 32];
+        rng.fill_bytes(&mut secret);
+        let identity = Self::from_secret(&secret);
+        secret.zeroize();
+        identity
+    }
+
+    /// Generate a fresh identity from the operating system CSPRNG. The dead-simple getting-started path.
+    #[cfg(feature = "os-rng")]
+    pub fn generate() -> Result<Self, CapError> {
+        Self::from_rng(&mut rand_core::OsRng)
+    }
+
     /// This identity's [`VerifyKey`]: the public key a cap roots at and peers dial.
-    pub fn node_id(&self) -> VerifyKey {
-        node_id_of(&self.root)
+    pub fn verifying_key(&self) -> VerifyKey {
+        verifying_key_of(&self.root)
     }
 
     /// Sign an opaque document with this identity's ed25519 key, producing a self-verifying blob. The signer
-    /// is THIS identity, never a courier that later serves it: only this secret can produce a signature that
+    /// is THIS identity, never a holder that later relays it: only this secret can produce a signature that
     /// verifies against this identity's [`VerifyKey`], so any node may hold and relay the blob and none can
     /// forge it. Reuses the same key that mints caps (no new secret material), as a plain detached ed25519
     /// signature over the caller's bytes: a signed document, not a capability. The bytes are OPAQUE here (a
     /// consumer canonicalizes and parses its own payload); this only proves who signed them.
     pub fn sign_document(&self, bytes: &[u8]) -> Signed {
-        let signature = self.signing.sign(bytes);
-        Signed::from_parts(bytes.to_vec(), self.node_id(), signature.to_bytes())
+        // Sign TAG || bytes, never the caller's bytes verbatim: the domain-separation tag makes a document
+        // signature impossible to reuse as a biscuit authority-block signature (F1). The tag is a
+        // signing-time prefix only; the Signed envelope still carries the OPAQUE `bytes`, so the wire
+        // framing is unchanged. See SIGNED_DOCUMENT_CONTEXT.
+        let mut message = SIGNED_DOCUMENT_CONTEXT.to_vec();
+        message.extend_from_slice(bytes);
+        let signature = self.signing.sign(&message);
+        Signed::from_parts(bytes.to_vec(), self.verifying_key(), signature.to_bytes())
     }
 
     /// Mint a fresh cap granting `service` until `expiry`, signed by this identity.
@@ -115,32 +170,32 @@ impl Identity {
         .build(&self.root)
         .map_err(CapError::Mint)?;
         Ok(Cap {
-            root: self.node_id(),
+            root: self.verifying_key(),
             token,
         })
     }
 
-    /// Mint a membership badge for the device `bound_to`, granting [`Service::membership`] until `expiry`.
+    /// Mint a membership badge for the device `bound_to`, granting whole-node membership until `expiry`.
     ///
     /// A device badge, not a service slip: it asserts "the bearer is one of my devices", which a
-    /// [`Family`](crate::Gate::Family) gate honors as whole-node admission. It is BOUND to `bound_to`, so it
+    /// [`Rooted`](crate::Gate::Rooted) gate honors as whole-node admission. It is BOUND to `bound_to`, so it
     /// grants only when the *proven* dialer is that device: a badge observed in flight and replayed from a
     /// DIFFERENT key verifies against no one. That is the binding's real job: it defends the short-lived
-    /// SELF-SIGNED badge a signet holder mints per dial against cross-key replay. It does NOT harden a
+    /// SELF-SIGNED badge an authority holder mints per dial against cross-key replay. It does NOT harden a
     /// badge that travels beside its own device seed (as a device seed provisioned alongside its badge does:
-    /// whoever steals that blob already holds the seed, so binding buys nothing there). Only the signet (this
-    /// identity) can mint
-    /// one, since minting needs the root secret; a delegated slip can never be attenuated into a membership
-    /// badge (attenuation only adds checks, [`Cap::attenuate`]).
+    /// whoever steals that blob already holds the seed, so binding buys nothing there). Only the authority
+    /// (this identity) can mint one, since minting needs the root secret; a delegated slip can never be
+    /// attenuated into a membership badge (attenuation only adds checks, [`Cap::attenuate`]).
     pub fn mint_member(&self, bound_to: VerifyKey, expiry: SystemTime) -> Result<Cap, CapError> {
         // Membership is a STRUCTURAL fact in the authority block, not a service name. `member(true)` is
-        // asserted here and checked by the gate's `allow if member(true)` query ([`Cap::verify_member_at_root`]).
-        // Because biscuit only trusts facts from the authority block (origin 0), a fact added in an
-        // attenuation block is NEVER visible to that query, so a delegated service slip can never be
-        // widened into membership, enforced by the crypto, not by a reserved name. And `Identity::mint`
-        // (the unbound, public mint) structurally cannot emit `member`, so there is no way to mint an
-        // unbound whole-node badge: the "reserved service" footgun is unrepresentable. The badge stays
-        // bound to `bound_to`, so only the proven device it names may present it.
+        // asserted here and checked by the gate's `allow if member(true)` query
+        // ([`Cap::verify_member_at_root_without_revocation`]). Because biscuit only trusts facts from the
+        // authority block (origin 0), a fact added in an attenuation block is NEVER visible to that query,
+        // so a delegated service slip can never be widened into membership, enforced by the crypto, not by a
+        // reserved name. And `Identity::mint` (the unbound, public mint) structurally cannot emit `member`,
+        // so there is no way to mint an unbound whole-node badge: the "reserved service" footgun is
+        // unrepresentable. The badge stays bound to `bound_to`, so only the proven device it names may
+        // present it.
         let token = biscuit!(
             r#"
             member(true);
@@ -153,7 +208,7 @@ impl Identity {
         .build(&self.root)
         .map_err(CapError::Mint)?;
         Ok(Cap {
-            root: self.node_id(),
+            root: self.verifying_key(),
             token,
         })
     }
@@ -167,10 +222,10 @@ impl Identity {
     /// [`Identity::mint_member`]). So a copy observed in flight and replayed from a DIFFERENT key verifies
     /// against no one, and a slip presented with no proven dialer (`request.bound_device` is `None`) grants
     /// nothing: theft-resistant, inert unless the presenter IS the bound device. It needs no new verify
-    /// path, [`Cap::verify_at_root`] already injects the proven dialer as `bound_device`, so the binding
-    /// check falls out of the existing service verification. Only the signet (this identity) can mint one
-    /// (minting needs the root secret), and attenuation only ADDS checks, so a device-bound slip can never be
-    /// widened into an unbound slip or a badge.
+    /// path, [`Cap::verify_at_root_without_revocation`] already injects the proven dialer as `bound_device`,
+    /// so the binding check falls out of the existing service verification. Only the authority (this
+    /// identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
+    /// device-bound slip can never be widened into an unbound slip or a badge.
     pub fn mint_bound(
         &self,
         service: &Service,
@@ -190,23 +245,24 @@ impl Identity {
         .build(&self.root)
         .map_err(CapError::Mint)?;
         Ok(Cap {
-            root: self.node_id(),
+            root: self.verifying_key(),
             token,
         })
     }
 
     /// Mint a service slip granting `service` until `expiry`, usable only by a device that proves membership
-    /// under the foreign signet `foreign_root` (a whole FLEET, not one device).
+    /// under the foreign authority `foreign_root` (a whole team, not one device).
     ///
-    /// The work-sim primitive: issue ONCE to a PERSON (their signet `X`), and every device that person's
-    /// signet vouches for may use it, at their discretion. `X` is pinned as a CONSTANT authority fact
-    /// (`signet_bound(X)`), so it is trusted transitively (this signet asserted it) and can NEVER be
-    /// overridden by a presenter. Inert alone: it carries `check if signet_bound($x), fleet_member($x)`, a
-    /// check no plain verification injects, so it FAILS [`verify_at_root`](Cap::verify_at_root) and grants
-    /// nothing unless the gate's two-cap flow first proves membership under `X` (see
-    /// [`Cap::verify_signet_bound_at_root`]). Only the signet (this identity) can mint one; attenuation only
-    /// ADDS checks, so it can never be widened.
-    pub fn mint_signet_slip(
+    /// The standing-access-to-a-team primitive: issue ONCE to a PERSON (their authority `X`), and every
+    /// device that authority vouches for may use it, at their discretion. `X` is pinned as a CONSTANT
+    /// authority fact (`authority_bound(X)`), so it is trusted transitively (this authority asserted it) and
+    /// can NEVER be overridden by a presenter. Inert alone: it carries `check if authority_bound($x),
+    /// foreign_member($x)`, a check no plain verification injects, so it FAILS
+    /// [`verify_at_root_without_revocation`](Cap::verify_at_root_without_revocation) and grants nothing
+    /// unless the gate's two-cap flow first proves membership under `X` (see
+    /// [`Cap::verify_authority_bound_at_root_without_revocation`]). Only the authority (this identity) can
+    /// mint one; attenuation only ADDS checks, so it can never be widened.
+    pub fn mint_authority_slip(
         &self,
         service: &Service,
         foreign_root: VerifyKey,
@@ -214,19 +270,19 @@ impl Identity {
     ) -> Result<Cap, CapError> {
         let token = biscuit!(
             r#"
-            signet_bound({fleet});
+            authority_bound({root});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if signet_bound($x), fleet_member($x);
+            check if authority_bound($x), foreign_member($x);
             "#,
-            fleet = foreign_root.to_string(),
+            root = foreign_root.to_string(),
             service = service.as_str(),
             expiry = expiry,
         )
         .build(&self.root)
         .map_err(CapError::Mint)?;
         Ok(Cap {
-            root: self.node_id(),
+            root: self.verifying_key(),
             token,
         })
     }
@@ -237,20 +293,30 @@ impl Identity {
     /// request: the service matches and the token is unexpired at `request.now`. A foreign root, a
     /// service mismatch, an expired token, or a token narrowed past the request is a denial. Returns this
     /// node's [`VerifyKey`] on success so a caller can log which identity authorized the grant.
+    ///
+    /// This does NOT consult a denylist: it is the headline self-rooted offline-verify path, pure public
+    /// key against your own root. To authorize a live connection use [`Gate::admit_witnessed`](crate::Gate),
+    /// which is the admission seam and does check revocation.
     pub fn verify(&self, cap: &Cap, request: &Request) -> Result<VerifyKey, CapError> {
-        cap.verify_at_root(request, self.node_id())
+        cap.verify_at_root_without_revocation(request, self.verifying_key())
     }
 }
 
 impl Cap {
     /// Verify this cap grants `request` and is rooted at `root`, returning the root identity on success.
     ///
+    /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
+    /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
+    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission seam and does check revocation.
+    /// Public because pure offline pubkey verification against a root you trust (with your own out-of-band
+    /// revocation) is a legitimate sovereign use.
+    ///
     /// Verification is pure public-key: a cap's signature chain is checked against its embedded root at
     /// [`Cap::parse`], so granting a request only needs the root to match `root` and every caveat to pass.
     /// No secret is involved, which is what lets a node gate on a root it merely TRUSTS rather than owns: a
     /// CI runner accepts caps rooted at YOUR key without ever holding your secret, so a compromised runner
     /// can never mint new access (see [`crate::Gate`]). [`Identity::verify`] is the self-rooted special case.
-    pub fn verify_at_root(
+    pub fn verify_at_root_without_revocation(
         &self,
         request: &Request,
         root: VerifyKey,
@@ -285,14 +351,20 @@ impl Cap {
     /// (see [`Identity::mint_member`]) and its device binding + expiry hold for the proven `peer` at `now`.
     /// Returns the root on success.
     ///
-    /// This is the membership question, distinct from the service question ([`Cap::verify_at_root`]): it
-    /// provides NO service fact and admits on `allow if member(true)`. Because that query runs at DEFAULT
-    /// scope, only a `member` fact in the token's AUTHORITY block satisfies it: a `member` fact forged into
-    /// an attenuation block lives at a higher origin, is untrusted, and never grants (biscuit's own trust
-    /// semantics). So a delegated service slip (no `member` fact) can never pass here, and a service slip
-    /// can never be widened into membership. A membership badge carries no service check, so honoring it is
-    /// whole-node admission.
-    pub fn verify_member_at_root(
+    /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
+    /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
+    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission seam and does check revocation.
+    /// Public because pure offline pubkey verification against a root you trust (with your own out-of-band
+    /// revocation) is a legitimate sovereign use.
+    ///
+    /// This is the membership question, distinct from the service question
+    /// ([`Cap::verify_at_root_without_revocation`]): it provides NO service fact and admits on `allow if
+    /// member(true)`. Because that query runs at DEFAULT scope, only a `member` fact in the token's
+    /// AUTHORITY block satisfies it: a `member` fact forged into an attenuation block lives at a higher
+    /// origin, is untrusted, and never grants (biscuit's own trust semantics). So a delegated service slip
+    /// (no `member` fact) can never pass here, and a service slip can never be widened into membership. A
+    /// membership badge carries no service check, so honoring it is whole-node admission.
+    pub fn verify_member_at_root_without_revocation(
         &self,
         now: SystemTime,
         peer: VerifyKey,
@@ -316,17 +388,24 @@ impl Cap {
         Ok(self.root)
     }
 
-    /// Verify this cap is a valid SIGNET-BOUND slip rooted at `root` for `request`, returning the FOREIGN
-    /// fleet root `X` it names. Grants (and returns `X`) iff: the cap roots at `root`, its service matches,
-    /// it is unexpired at `request.now`, and it carries a `signet_bound(X)` AUTHORITY fact. The gate then
-    /// verifies a membership badge at the RETURNED `X` (never a presenter-supplied root) before admitting.
+    /// Verify this cap is a valid AUTHORITY-BOUND slip rooted at `root` for `request`, returning the FOREIGN
+    /// authority root `X` it names. Grants (and returns `X`) iff: the cap roots at `root`, its service
+    /// matches, it is unexpired at `request.now`, and it carries an `authority_bound(X)` AUTHORITY fact. The
+    /// gate then verifies a membership badge at the RETURNED `X` (never a presenter-supplied root) before
+    /// admitting.
+    ///
+    /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
+    /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
+    /// use [`Gate::admit_foreign_witnessed`](crate::Gate), which is the admission seam and does check
+    /// revocation. Public because pure offline pubkey verification against a root you trust (with your own
+    /// out-of-band revocation) is a legitimate sovereign use.
     ///
     /// `X` is read from the authority block ONLY (biscuit `query` sees origin-0 facts, never attenuation
-    /// blocks), so a `signet_bound` fact forged into a delegation block is invisible: the bound fleet is
-    /// exactly the one THIS signet signed. A plain slip or a membership badge carries no `signet_bound`
-    /// fact, so this returns [`CapError::NotSignetBound`] for them: this method is the sole detector AND
-    /// extractor.
-    pub fn verify_signet_bound_at_root(
+    /// blocks), so an `authority_bound` fact forged into a delegation block is invisible: the bound
+    /// authority is exactly the one THIS authority signed. A plain slip or a membership badge carries no
+    /// `authority_bound` fact, so this returns [`CapError::NotAuthorityBound`] for them: this method is the
+    /// sole detector AND extractor.
+    pub fn verify_authority_bound_at_root_without_revocation(
         &self,
         request: &Request,
         root: VerifyKey,
@@ -335,24 +414,27 @@ impl Cap {
             return Err(CapError::ForeignRoot);
         }
         // Read the pinned foreign root from the authority block (origin-0 only, so an attenuation-block
-        // `signet_bound` is invisible). A missing fact is a clean "not this kind".
-        let x_text = self.signet_bound_text()?.ok_or(CapError::NotSignetBound)?;
+        // `authority_bound` is invisible). A missing fact is a clean "not this kind".
+        let x_text = self
+            .authority_bound_text()?
+            .ok_or(CapError::NotAuthorityBound)?;
         let x = x_text
             .parse::<VerifyKey>()
             .map_err(|_| CapError::Malformed)?;
-        // Authorize the slip's service + expiry checks AND satisfy its `fleet_member($x)` check by injecting
-        // the fleet it named. This is what makes it authorize HERE and NOWHERE else; the gate still ANDs an
-        // independent badge check under `x` before it admits, so this method never admits on its own.
+        // Authorize the slip's service + expiry checks AND satisfy its `foreign_member($x)` check by
+        // injecting the authority it named. This is what makes it authorize HERE and NOWHERE else; the gate
+        // still ANDs an independent badge check under `x` before it admits, so this method never admits on
+        // its own.
         let mut authorizer = authorizer!(
             r#"
             time({now});
             service({service});
-            fleet_member({fleet});
+            foreign_member({root});
             allow if true;
             "#,
             now = request.now,
             service = request.service.as_str(),
-            fleet = x.to_string(),
+            root = x.to_string(),
         )
         .build(&self.token)
         .map_err(CapError::Authorize)?;
@@ -360,41 +442,45 @@ impl Cap {
         Ok(x)
     }
 
-    /// Whether this cap is a SIGNET-BOUND slip: it carries a `signet_bound` fact in its AUTHORITY block.
+    /// Whether this cap is an AUTHORITY-BOUND slip: it carries an `authority_bound` fact in its AUTHORITY
+    /// block.
     ///
-    /// A cheap, offline, root-free check the DIALER uses to decide whether to attach a fleet membership
-    /// badge (slot 2) beside a presented slip: a plain, bearer, or device-bound slip is NOT signet-bound, so
-    /// the dialer attaches no badge and never leaks its own device-to-signet linkage on a non-signet dial.
-    /// Reads origin-0 facts only (see [`signet_bound_text`](Self::signet_bound_text)), so an
-    /// attenuation-block fact never reads as signet-bound.
-    pub fn is_signet_bound(&self) -> bool {
-        matches!(self.signet_bound_text(), Ok(Some(_)))
+    /// A cheap, offline, root-free check the DIALER uses to decide whether to attach a foreign membership
+    /// badge beside a presented slip: a plain, bearer, or device-bound slip is NOT authority-bound, so the
+    /// dialer attaches no badge and never leaks its own device-to-authority linkage on a non-authority dial.
+    /// Reads origin-0 facts only (see the private `authority_bound_text`), so an attenuation-block fact
+    /// never reads as authority-bound.
+    pub fn is_authority_bound(&self) -> bool {
+        matches!(self.authority_bound_text(), Ok(Some(_)))
     }
 
-    /// The foreign fleet key `X` this cap's `signet_bound` AUTHORITY fact pins, as a typed [`VerifyKey`], if
-    /// any. `None` for a plain, bearer, or device-bound slip (no such fact). Reads origin-0 facts only, so an
-    /// attenuation-block fact is invisible: the pinned fleet is exactly the one this signet signed.
+    /// The foreign authority key `X` this cap's `authority_bound` AUTHORITY fact pins, as a typed
+    /// [`VerifyKey`], if any. `None` for a plain, bearer, or device-bound slip (no such fact). Reads
+    /// origin-0 facts only, so an attenuation-block fact is invisible: the pinned authority is exactly the
+    /// one this authority signed.
     ///
-    /// The typed, offline, root-free extractor a DIALER uses to decide whether its own fleet membership
-    /// badge (slot 2) can ever help: a badge for a fleet you are not in never verifies at that fleet's gate,
-    /// so a dialer attaches slot 2 ONLY when `X` equals the fleet its own badge roots under. Distinct from
-    /// [`verify_signet_bound_at_root`](Self::verify_signet_bound_at_root), which is the GATE's path (it needs
-    /// the root and a request, and gates admission); this is a pure read of the pinned fleet.
-    pub fn signet_bound_fleet(&self) -> Result<Option<VerifyKey>, CapError> {
-        self.signet_bound_text()?
+    /// The typed, offline, root-free extractor a DIALER uses to decide whether its own foreign membership
+    /// badge can ever help: a badge for an authority you are not under never verifies at that authority's
+    /// gate, so a dialer attaches the co-presented badge ONLY when `X` equals the authority its own badge
+    /// roots under. Distinct from
+    /// [`verify_authority_bound_at_root_without_revocation`](Self::verify_authority_bound_at_root_without_revocation),
+    /// which is the GATE's path (it needs the root and a request, and gates admission); this is a pure read
+    /// of the pinned authority.
+    pub fn authority_bound_root(&self) -> Result<Option<VerifyKey>, CapError> {
+        self.authority_bound_text()?
             .map(|x| x.parse::<VerifyKey>().map_err(|_| CapError::Malformed))
             .transpose()
     }
 
-    /// The encoded foreign fleet key this cap's `signet_bound` AUTHORITY fact pins, if any. Reads origin-0
-    /// facts only: `query` (not `query_all`) defaults its rule scope to the authority block, so a
-    /// `signet_bound` fact forged into an attenuation block is invisible and the bound fleet is exactly the
-    /// one this signet signed. `None` for a plain slip or a membership badge (no such fact). No root or
-    /// secret: a pure offline read of the token's own authority block.
-    fn signet_bound_text(&self) -> Result<Option<String>, CapError> {
+    /// The encoded foreign authority key this cap's `authority_bound` AUTHORITY fact pins, if any. Reads
+    /// origin-0 facts only: `query` (not `query_all`) defaults its rule scope to the authority block, so an
+    /// `authority_bound` fact forged into an attenuation block is invisible and the bound authority is
+    /// exactly the one this authority signed. `None` for a plain slip or a membership badge (no such fact).
+    /// No root or secret: a pure offline read of the token's own authority block.
+    fn authority_bound_text(&self) -> Result<Option<String>, CapError> {
         let mut authorizer = self.token.authorizer().map_err(CapError::Authorize)?;
         let rows: Vec<(String,)> = authorizer
-            .query("bound($x) <- signet_bound($x)")
+            .query("bound($x) <- authority_bound($x)")
             .map_err(CapError::Authorize)?;
         Ok(rows.into_iter().next().map(|(x,)| x))
     }
@@ -432,7 +518,7 @@ impl Cap {
         let public = root_key(root)?;
         // Decoding with the embedded root verifies the signature chain back to it; a token that does not
         // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
-        let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Malformed)?;
+        let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Unverified)?;
         // A well-formed but deeply-attenuated token is still a DoS via O(blocks) work; a legitimate
         // delegation chain is short, so bound the block count too.
         if token.block_count() > MAX_BLOCKS {
@@ -441,16 +527,16 @@ impl Cap {
         Ok(Self { root, token })
     }
 
-    /// The identity this cap is rooted at: the [`VerifyKey`] a connector should dial and the exposer must be
-    /// to verify it.
+    /// The identity this cap is rooted at: the [`VerifyKey`] a dialer should dial and the issuer must be to
+    /// verify it.
     pub fn root(&self) -> VerifyKey {
         self.root
     }
 
     /// This cap's revocation identifiers, one per block (the authority block first, the narrowest last).
     /// Each is a pure, offline function of the block's signature. Recording one in a
-    /// [`Denylist`](crate::Denylist) revokes that token and every token attenuated from it (all of which
-    /// carry that block, hence that id).
+    /// [`Revocations`](crate::Revocations) store revokes that token and every token attenuated from it (all
+    /// of which carry that block, hence that id).
     pub fn revocation_ids(&self) -> Vec<RevocationId> {
         self.token
             .revocation_identifiers()
@@ -459,10 +545,11 @@ impl Cap {
             .collect()
     }
 
-    /// This cap's ROOT revocation id: the authority-block id (the first of [`revocation_ids`](Self::revocation_ids))
-    /// that every cap attenuated or delegated from it inherits. Recording it in a [`Denylist`](crate::Denylist)
-    /// revokes this cap AND its whole delegation tree in one entry, whereas recording the narrowest id revokes
-    /// only this leaf. `None` only for a token with no blocks, which a well-formed biscuit never is.
+    /// This cap's ROOT revocation id: the authority-block id (the first of
+    /// [`revocation_ids`](Self::revocation_ids)) that every cap attenuated or delegated from it inherits.
+    /// Recording it in a [`Revocations`](crate::Revocations) store revokes this cap AND its whole delegation
+    /// tree in one entry, whereas recording the narrowest id revokes only this leaf. `None` only for a token
+    /// with no blocks, which a well-formed biscuit never is.
     pub fn root_revocation_id(&self) -> Option<RevocationId> {
         self.revocation_ids().into_iter().next()
     }
@@ -495,7 +582,7 @@ impl Cap {
     /// Monotone by construction: [`biscuit_auth`] only lets a block ADD checks, so the result is always
     /// the same grant or narrower, never broader. Any holder can do this with no secret and no network,
     /// which is exactly what makes delegation work: a third party narrows and hands the token onward, and
-    /// the exposer still verifies the whole chain. A sealed cap (see [`Cap::seal`]) rejects this with
+    /// the issuer still verifies the whole chain. A sealed cap (see [`Cap::seal`]) rejects this with
     /// [`CapError::Attenuate`]. At least one of `service`/`shorten` must be given, or this is a no-op and
     /// returns [`CapError::EmptyAttenuation`].
     pub fn attenuate(
@@ -558,30 +645,30 @@ impl Identity {
             .append(block!(r#"member(true);"#))
             .map_err(CapError::Attenuate)?;
         Ok(Cap {
-            root: self.node_id(),
+            root: self.verifying_key(),
             token,
         })
     }
 
-    /// Test-only: mint a real signet-bound slip naming `real_fleet` in the AUTHORITY block, then append a
-    /// second `signet_bound(forged_fleet)` fact in an ATTENUATION block, exactly what an attacker would
-    /// attempt to redirect the bound fleet to a fleet THEY control. [`Cap::verify_signet_bound_at_root`]
-    /// must still return `real_fleet`: `query` reads origin-0 facts only, so an appended `signet_bound` is
-    /// untrusted origin and invisible. Reaches past the public API on purpose (the public [`Cap::attenuate`]
-    /// can only append CHECKS, never facts), the prosecutable proof that the bound fleet is exactly the one
-    /// this signet signed.
-    pub(crate) fn mint_signet_slip_with_forged_binding(
+    /// Test-only: mint a real authority-bound slip naming `real_root` in the AUTHORITY block, then append a
+    /// second `authority_bound(forged_root)` fact in an ATTENUATION block, exactly what an attacker would
+    /// attempt to redirect the bound authority to one THEY control.
+    /// [`Cap::verify_authority_bound_at_root_without_revocation`] must still return `real_root`: `query`
+    /// reads origin-0 facts only, so an appended `authority_bound` is untrusted origin and invisible.
+    /// Reaches past the public API on purpose (the public [`Cap::attenuate`] can only append CHECKS, never
+    /// facts), the prosecutable proof that the bound authority is exactly the one this authority signed.
+    pub(crate) fn mint_authority_slip_with_forged_binding(
         &self,
         service: &Service,
-        real_fleet: VerifyKey,
-        forged_fleet: VerifyKey,
+        real_root: VerifyKey,
+        forged_root: VerifyKey,
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
-        let Cap { root, token } = self.mint_signet_slip(service, real_fleet, expiry)?;
+        let Cap { root, token } = self.mint_authority_slip(service, real_root, expiry)?;
         let token = token
             .append(block!(
-                r#"signet_bound({forged});"#,
-                forged = forged_fleet.to_string(),
+                r#"authority_bound({forged});"#,
+                forged = forged_root.to_string(),
             ))
             .map_err(CapError::Attenuate)?;
         Ok(Cap { root, token })
@@ -593,7 +680,7 @@ impl Identity {
 /// Built at the verify boundary so `verify` receives an already-valid request. `now` is normally the
 /// wall clock; it is a field so a test can pin a moment and prove expiry.
 pub struct Request {
-    /// The service the connector is asking to reach.
+    /// The service the dialer is asking to reach.
     pub service: Service,
     /// The moment to evaluate expiry against.
     pub now: SystemTime,
@@ -619,22 +706,22 @@ impl Request {
         self.bound_device = Some(peer);
         self
     }
+
+    /// An expiry `duration` from now, for [`Identity::mint`]. A convenience so callers pass `2h` not an
+    /// absolute instant; a duration so large it would overflow the clock saturates to a century out rather
+    /// than panicking, which is expiry enough for any real grant.
+    pub fn expires_in(duration: Duration) -> SystemTime {
+        let now = SystemTime::now();
+        now.checked_add(duration).unwrap_or_else(|| now + CENTURY)
+    }
 }
 
-/// An expiry `duration` from now, for [`Identity::mint`]. A convenience so callers pass `2h` not an
-/// absolute instant; a duration so large it would overflow the clock saturates to a century out rather
-/// than panicking, which is expiry enough for any real grant.
-pub fn expires_in(duration: Duration) -> SystemTime {
-    let now = SystemTime::now();
-    now.checked_add(duration).unwrap_or_else(|| now + CENTURY)
-}
-
-/// A hundred years, the saturating ceiling for [`expires_in`]. Far enough out to be "does not expire" in
-/// practice, near enough that `SystemTime` arithmetic never overflows.
+/// A hundred years, the saturating ceiling for [`Request::expires_in`]. Far enough out to be "does not
+/// expire" in practice, near enough that `SystemTime` arithmetic never overflows.
 const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// The [`VerifyKey`] that is this keypair's public half.
-fn node_id_of(root: &KeyPair) -> VerifyKey {
+fn verifying_key_of(root: &KeyPair) -> VerifyKey {
     let mut bytes = [0u8; VerifyKey::LEN];
     // biscuit's PublicKey serializes to exactly 32 ed25519 bytes; the copy pins that into a VerifyKey.
     bytes.copy_from_slice(&root.public().to_bytes());
@@ -663,9 +750,16 @@ pub enum CapError {
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
-    /// The link's node id, structure, or signature chain was not well formed.
+    /// The link was structurally broken before any signature check: a missing separator, or a node-id /
+    /// authority-fact key that is not a well-formed [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified),
+    /// a signature-chain failure, because a structural break is a malformed input, not a security event.
     #[error("malformed capability")]
     Malformed,
+    /// The token decoded but its signature chain did not verify against the embedded root: tampered,
+    /// truncated mid-chain, or never signed by the key it claims. A security-relevant failure, kept distinct
+    /// from [`Malformed`](Self::Malformed).
+    #[error("capability signature chain does not verify")]
+    Unverified,
     /// A raw ed25519 key was not valid.
     #[error("invalid key")]
     Key(#[source] biscuit_auth::error::Format),
@@ -693,9 +787,9 @@ pub enum CapError {
     /// The token chained to the root, but its checks denied the request (wrong service or expired).
     #[error("capability does not grant this request")]
     Denied(#[source] biscuit_auth::error::Token),
-    /// The token is not a signet-bound slip: it carries no `signet_bound` authority fact, so it names no
-    /// foreign fleet. A clean "not this kind", distinct from [`Denied`](Self::Denied); the gate treats both
-    /// as "not admitted on the signet-bound arm".
-    #[error("capability is not a signet-bound slip")]
-    NotSignetBound,
+    /// The token is not an authority-bound slip: it carries no `authority_bound` authority fact, so it names
+    /// no foreign authority. A clean "not this kind", distinct from [`Denied`](Self::Denied); the gate
+    /// treats both as "not admitted on the authority-bound arm".
+    #[error("capability is not an authority-bound slip")]
+    NotAuthorityBound,
 }
