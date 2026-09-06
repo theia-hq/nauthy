@@ -6,7 +6,9 @@ it on, revoke it, all verified against your key with no server, no PKI, and no c
 The one thing that sets nauthy apart: a grant roots at the **same ed25519 key a peer already dials you
 at**. Where that key is your transport identity (iroh, libp2p, Noise, any ed25519 p2p), authorization
 collapses into the key the handshake already proved. There is no second identity to manage, nothing to
-phone home to, and verification is local arithmetic against one public key.
+phone home to, and verification is local arithmetic against one public key. For a peer who already proved a
+transport key, a separate identity layer plus a second signature on every use would be pure overhead;
+nauthy spends neither.
 
 ```rust
 match gate.admit(peer, presented, &service) {
@@ -20,14 +22,14 @@ match gate.admit(peer, presented, &service) {
 ## Install
 
 ```sh
-cargo add nauthy
+cargo add nauthy --git https://github.com/theia-hq/nauthy --tag v0.1.0
 ```
 
 The defaults (`tokio-fs`, `os-rng`) give you the shipped file-backed revocation store and one-line key
 generation. For a build with no async runtime at all, take the core alone:
 
 ```toml
-nauthy = { version = "0.1", default-features = false }
+nauthy = { git = "https://github.com/theia-hq/nauthy", tag = "v0.1.0", default-features = false }
 ```
 
 The core (`Gate`, `Cap`, `Identity`, the `Revocations` trait) needs no runtime. `--no-default-features`
@@ -207,12 +209,16 @@ transport already proved rather than a fresh one.
 Own what they have that nauthy does not: UCAN has cross-language libraries, spec governance, and adopters;
 DPoP is a finalized IETF standard in broad production use. The token core under nauthy is
 [Eclipse Biscuit](https://www.biscuitsec.org), which gives full datalog where nauthy gives five fixed
-shapes, and has been through external security review nauthy has not. If you are not already a
-pubkey-transport system, or you need central mutable policy, reach for those.
+shapes (an illegal state you cannot represent beats an expressive one you can misconfigure), and has been
+through external security review nauthy has not. If you are not already a pubkey-transport system, or you
+need central mutable policy, reach for those.
 
 nauthy is deliberately none of those. It is not a policy engine, not a workload-identity server, and not a
 relationship store. It is the zero-infrastructure, capability side of that fork, for systems where your
 key is already your identity, and it stays there.
+
+The reasoning behind each of these choices (why it is the way it is, what it costs, and what was weighed)
+is in [DESIGN.md](DESIGN.md).
 
 ## The name
 
