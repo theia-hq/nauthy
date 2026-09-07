@@ -2,6 +2,18 @@
 
 All notable changes to nauthy, newest first.
 
+## Unreleased
+
+### Changed
+- **`FileDenylist` no longer creates its parent directory.** Provisioning the directory the denylist lives
+  in, and its permissions, is the consumer's responsibility; `FileDenylist` writes only its own file,
+  owner-only (`0600` on Unix). A consumer that relied on `persist` creating the directory must now create
+  it beforehand.
+
+### Added
+- **`DESIGN.md`**, the why/compromise/factored-in rationale for each major design choice, linked from the
+  README.
+
 ## 0.1.0
 
 The first standalone release: generic capability vocabulary, an offline keygen path, a runtime-free core,
