@@ -265,6 +265,22 @@ impl FileDenylist {
 
     async fn persist(&self) -> Result<(), DenylistError> {
         if let Some(parent) = self.path.parent() {
+            // The denylist records which caps this issuer has recalled: a who-can-no-longer-reach-what
+            // trace. When WE create its dir, make it owner-only (`0700`) so it is not exposed to other
+            // local users. Create-with-mode tightens only a dir we make and is a no-op on an existing one,
+            // so a dir the consumer already provisioned is left as they set it, never chmod'd out from
+            // under them.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)
+                    .map_err(DenylistError::Io)?;
+            }
+            #[cfg(not(unix))]
             tokio::fs::create_dir_all(parent)
                 .await
                 .map_err(DenylistError::Io)?;
@@ -283,10 +299,21 @@ impl FileDenylist {
         let body = lines.join("\n") + "\n";
         // Atomic replace: write a temp sibling, then rename over the target. A crash mid-write can never
         // truncate the denylist and silently bring a revoked cap back to life; the rename is all-or-nothing.
+        // The temp is tightened to `0600` before the rename carries that mode onto the target, so the
+        // denylist is owner-only; the `0700` dir above already keeps the transient temp unreadable to
+        // other local users in the meantime.
         let tmp = self.path.with_extension("tmp");
         tokio::fs::write(&tmp, body)
             .await
             .map_err(DenylistError::Io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(DenylistError::Io)?;
+        }
         tokio::fs::rename(&tmp, &self.path)
             .await
             .map_err(DenylistError::Io)
