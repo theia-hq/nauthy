@@ -82,18 +82,23 @@ async fn plain_revoke_refuses_only_the_leaf_not_its_parent() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn a_persisted_denylist_is_owner_only_in_an_owner_only_dir_it_creates() {
-    use std::os::unix::fs::PermissionsExt as _;
+async fn a_persisted_denylist_is_owner_only() {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
-    // A nested store dir that does not exist yet, so the first persist exercises the 0700 create rather than
-    // reusing the world-writable temp dir. The denylist records who this issuer recalled: a co-tenant local
-    // user must not be able to read it.
+    // The consumer owns and provisions the store dir; nauthy no longer creates it, so the test makes the
+    // parent itself (0700 here) before persisting. The denylist records who this issuer recalled: a co-tenant
+    // local user must not be able to read the FILE, which is what this asserts.
     let dir = std::env::temp_dir().join(format!(
         "nauthy-denylist-perms-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = std::fs::remove_dir_all(&dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .expect("provision the store dir the consumer owns");
     let path = dir.join("revoked");
 
     let mut denylist = FileDenylist::empty(path.clone());
@@ -103,17 +108,7 @@ async fn a_persisted_denylist_is_owner_only_in_an_owner_only_dir_it_creates() {
     denylist
         .revoke_root(&cap)
         .await
-        .expect("revoke persists the denylist into a fresh store dir");
-
-    let dir_mode = std::fs::metadata(&dir)
-        .expect("stat the store dir")
-        .permissions()
-        .mode();
-    assert_eq!(
-        dir_mode & 0o777,
-        0o700,
-        "a denylist dir we create is 0700 (owner-only), not group/world-traversable"
-    );
+        .expect("revoke persists the denylist into the provisioned store dir");
 
     let file_mode = std::fs::metadata(&path)
         .expect("stat the denylist")

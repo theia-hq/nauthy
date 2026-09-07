@@ -263,28 +263,12 @@ impl FileDenylist {
         &self.path
     }
 
+    /// Atomically rewrite the backing file with the current id set, owner-only.
+    ///
+    /// The parent directory must already exist: the consuming process owns the store location and
+    /// provisions it (with whatever mode it wants), so nauthy does NOT create the dir. nauthy only writes
+    /// its OWN file, tightened to `0600` so the recall trace is not exposed to other local users.
     async fn persist(&self) -> Result<(), DenylistError> {
-        if let Some(parent) = self.path.parent() {
-            // The denylist records which caps this issuer has recalled: a who-can-no-longer-reach-what
-            // trace. When WE create its dir, make it owner-only (`0700`) so it is not exposed to other
-            // local users. Create-with-mode tightens only a dir we make and is a no-op on an existing one,
-            // so a dir the consumer already provisioned is left as they set it, never chmod'd out from
-            // under them.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt as _;
-
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)
-                    .map_err(DenylistError::Io)?;
-            }
-            #[cfg(not(unix))]
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(DenylistError::Io)?;
-        }
         let mut lines = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             // Encode through RevocationId::to_hex so the file and the API encoding cannot diverge: the file
@@ -300,7 +284,7 @@ impl FileDenylist {
         // Atomic replace: write a temp sibling, then rename over the target. A crash mid-write can never
         // truncate the denylist and silently bring a revoked cap back to life; the rename is all-or-nothing.
         // The temp is tightened to `0600` before the rename carries that mode onto the target, so the
-        // denylist is owner-only; the `0700` dir above already keeps the transient temp unreadable to
+        // denylist is owner-only. The consumer-provisioned parent dir keeps the transient temp unreadable to
         // other local users in the meantime.
         let tmp = self.path.with_extension("tmp");
         tokio::fs::write(&tmp, body)
