@@ -1,7 +1,9 @@
 # nauthy
 
 Offline capability tokens rooted at one key you hold. Mint a grant to reach a service, narrow it, hand
-it on, revoke it, all verified against your key with no server, no PKI, and no control plane.
+it on, revoke it: every grant carries an expiry and a revocation id, so a grant you regret stops working
+when it expires or when you revoke it, with no server to ask. All verified against your key with no PKI
+and no control plane.
 
 The one thing that sets nauthy apart: a grant roots at the **same ed25519 key a peer already dials you
 at**. Where that key is your transport identity (iroh, libp2p, Noise, any ed25519 p2p), authorization
@@ -47,6 +49,12 @@ public key. That is what `ProvenPeer::from_handshake` marks. It is a well-marked
 seam you audit, not a guarantee the type system proves: nauthy has no transport to check, so you must
 call it only from the code that finished the handshake, with the key the handshake proved. Every
 device-bound grant rests on that one call being honest.
+
+## Revoke it when you regret it
+
+Every grant below carries an expiry and a revocation id. Expiry ends it on its own; revocation ends it
+now: record the id in the denylist and the gate refuses that grant from the next connection on, no
+restart. See [Revocation](#revocation). The rest of this page is what you revoke.
 
 ## The grants
 
@@ -152,7 +160,12 @@ nauthy is the authorization layer, and no more. Three seams are yours:
 nauthy brings the grant vocabulary, offline verification, device binding against replay, the single-use
 `Admitted` witness, and the shipped revocation store.
 
-## Recipes
+## Recipes: three things people build with this
+
+Agentic-AI permissioning: mint a short bearer slip per task, scoped to the one service the agent may
+reach, and revoke it when the task ends. Licensing: mint one device-bound slip per customer machine;
+a copied license file verifies against no other key. Membership badges: mint one badge per device you
+own; the gate admits your fleet with no per-service step.
 
 Two patterns you build on nauthy's own primitives.
 
