@@ -30,6 +30,8 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
 
 use data_encoding::HEXLOWER;
+#[cfg(feature = "tokio-fs")]
+use tokio::io::AsyncRead as _;
 
 use crate::cap::Cap;
 
@@ -124,7 +126,9 @@ pub(crate) const STAT_DEBOUNCE: Duration = Duration::from_millis(100);
 
 #[cfg(feature = "tokio-fs")]
 impl FileDenylist {
-    /// Load the denylist from `path`; an absent file is an empty set.
+    /// Load the denylist from `path`; an absent file is an empty set. The ids and the `(mtime, len)` stamp
+    /// come from one opened handle, so a file replaced during this load cannot stamp the old ids as current
+    /// and make every later refresh skip a real revocation.
     pub async fn load(path: PathBuf) -> Result<Self, DenylistError> {
         let (ids, stamp) = read_ids(&path).await?;
         Ok(Self {
@@ -320,18 +324,67 @@ impl Revocations for FileDenylist {
 async fn read_ids(
     path: &Path,
 ) -> Result<(HashSet<RevocationId>, Option<(SystemTime, u64)>), DenylistError> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(text) => {
-            let ids = parse_ids(&text)?;
-            let stamp = tokio::fs::metadata(path)
-                .await
-                .ok()
-                .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
-            Ok((ids, stamp))
+    // Open ONCE and take both the ids and the stamp from that handle (`read_ids_from`). Reading the path
+    // and then stat-ing the path again is the defect this closes: a writer that replaces the file between
+    // the two calls made the old ids wear the new file's (mtime, len), so every later refresh saw the
+    // stamp as current and a revocation froze until the next edit.
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashSet::new(), None));
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((HashSet::new(), None)),
-        Err(error) => Err(DenylistError::Io(error)),
+        Err(error) => return Err(DenylistError::Io(error)),
+    };
+    read_ids_from(&mut file).await
+}
+
+/// Read the ids and their `(mtime, len)` stamp from ONE already-open handle. The single handle is the
+/// invariant: the bytes and the stamp describe the same inode, so a path replacement between the open and
+/// the read can never pair old ids with the replacement's freshness. An unreadable body or an unparsable
+/// line is an error; a stamp the platform will not report degrades to `None`, so the next refresh re-reads
+/// rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the handle seam.
+#[cfg(feature = "tokio-fs")]
+#[allow(clippy::type_complexity)]
+pub(crate) async fn read_ids_from(
+    file: &mut tokio::fs::File,
+) -> Result<(HashSet<RevocationId>, Option<(SystemTime, u64)>), DenylistError> {
+    let text = read_to_string(file).await?;
+    let ids = parse_ids(&text)?;
+    let stamp = file
+        .metadata()
+        .await
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    Ok((ids, stamp))
+}
+
+/// Read an open file to a string through the core [`AsyncRead`] trait. The `tokio-fs` feature enables only
+/// `tokio/fs`; the `io-util` extension traits would add `bytes` to every consumer's lock just to read this
+/// small control file, so this loop drives `poll_read` directly.
+// `core::io::ErrorKind` is still unstable, so the UTF-8 error construction reads from `std`.
+#[allow(clippy::std_instead_of_core)]
+async fn read_to_string(file: &mut tokio::fs::File) -> Result<String, DenylistError> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let filled = core::future::poll_fn(|cx| {
+            let mut buf = tokio::io::ReadBuf::new(&mut chunk);
+            core::task::ready!(core::pin::Pin::new(&mut *file).poll_read(cx, &mut buf))?;
+            core::task::Poll::Ready(Ok(buf.filled().len()))
+        })
+        .await
+        .map_err(DenylistError::Io)?;
+        if filled == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..filled]);
     }
+    String::from_utf8(bytes).map_err(|_| {
+        DenylistError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "denylist file is not valid UTF-8",
+        ))
+    })
 }
 
 /// Decode a denylist file body into a set of revocation ids.

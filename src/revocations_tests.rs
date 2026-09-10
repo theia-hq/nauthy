@@ -6,7 +6,7 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use crate::cap::Identity;
-use crate::revocations::FileDenylist;
+use crate::revocations::{FileDenylist, RevocationId};
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -121,4 +121,58 @@ async fn a_persisted_denylist_is_owner_only() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The M2 race at its smallest: a writer replaces the path between the loader's open and its read. The
+/// loaded ids and the freshness stamp must both come from the one opened handle, so the loader reports the
+/// handle's bytes with the handle's `(mtime, len)`, never the old ids wearing the replacement's stamp
+/// (which would make every later refresh skip and freeze a revocation until the next edit).
+#[tokio::test]
+async fn load_pairs_ids_and_stamp_from_one_handle() {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-denylist-race-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    std::fs::write(&path, "00\n").expect("write the first generation");
+    let mut handle = tokio::fs::File::open(&path)
+        .await
+        .expect("open the first generation");
+
+    // Replace the path with a different inode after the open: a truncating in-place write would be seen
+    // through the still-open handle, so write a sibling and rename it over the path. The replacement is a
+    // different LENGTH too, so the stamp differs even on a filesystem with coarse mtime ticks.
+    let replacement = path.with_extension("replacement");
+    std::fs::write(&replacement, "ffff\n").expect("write the replacement generation");
+    std::fs::rename(&replacement, &path).expect("rename the replacement over the path");
+
+    let old = RevocationId::from_hex("00").expect("valid hex");
+    let fresh = RevocationId::from_hex("ffff").expect("valid hex");
+    let (ids, stamp) = crate::revocations::read_ids_from(&mut handle)
+        .await
+        .expect("read from the opened handle");
+    assert!(
+        ids.contains(&old),
+        "the loaded set is the handle's ids, not the replacement path's"
+    );
+    assert!(
+        !ids.contains(&fresh),
+        "the replacement's ids are not loaded"
+    );
+
+    let held = handle.metadata().await.expect("stat the opened handle");
+    assert_eq!(
+        stamp,
+        Some((held.modified().expect("mtime"), held.len())),
+        "the stamp describes the same inode as the ids"
+    );
+    let replaced = std::fs::metadata(&path).expect("stat the replacement path");
+    assert_ne!(
+        stamp,
+        Some((replaced.modified().expect("mtime"), replaced.len())),
+        "the stamp is not the replacement path's"
+    );
+
+    let _ = std::fs::remove_file(&path);
 }
