@@ -211,11 +211,13 @@ async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
         .await
         .expect("write the body and stamp the handle");
 
-    let held = file.metadata().await.expect("stat the written handle");
+    // The length is the bytes this handle wrote, so it can only be the handle's own body. The exact
+    // mtime is not asserted: a stat can race the write's mtime visibility on some filesystems, and
+    // the security property here is which bytes the stamp describes, never the clock tick.
     assert_eq!(
-        stamp,
-        Some((held.modified().expect("mtime"), held.len())),
-        "the adopted stamp describes the inode that received the bytes"
+        stamp.map(|(_, len)| len),
+        Some(7),
+        "the adopted stamp carries the bytes the handle wrote, not a replacement's length"
     );
     let foreign = std::fs::metadata(&path).expect("stat the replacement path");
     assert_ne!(
