@@ -360,11 +360,16 @@ pub(crate) async fn write_and_stamp(
     body: &[u8],
 ) -> Result<Option<(SystemTime, u64)>, DenylistError> {
     write_all(file, body).await?;
+    // The length is the bytes we just wrote, not a post-write stat: a stat can race the write's
+    // visibility on some filesystems and report the pre-write size with the same mtime tick, which
+    // would make this instance adopt a stamp that no longer matches the file it just wrote. The
+    // mtime still comes from the handle, so the stamp names the inode that received the bytes.
+    let written = u64::try_from(body.len()).unwrap_or(u64::MAX);
     let stamp = file
         .metadata()
         .await
         .ok()
-        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+        .and_then(|meta| Some((meta.modified().ok()?, written)));
     Ok(stamp)
 }
 
