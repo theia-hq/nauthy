@@ -176,3 +176,54 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// The M2 race at its smallest on the WRITE side: a revoke must adopt the stamp of the bytes it wrote, taken
+/// from the handle that wrote them, never the `(mtime, len)` of a path a second writer can replace. `persist`
+/// funnels every write and every stamp through `write_and_stamp`, so this drives that seam with the
+/// replacement landing between the open and the write: a stamp read from the path would describe the
+/// replacement and make the next refresh skip the replacement's revocation until the next edit.
+#[tokio::test]
+async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-denylist-write-race-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&tmp);
+
+    // The path already holds a foreign generation, and the replacement lands with a different LENGTH than
+    // the body written through the handle, so the two stamps differ even on a filesystem with coarse mtime
+    // ticks.
+    std::fs::write(&path, "00\n").expect("write the foreign generation");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .expect("open the handle the body is written through");
+
+    // Replace the path after the handle is open and before the body is written: a stamp read from the path
+    // would wear this replacement's freshness instead of the handle's.
+    let replacement = path.with_extension("replacement");
+    std::fs::write(&replacement, "ffffaaaa\n").expect("write the replacement generation");
+    std::fs::rename(&replacement, &path).expect("rename the replacement over the path");
+
+    let stamp = crate::revocations::write_and_stamp(&mut file, b"aabbcc\n")
+        .await
+        .expect("write the body and stamp the handle");
+
+    let held = file.metadata().await.expect("stat the written handle");
+    assert_eq!(
+        stamp,
+        Some((held.modified().expect("mtime"), held.len())),
+        "the adopted stamp describes the inode that received the bytes"
+    );
+    let foreign = std::fs::metadata(&path).expect("stat the replacement path");
+    assert_ne!(
+        stamp,
+        Some((foreign.modified().expect("mtime"), foreign.len())),
+        "the adopted stamp is not the replacement path's"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&tmp);
+}

@@ -31,7 +31,7 @@ use std::time::{Instant, SystemTime};
 
 use data_encoding::HEXLOWER;
 #[cfg(feature = "tokio-fs")]
-use tokio::io::AsyncRead as _;
+use tokio::io::{AsyncRead as _, AsyncWrite as _};
 
 use crate::cap::Cap;
 
@@ -224,27 +224,27 @@ impl FileDenylist {
 
     /// Revoke one raw biscuit revocation id and persist. The single primitive both [`revoke`](Self::revoke)
     /// and [`revoke_root`](Self::revoke_root) funnel through: it inserts the id and, only if it was new,
-    /// atomically rewrites the file and adopts the `(mtime, len)` stamp so our OWN write triggers no
-    /// redundant reload on the next check. A caller that already holds an id it recorded when the cap was
-    /// minted (an issuer's audit index from grantee to root id) can revoke by that id directly, without still
-    /// holding the cap the id came from.
+    /// atomically rewrites the file and adopts the `(mtime, len)` stamp of the bytes it just wrote, taken
+    /// from the writing handle, so our OWN write triggers no redundant reload on the next check. A caller
+    /// that already holds an id it recorded when the cap was minted (an issuer's audit index from grantee to
+    /// root id) can revoke by that id directly, without still holding the cap the id came from.
     pub async fn revoke_id(&mut self, id: RevocationId) -> Result<(), DenylistError> {
         let inserted = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.ids.insert(id)
         };
         if inserted {
-            self.persist().await?;
-            // Adopt the (mtime, len) we just wrote so our own write does not trigger a redundant reload.
-            if let Ok((mtime, len)) = tokio::fs::metadata(&self.path)
-                .await
-                .and_then(|meta| Ok((meta.modified()?, meta.len())))
-            {
-                self.state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .stamp = Some((mtime, len));
-            }
+            // Adopt the stamp of the bytes this call just wrote (`persist` takes it from the same handle
+            // that wrote them). Stat-ing the path here instead is the defect this closes: a second writer's
+            // rename between our write and our stat made us adopt their (mtime, len) while keeping our
+            // in-memory set, so the next refresh saw the stamp current and skipped their revocation. A
+            // stamp the platform will not report is `None`, so the next refresh re-reads instead of
+            // trusting a stale stamp.
+            let stamp = self.persist().await?;
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .stamp = stamp;
         }
         Ok(())
     }
@@ -267,12 +267,16 @@ impl FileDenylist {
         &self.path
     }
 
-    /// Atomically rewrite the backing file with the current id set, owner-only.
+    /// Atomically rewrite the backing file with the current id set, owner-only, and return the
+    /// `(mtime, len)` stamp of the bytes written. The stamp comes from the ONE handle that received the
+    /// bytes ([`write_and_stamp`]), never from stat-ing the path after the rename, so a writer that replaces
+    /// the path between our write and our stamp cannot make this instance adopt the replacement's stamp and
+    /// skip the replacement's revocation on the next refresh.
     ///
     /// The parent directory must already exist: the consuming process owns the store location and
     /// provisions it (with whatever mode it wants), so nauthy does NOT create the dir. nauthy only writes
     /// its OWN file, tightened to `0600` so the recall trace is not exposed to other local users.
-    async fn persist(&self) -> Result<(), DenylistError> {
+    async fn persist(&self) -> Result<Option<(SystemTime, u64)>, DenylistError> {
         let mut lines = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             // Encode through RevocationId::to_hex so the file and the API encoding cannot diverge: the file
@@ -287,13 +291,12 @@ impl FileDenylist {
         let body = lines.join("\n") + "\n";
         // Atomic replace: write a temp sibling, then rename over the target. A crash mid-write can never
         // truncate the denylist and silently bring a revoked cap back to life; the rename is all-or-nothing.
-        // The temp is tightened to `0600` before the rename carries that mode onto the target, so the
-        // denylist is owner-only. The consumer-provisioned parent dir keeps the transient temp unreadable to
-        // other local users in the meantime.
+        // The temp is opened owner-only and tightened to `0600` before the rename carries that mode onto
+        // the target, so the denylist is owner-only. The consumer-provisioned parent dir keeps the transient
+        // temp unreadable to other local users in the meantime.
         let tmp = self.path.with_extension("tmp");
-        tokio::fs::write(&tmp, body)
-            .await
-            .map_err(DenylistError::Io)?;
+        let mut file = open_tmp(&tmp).await.map_err(DenylistError::Io)?;
+        let stamp = write_and_stamp(&mut file, body.as_bytes()).await?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -304,7 +307,8 @@ impl FileDenylist {
         }
         tokio::fs::rename(&tmp, &self.path)
             .await
-            .map_err(DenylistError::Io)
+            .map_err(DenylistError::Io)?;
+        Ok(stamp)
     }
 }
 
@@ -313,6 +317,80 @@ impl Revocations for FileDenylist {
     fn is_revoked(&self, cap: &Cap) -> bool {
         FileDenylist::is_revoked(self, cap)
     }
+}
+
+/// Open the denylist's temp sibling for a whole-body rewrite, owner-only from creation. Opening this ONE
+/// handle is what lets [`write_and_stamp`] take the stamp from the bytes it wrote rather than from the path.
+/// A pre-existing temp is truncated in place and tightened again below before the rename carries `0600` onto
+/// the target.
+#[cfg(feature = "tokio-fs")]
+#[cfg(unix)]
+async fn open_tmp(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .await
+}
+
+/// The non-unix twin of `open_tmp`; there is no creation mode to tighten.
+#[cfg(feature = "tokio-fs")]
+#[cfg(not(unix))]
+async fn open_tmp(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+        .await
+}
+
+/// Write `body` to ONE already-open handle and return that handle's `(mtime, len)` stamp. The single
+/// handle is the invariant: the stamp names the same inode the bytes went to, so a writer that replaces the
+/// target path can never pair these bytes with the replacement's freshness and make the next refresh skip
+/// the replacement's revocation. A stamp the platform will not report degrades to `None`, so the next
+/// refresh re-reads rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the
+/// write seam.
+#[cfg(feature = "tokio-fs")]
+#[allow(clippy::type_complexity)]
+pub(crate) async fn write_and_stamp(
+    file: &mut tokio::fs::File,
+    body: &[u8],
+) -> Result<Option<(SystemTime, u64)>, DenylistError> {
+    write_all(file, body).await?;
+    let stamp = file
+        .metadata()
+        .await
+        .ok()
+        .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+    Ok(stamp)
+}
+
+/// Write every byte of `body` to the open `file` through the core [`AsyncWrite`] trait. The `tokio-fs`
+/// feature enables only `tokio/fs`; the `io-util` extension traits would add `bytes` to every consumer's
+/// lock just to write this small control file, so this loop drives `poll_write` directly. A zero-length
+/// write is an error, never a silently truncated body.
+// `core::io::ErrorKind` is still unstable, so the zero-write error reads from `std`.
+#[cfg(feature = "tokio-fs")]
+#[allow(clippy::std_instead_of_core)]
+async fn write_all(file: &mut tokio::fs::File, mut body: &[u8]) -> Result<(), DenylistError> {
+    while !body.is_empty() {
+        let written = core::future::poll_fn(|cx| {
+            core::pin::Pin::new(&mut *file)
+                .poll_write(cx, body)
+                .map(|outcome| outcome.map_err(DenylistError::Io))
+        })
+        .await?;
+        if written == 0 {
+            return Err(DenylistError::Io(std::io::Error::from(
+                std::io::ErrorKind::WriteZero,
+            )));
+        }
+        body = &body[written..];
+    }
+    Ok(())
 }
 
 /// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file's
@@ -362,6 +440,7 @@ pub(crate) async fn read_ids_from(
 /// `tokio/fs`; the `io-util` extension traits would add `bytes` to every consumer's lock just to read this
 /// small control file, so this loop drives `poll_read` directly.
 // `core::io::ErrorKind` is still unstable, so the UTF-8 error construction reads from `std`.
+#[cfg(feature = "tokio-fs")]
 #[allow(clippy::std_instead_of_core)]
 async fn read_to_string(file: &mut tokio::fs::File) -> Result<String, DenylistError> {
     let mut bytes = Vec::new();
