@@ -1,5 +1,5 @@
 //! Unit tests for the generic signed-document primitive. Authenticity (only the signing key's signature
-//! verifies) and a lossless encode/decode round-trip are the load-bearing properties: a payload is opaque,
+//! verifies) and a lossless encode/decode round-trip are the essential properties: a payload is opaque,
 //! so the whole job here is proving WHO signed the bytes and that they arrived untampered. Plus the
 //! domain-separation regression: a document signature can never be reused as a biscuit block signature.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -172,7 +172,7 @@ fn a_document_signature_cannot_forge_a_biscuit_block_signature_v0_or_v1() {
 
 #[test]
 fn the_domain_tag_first_byte_cannot_begin_any_biscuit_block_signing_payload() {
-    // Pin the load-bearing invariant so a future tag rename is a deliberate re-check, not a silent
+    // Pin the essential invariant so a future tag rename is a deliberate re-check, not a silent
     // regression (Adversary condition on M3.1). See SIGNED_DOCUMENT_CONTEXT.
     let first = SIGNED_DOCUMENT_CONTEXT[0];
     // v1 payloads begin with \0 (\0BLOCK\0...); a tag beginning with \0 could masquerade as a v1 payload.

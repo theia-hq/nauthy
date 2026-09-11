@@ -2,7 +2,7 @@
 //!
 //! The generic primitive under any signed artifact rooted at an identity. [`Identity::sign_document`]
 //! signs a payload with the same ed25519 key the identity mints caps with, and [`Signed::verify`] against
-//! the key you actually trust is the whole security seam: only that key's secret makes a signature the
+//! the key you actually trust is the whole security check: only that key's secret makes a signature the
 //! key verifies, so any holder may relay the blob and none can forge it. The payload is OPAQUE
 //! here (nauthy attaches no meaning to the bytes): a consumer canonicalizes and parses its own document,
 //! and this layer only proves who signed the bytes and that they were not tampered.
@@ -18,7 +18,7 @@ const SIG_LEN: usize = 64;
 /// An opaque payload plus the identity that signed it and its detached ed25519 signature.
 ///
 /// Holding one proves NOTHING on its own: [`verify`](Signed::verify) against the key you actually trust is
-/// the security seam, and the ONLY path from a decoded blob to a payload a caller may trust. The signer is
+/// the security check, and the ONLY path from a decoded blob to a payload a caller may trust. The signer is
 /// carried so a blob is self-describing on the wire, but it is UNTRUSTED until `verify` roots it at the key
 /// the caller names.
 #[derive(Debug, Clone, PartialEq, Eq)]
