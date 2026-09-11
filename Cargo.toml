@@ -24,6 +24,9 @@ data-encoding = "2"
 # token). Already in the tree transitively via biscuit-auth; declared directly so the roster primitive signs
 # with a plain, obvious ed25519 signature rather than smuggling a document into an authorization token.
 ed25519-dalek = "2"
+# The advisory `flock` that serializes denylist writers. Already in the tree transitively; declared
+# directly so the syscall rides the standard binding rather than a hand-declared symbol.
+libc = "0.2"
 # The CSPRNG traits `Identity::from_rng` accepts, so keygen needs no OS dependency in the core; the
 # OS-seeded `Identity::generate` is behind `os-rng`, which turns on rand_core's own `getrandom`.
 rand_core = "0.6"

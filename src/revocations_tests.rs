@@ -31,6 +31,8 @@ fn denylist(tag: &str) -> FileDenylist {
         std::thread::current().id()
     ));
     let _ = std::fs::remove_file(&path);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
     FileDenylist::empty(path)
 }
 
@@ -178,18 +180,18 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
 }
 
 /// The M2 race at its smallest on the WRITE side: a revoke must adopt the stamp of the bytes it wrote, taken
-/// from the handle that wrote them, never the `(mtime, len)` of a path a second writer can replace. `persist`
-/// funnels every write and every stamp through `write_and_stamp`, so this drives that path with the
-/// replacement landing between the open and the write: a stamp read from the path would describe the
+/// from the handle that wrote them, never the `(mtime, len)` of a path a second writer can replace.
+/// `persist` funnels every write and every stamp through `write_and_stamp`, so this drives that path with
+/// the replacement landing between the open and the write: a stamp read from the path would describe the
 /// replacement and make the next refresh skip the replacement's revocation until the next edit.
-#[tokio::test]
-async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
+#[test]
+fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
     let path = std::env::temp_dir().join(format!(
         "nauthy-denylist-write-race-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
-    let tmp = path.with_extension("tmp");
+    let tmp = crate::revocations::temp_path(&path);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&tmp);
 
@@ -197,9 +199,8 @@ async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
     // the body written through the handle, so the two stamps differ even on a filesystem with coarse mtime
     // ticks.
     std::fs::write(&path, "00\n").expect("write the foreign generation");
-    let mut file = tokio::fs::File::create(&tmp)
-        .await
-        .expect("open the handle the body is written through");
+    let mut file =
+        std::fs::File::create(&tmp).expect("open the handle the body is written through");
 
     // Replace the path after the handle is open and before the body is written: a stamp read from the path
     // would wear this replacement's freshness instead of the handle's.
@@ -208,7 +209,6 @@ async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
     std::fs::rename(&replacement, &path).expect("rename the replacement over the path");
 
     let stamp = crate::revocations::write_and_stamp(&mut file, b"aabbcc\n")
-        .await
         .expect("write the body and stamp the handle");
 
     // The length is the bytes this handle wrote, so it can only be the handle's own body. The exact
@@ -228,4 +228,97 @@ async fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(&tmp);
+}
+
+/// Two issuers over one path that each loaded the file BEFORE either wrote: the exact schedule the
+/// lost-update defect needed, because each writer's in-memory set is missing the other's id. The
+/// read-merge-write under the lock must keep BOTH ids on disk, so a fresh load refuses both caps, and each
+/// instance sees the other's id on its next check.
+#[tokio::test]
+async fn two_instances_revoking_different_ids_both_survive_on_disk() {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-denylist-merge-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+
+    // Both load the absent file: each holds the same empty view the losing writer had.
+    let mut first = FileDenylist::load(path.clone()).await.expect("load first");
+    let mut second = FileDenylist::load(path.clone()).await.expect("load second");
+
+    let cap_a = identity(11)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint a");
+    let cap_b = identity(12)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint b");
+    first.revoke_root(&cap_a).await.expect("first revokes a");
+    // `second` still holds the empty view it loaded before the write above, so writing its own set alone
+    // would erase `cap_a`; the merge under the lock must keep it.
+    second.revoke_root(&cap_b).await.expect("second revokes b");
+
+    let on_disk = std::fs::read_to_string(&path).expect("read the denylist back");
+    let root_a = cap_a
+        .root_revocation_id()
+        .expect("a minted cap has an authority block");
+    let root_b = cap_b
+        .root_revocation_id()
+        .expect("a minted cap has an authority block");
+    assert!(
+        on_disk.contains(&root_a.to_hex()),
+        "the first writer's id is on disk"
+    );
+    assert!(
+        on_disk.contains(&root_b.to_hex()),
+        "the second writer's id is on disk"
+    );
+
+    let fresh = FileDenylist::load(path.clone()).await.expect("fresh load");
+    assert!(
+        fresh.is_revoked(&cap_a),
+        "a fresh load refuses the first writer's cap"
+    );
+    assert!(
+        fresh.is_revoked(&cap_b),
+        "a fresh load refuses the second writer's cap"
+    );
+
+    // The merging writer adopted the first writer's id with the union. The first writer, whose own write
+    // predates the second's, sees the second's id on its next check: the first check after load always
+    // stats the file, so no sleep is needed for the mtime watch to fire.
+    assert!(
+        second.is_revoked(&cap_a),
+        "the merging writer's own view includes the first writer's id"
+    );
+    assert!(
+        first.is_revoked(&cap_b),
+        "the first writer sees the second's write on its next check"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+}
+
+/// Each write gets its own temp sibling: the old fixed `<denylist>.tmp` name let two writers share one
+/// temp, so one could truncate the other's in-flight body.
+#[test]
+fn each_write_gets_a_unique_temp_sibling() {
+    let path = std::path::PathBuf::from("/tmp/nauthy-denylist-temp");
+    let first = crate::revocations::temp_path(&path);
+    let second = crate::revocations::temp_path(&path);
+    assert_ne!(first, second, "two writes never share one temp path");
+    assert_eq!(
+        first.parent(),
+        path.parent(),
+        "the temp is a sibling in the denylist's dir"
+    );
+    assert_eq!(
+        second.parent(),
+        path.parent(),
+        "the temp is a sibling in the denylist's dir"
+    );
 }
