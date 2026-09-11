@@ -407,3 +407,5 @@ impl core::fmt::Display for Refusal {
         f.write_str(reason)
     }
 }
+
+impl core::error::Error for Refusal {}
