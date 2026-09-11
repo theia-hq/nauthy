@@ -46,7 +46,7 @@ check is: does this token chain back to my key, and do its checks pass right now
 nauthy authorizes an identity; it does not authenticate one. It rests on **one precondition it cannot
 check itself**: that a transport handshake has already proven the peer holds the private key behind its
 public key. That is what `ProvenPeer::from_handshake` marks. It is a well-marked contract at a single
-seam you audit, not a guarantee the type system proves: nauthy has no transport to check, so you must
+point you audit, not a guarantee the type system proves: nauthy has no transport to check, so you must
 call it only from the code that finished the handshake, with the key the handshake proved. Every
 device-bound grant rests on that one call being honest.
 
@@ -145,9 +145,9 @@ live when the file changes, so a revocation written by another process takes eff
 connection without a restart. Revocation does not evict a session already in progress; short expiry backs
 it up.
 
-## The seams: what you bring
+## The boundaries: what you bring
 
-nauthy is the authorization layer, and no more. Three seams are yours:
+nauthy is the authorization layer, and no more. Three things are yours:
 
 - **A transport-proven peer.** You call `ProvenPeer::from_handshake` from the code that finished the
   handshake. nauthy consumes the proof; it does not perform the handshake.

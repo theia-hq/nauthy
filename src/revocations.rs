@@ -7,7 +7,7 @@
 //! attenuated from). Pure-offline, node-local, and it survives restarts, which a short TTL cannot: a TTL
 //! ages a leaked cap out eventually but cannot recall it now.
 //!
-//! [`Revocations`] is the seam. It is a synchronous, one-method trait, so a consumer whose distributed
+//! [`Revocations`] is the extension point. It is a synchronous, one-method trait, so a consumer whose distributed
 //! system keeps revocations in Redis, a database, or a gossip set implements it over that store and needs
 //! no file and no async runtime. The batteries-included impl is [`FileDenylist`] (behind the `tokio-fs`
 //! feature), a persisted set of ids on disk.
@@ -352,7 +352,7 @@ async fn open_tmp(path: &Path) -> std::io::Result<tokio::fs::File> {
 /// target path can never pair these bytes with the replacement's freshness and make the next refresh skip
 /// the replacement's revocation. A stamp the platform will not report degrades to `None`, so the next
 /// refresh re-reads rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the
-/// write seam.
+/// single-handle write path.
 #[cfg(feature = "tokio-fs")]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn write_and_stamp(
@@ -425,7 +425,7 @@ async fn read_ids(
 /// invariant: the bytes and the stamp describe the same inode, so a path replacement between the open and
 /// the read can never pair old ids with the replacement's freshness. An unreadable body or an unparsable
 /// line is an error; a stamp the platform will not report degrades to `None`, so the next refresh re-reads
-/// rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the handle seam.
+/// rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the single-handle path.
 #[cfg(feature = "tokio-fs")]
 #[allow(clippy::type_complexity)]
 pub(crate) async fn read_ids_from(

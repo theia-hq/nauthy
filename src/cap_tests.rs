@@ -1,4 +1,4 @@
-//! The capability ACL matrix: mint, attenuate, delegate, expire, wrong-service, and the load-bearing
+//! The capability ACL matrix: mint, attenuate, delegate, expire, wrong-service, and the essential
 //! proof that broadening is impossible by construction.
 
 use core::time::Duration;
@@ -122,7 +122,7 @@ fn a_service_slip_is_not_membership() {
 
 #[test]
 fn an_appended_member_fact_does_not_grant_membership() {
-    // The origin wall, the load-bearing proof. `mint_forged_member` builds a badge whose authority block
+    // The origin wall, the essential proof. `mint_forged_member` builds a badge whose authority block
     // has the SAME device-binding + expiry as a real one, but asserts `member(true)` in an ATTENUATION
     // block. The only variable is the fact's origin. The gate refuses the forged badge (appended fact is
     // untrusted, so `allow if member(true)` never sees it) yet admits the real one, so membership is
@@ -438,7 +438,7 @@ fn authority_bound_root_reads_the_pinned_authority_offline() {
 
 #[test]
 fn an_authority_slip_is_inert_on_the_plain_path() {
-    // The load-bearing "slip alone denies" guard: an authority-bound slip carries an extra
+    // The essential "slip alone denies" guard: an authority-bound slip carries an extra
     // `check if authority_bound($x), foreign_member($x)` that NO plain verification injects, so
     // verify_at_root_without_revocation (the gate's plain path) can never satisfy it. Without this, an
     // authority slip would admit with no badge.

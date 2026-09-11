@@ -48,7 +48,7 @@ which a short expiry cannot.
 **The compromise.** Revoking on one node does not reach others. An owner running several nodes revokes on
 each. There is no canonical, signed, published status list a third party can fetch and trust.
 
-**Factored in.** Revocation is a seam, not a fixed store: the gate consults a one-method `Revocations`
+**Factored in.** Revocation is an interface, not a fixed store: the gate consults a one-method `Revocations`
 trait, so the set can live behind anything a consumer supplies, including a set shared across their own
 deployment. nauthy ships the node-local floor and leaves distribution to the consumer, rather than baking
 in a network to propagate revocations: the trait is the extension point, not a promise of one.

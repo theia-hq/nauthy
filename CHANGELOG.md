@@ -45,7 +45,7 @@ theia-internal build.
 - **`Revocations` trait and a runtime-free core.** The gate consults a synchronous `Revocations` oracle, so
   a consumer can back revocation with any store. `FileDenylist` sits behind the `tokio-fs` feature (on by
   default); `--no-default-features` builds the core (trait, `Gate`, `Cap`, `Identity`) with no async runtime.
-- **`ProvenPeer`.** A named, greppable seam for the one precondition offline auth cannot check: the peer is
+- **`ProvenPeer`.** A named, greppable point for the one precondition offline auth cannot check: the peer is
   transport-proven. `Gate::admit` takes it instead of a bare key.
 - **`sign_document` is domain-separated** with a fixed context tag, so a document signature can never be
   reused as a biscuit block signature.

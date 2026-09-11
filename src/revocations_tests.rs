@@ -179,7 +179,7 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
 
 /// The M2 race at its smallest on the WRITE side: a revoke must adopt the stamp of the bytes it wrote, taken
 /// from the handle that wrote them, never the `(mtime, len)` of a path a second writer can replace. `persist`
-/// funnels every write and every stamp through `write_and_stamp`, so this drives that seam with the
+/// funnels every write and every stamp through `write_and_stamp`, so this drives that path with the
 /// replacement landing between the open and the write: a stamp read from the path would describe the
 /// replacement and make the next refresh skip the replacement's revocation until the next edit.
 #[tokio::test]

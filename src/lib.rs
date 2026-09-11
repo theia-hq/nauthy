@@ -41,7 +41,7 @@
 //!
 //! Offline verification trusts what it cannot check. A consumer MUST uphold all of:
 //! - **The peer is TRANSPORT-PROVEN.** [`Gate::admit`] takes a [`ProvenPeer`], minted only from a completed
-//!   handshake; a key from an unauthenticated hello voids every device binding. The type marks this seam
+//!   handshake; a key from an unauthenticated hello voids every device binding. The type marks this precondition
 //!   loudly but cannot enforce it (nauthy has no transport), so the proof is the caller's contract.
 //! - **The secret stays secret AND never signs hostile bytes.** [`Identity::sign_document`] domain-separates
 //!   its signatures so a document signature can never be reused as a biscuit block signature.

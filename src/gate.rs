@@ -184,8 +184,8 @@ impl Gate {
 ///
 /// nauthy cannot check this, and every device binding rests on it: [`Gate::admit`] takes a `ProvenPeer`,
 /// never a bare [`VerifyKey`], so the one precondition a caller MUST uphold is NAMED and LOCALIZED at a
-/// single, greppable, loudly-documented seam rather than scattered. This is a WELL-MARKED PRECONDITION
-/// enforced by contract at that seam, NOT a guarantee proven by the type system: nauthy has no transport to
+/// single, greppable, loudly-documented place rather than scattered. This is a WELL-MARKED PRECONDITION
+/// enforced by contract there, NOT a guarantee proven by the type system: nauthy has no transport to
 /// check, so a caller can still construct a `ProvenPeer` from an unproven key. The transport-proof audit is
 /// therefore not optional. What the type buys over a bare `VerifyKey` is that the F2 mistake (gating on a
 /// key read from an unauthenticated hello) can no longer be made SILENTLY, and is trivial to audit for.

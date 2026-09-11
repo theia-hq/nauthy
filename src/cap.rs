@@ -66,7 +66,7 @@ const MAX_BLOCKS: usize = 16;
 /// document signature can never double as a biscuit authority-block signature (the confused-deputy forgery,
 /// F1: a victim who signs attacker-influenced bytes must not thereby emit a valid biscuit block signature).
 ///
-/// LOAD-BEARING INVARIANT: the tag's FIRST byte must be one that cannot begin a valid biscuit
+/// ESSENTIAL INVARIANT: the tag's FIRST byte must be one that cannot begin a valid biscuit
 /// authority-block signing payload of ANY supported biscuit version. Today this holds two ways at once:
 /// - a biscuit v1 signing payload begins with `\0` (`\0BLOCK\0...`); ours begins with `n` (0x6e), so the
 ///   signed message `TAG || bytes` can never equal a v1 payload.
@@ -296,7 +296,7 @@ impl Identity {
     ///
     /// This does NOT consult a denylist: it is the headline self-rooted offline-verify path, pure public
     /// key against your own root. To authorize a live connection use [`Gate::admit_witnessed`](crate::Gate),
-    /// which is the admission seam and does check revocation.
+    /// which is the admission API and does check revocation.
     pub fn verify(&self, cap: &Cap, request: &Request) -> Result<VerifyKey, CapError> {
         cap.verify_at_root_without_revocation(request, self.verifying_key())
     }
@@ -307,7 +307,7 @@ impl Cap {
     ///
     /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
     /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
-    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission seam and does check revocation.
+    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission API and does check revocation.
     /// Public because pure offline pubkey verification against a root you trust (with your own out-of-band
     /// revocation) is a legitimate sovereign use.
     ///
@@ -353,7 +353,7 @@ impl Cap {
     ///
     /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
     /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
-    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission seam and does check revocation.
+    /// use [`Gate::admit_witnessed`](crate::Gate), which is the admission API and does check revocation.
     /// Public because pure offline pubkey verification against a root you trust (with your own out-of-band
     /// revocation) is a legitimate sovereign use.
     ///
@@ -396,7 +396,7 @@ impl Cap {
     ///
     /// SUB-CHECK, NOT the admission API. This OMITS revocation: it verifies the signature chain and the
     /// caveats but does NOT consult any [`Revocations`](crate::Revocations) store. To authorize a connection
-    /// use [`Gate::admit_foreign_witnessed`](crate::Gate), which is the admission seam and does check
+    /// use [`Gate::admit_foreign_witnessed`](crate::Gate), which is the admission API and does check
     /// revocation. Public because pure offline pubkey verification against a root you trust (with your own
     /// out-of-band revocation) is a legitimate sovereign use.
     ///
