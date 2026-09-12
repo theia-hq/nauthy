@@ -13,10 +13,10 @@ use crate::service::Service;
 /// A `sheer:` capability link: the shareable text form of a [`Cap`], validated at construction.
 ///
 /// [`FromStr`] runs [`Cap::parse`], the same check the far gate runs, so holding a `Link` proves the bytes
-/// decoded and the signature chain verified against the embedded root; [`Display`] renders the exact text
-/// to present. It is the typed owner of the raw form: [`Cap::link`] produces one and no public signature
-/// traffics in the raw string. The parsed cap is carried beside the text, so the link's root (the node it
-/// addresses) is a plain read rather than a second parse.
+/// decoded and the signature chain verified against the embedded root; [`Display`](fmt::Display) renders the
+/// exact text to present. It is the typed owner of the raw form: [`Cap::link`] produces one and no public
+/// signature traffics in the raw string. The parsed cap is carried beside the text, so the link's root
+/// (the node it addresses) is a plain read rather than a second parse.
 #[derive(Clone)]
 pub struct Link {
     cap: Cap,

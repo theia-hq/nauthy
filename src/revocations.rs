@@ -13,10 +13,11 @@
 //! feature), a persisted set of ids on disk.
 //!
 //! Revocation through [`FileDenylist`] is LIVE: [`is_revoked`](FileDenylist::is_revoked) re-reads the file
-//! when its mtime changes, so a revocation written by a separate process takes effect on the next
-//! connection to a long-running issuer; it does not wait for a restart. The file's mtime is the freshness
-//! signal; the reload is a small, rare read (only when the file actually changed), guarded by interior
-//! mutability so the gate's synchronous admit path stays synchronous.
+//! when its `(mtime, len)` stamp changes, so a revocation written by a separate process takes effect on
+//! the next connection to a long-running issuer; it does not wait for a restart. The length rides with
+//! the mtime on purpose: a revoke only ever grows the file, so a change within one coarse mtime tick is
+//! still seen. The reload is a small, rare read (only when the file actually changed), guarded by
+//! interior mutability so the gate's synchronous admit path stays synchronous.
 //!
 //! Revocation WRITES are SERIALIZED: [`revoke`](FileDenylist::revoke) takes an exclusive advisory lock on a
 //! sibling `<path>.lock` file, re-reads the on-disk set under that lock, and writes the union of the disk
@@ -106,8 +107,9 @@ pub struct RevocationIdParseError;
 /// line, and the batteries-included [`Revocations`] impl.
 ///
 /// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
-/// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the mtime it was
-/// read at, so a check can refresh it in place when the file changed underneath a running process.
+/// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the
+/// `(mtime, len)` stamp it was read at, so a check can refresh it in place when the file changed
+/// underneath a running process.
 ///
 /// CONCURRENT REVOCATIONS SURVIVE. A write locks a sibling `<path>.lock` file, re-reads the on-disk set
 /// under that lock, and rewrites the union, so two issuers that each loaded the file before either wrote
@@ -173,9 +175,9 @@ impl FileDenylist {
         chain.iter().any(|id| state.ids.contains(id))
     }
 
-    /// Reload the ids in place if the backing file's mtime differs from what we last read. Synchronous and
-    /// on the admit hot path, so it debounces the stat to at most once per [`STAT_DEBOUNCE`] and re-reads
-    /// only on change.
+    /// Reload the ids in place if the backing file's `(mtime, len)` stamp differs from what we last read.
+    /// Synchronous and on the admit hot path, so it debounces the stat to at most once per
+    /// [`STAT_DEBOUNCE`] and re-reads only on change.
     ///
     /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
     /// leave the last-known set intact and return. Deletion is not "the denylist is now empty": a `rm` of
