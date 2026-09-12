@@ -39,6 +39,7 @@ use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::VerifyKey;
+use crate::link::Link;
 use crate::revocations::RevocationId;
 use crate::service::Service;
 use crate::signed::Signed;
@@ -489,7 +490,10 @@ impl Cap {
 /// A capability: a token decoded and signature-verified against the root [`VerifyKey`] embedded in its link.
 ///
 /// Holding a `Cap` proves the bytes were a biscuit that chains to `root`; whether it *grants* a specific
-/// request (right service, unexpired) is a separate question answered by [`Identity::verify`].
+/// request (right service, unexpired) is a separate question answered by [`Identity::verify`]. Cloneable
+/// because a cap is share material, not a secret: every holder of the link can parse one, and cloning it
+/// lets [`Link`] carry the parsed token beside its text.
+#[derive(Clone)]
 pub struct Cap {
     root: VerifyKey,
     token: Biscuit,
@@ -554,8 +558,14 @@ impl Cap {
         self.revocation_ids().into_iter().next()
     }
 
-    /// Encode this cap as a `sheer:<node-id>.<base32>` share-link.
-    pub fn link(&self) -> Result<String, CapError> {
+    /// Encode this cap as a [`Link`]: the shareable `sheer:<node-id>.<base32>` form.
+    pub fn link(&self) -> Result<Link, CapError> {
+        Link::of(self.clone())
+    }
+
+    /// The encoded `sheer:<node-id>.<base32>` text. The one raw-form encoder ([`Link::of`] calls it), so
+    /// the text and the token can never drift apart.
+    pub(crate) fn link_text(&self) -> Result<String, CapError> {
         let bytes = self.token.to_vec().map_err(CapError::Encode)?;
         Ok(format!(
             "{SCHEME}{}{SEPARATOR}{}",

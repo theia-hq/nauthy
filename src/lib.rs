@@ -54,6 +54,7 @@
 mod cap;
 mod gate;
 mod key;
+mod link;
 mod revocations;
 mod service;
 mod signed;
@@ -63,6 +64,8 @@ mod cap_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
+mod link_tests;
+#[cfg(test)]
 mod revocations_tests;
 #[cfg(test)]
 mod signed_tests;
@@ -70,6 +73,7 @@ mod signed_tests;
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
 pub use crate::gate::{Admission, Admitted, Decision, Gate, ProvenPeer, Refusal};
 pub use crate::key::{KeyParseError, VerifyKey};
+pub use crate::link::Link;
 #[cfg(feature = "tokio-fs")]
 pub use crate::revocations::{DenylistError, FileDenylist};
 pub use crate::revocations::{RevocationId, RevocationIdParseError, Revocations};
