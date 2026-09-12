@@ -11,8 +11,20 @@ All notable changes to nauthy, newest first.
   it beforehand.
 
 ### Added
+- **`Link`**, the typed `sheer:` link: `Link::mint`, `Link::mint_bound`, `Link::mint_signet`, `Link::seal`,
+  `Link::narrow`, and `Link::revoke`, with `FromStr` validating the signature chain at the wire edge.
+- **`Admitted::origin()`**, exposing an `Origin` (`Rooted` or `Open`) on the admission witness, so a
+  handler can refuse an open-gate admission even when its route reached it.
+- **`Refusal` implements `Error`**, so a refusal threads through a typed error chain.
 - **`DESIGN.md`**, the why/compromise/factored-in rationale for each major design choice, linked from the
   README.
+
+### Fixed
+- **Concurrent revocations no longer drop one.** `FileDenylist` writers take an exclusive lock on a sibling
+  `<path>.lock`, re-read under it, and write the union, so two processes revoking different ids both keep
+  them; the rewrite is atomic (a unique temp file, then a rename).
+- **Live reload spots a same-tick change.** The freshness stamp is `(mtime, len)`, so a revocation written
+  within one coarse mtime tick is still picked up.
 
 ## 0.1.0
 

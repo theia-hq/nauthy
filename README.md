@@ -1,9 +1,8 @@
 # nauthy
 
-Offline capability tokens rooted at one key you hold. Mint a grant to reach a service, narrow it, hand
-it on, revoke it: every grant carries an expiry and a revocation id, so a grant you regret stops working
-when it expires or when you revoke it, with no server to ask. All verified against your key with no PKI
-and no control plane.
+Capability tokens you can revoke with no server, rooted at one ed25519 key you hold. Mint a grant to
+reach a service, narrow it, hand it on, or revoke it; every grant carries an expiry and a revocation id.
+Verification is offline against that key, with no PKI and no control plane.
 
 The one thing that sets nauthy apart: a grant roots at the **same ed25519 key a peer already dials you
 at**. Where that key is your transport identity (iroh, libp2p, Noise, any ed25519 p2p), authorization
@@ -24,19 +23,22 @@ match gate.admit(peer, presented, &service) {
 ## Install
 
 ```sh
-cargo add nauthy --git https://github.com/theia-hq/nauthy --tag v0.1.0
+cargo add nauthy --git https://github.com/theia-hq/nauthy --branch main
 ```
 
 The defaults (`tokio-fs`, `os-rng`) give you the shipped file-backed revocation store and one-line key
 generation. For a build with no async runtime at all, take the core alone:
 
 ```toml
-nauthy = { git = "https://github.com/theia-hq/nauthy", tag = "v0.1.0", default-features = false }
+nauthy = { git = "https://github.com/theia-hq/nauthy", branch = "main", default-features = false }
 ```
 
 The core (`Gate`, `Cap`, `Identity`, the `Revocations` trait) needs no runtime. `--no-default-features`
 drops `FileDenylist` (bring your own `Revocations`) and `Identity::generate` (use `Identity::from_rng`
 with any CSPRNG you supply).
+
+`FileDenylist` is async, so the example below runs on a Tokio runtime: add `tokio` with the `macros` and
+`rt-multi-thread` features to the binary that embeds nauthy.
 
 ## What you verify, and the one precondition
 
@@ -50,15 +52,10 @@ point you audit, not a guarantee the type system proves: nauthy has no transport
 call it only from the code that finished the handshake, with the key the handshake proved. Every
 device-bound grant rests on that one call being honest.
 
-## Revoke it when you regret it
-
-Every grant below carries an expiry and a revocation id. Expiry ends it on its own; revocation ends it
-now: record the id in the denylist and the gate refuses that grant from the next connection on, no
-restart. See [Revocation](#revocation). The rest of this page is what you revoke.
-
 ## The grants
 
-One key signs four token shapes, plus one policy that needs no token. Each answers one question:
+One key signs four token shapes, plus one policy that needs no token. Each answers one question, and
+every grant carries an expiry and a revocation id:
 
 | Grant | Question | Bound to | Delegable |
 | ----- | -------- | -------- | --------- |
@@ -92,16 +89,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Hand it out as a link. A holder can narrow it further, offline, with no secret.
     let link = cap.link()?;
-    let narrowed =
-        Cap::parse(&link)?.attenuate(None, Some(Request::expires_in(Duration::from_secs(600))))?;
+    let narrowed = link.narrow(None, Some(Duration::from_secs(600)))?;
 
     // The transport handshake proved which key the peer holds; mark that fact here.
     // (In a real service this key comes from your transport, not a fresh identity.)
     let peer = ProvenPeer::from_handshake(Identity::generate()?.verifying_key());
 
     // 4. On your node, decide whether the peer may connect. The gate trusts one key: yours.
+    //    The link arrives as text; parse it back into the cap the gate rules on.
+    let presented = Cap::parse(narrowed.as_str())?;
     let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
-    match gate.admit(peer, Some(&narrowed), &ssh) {
+    match gate.admit(peer, Some(&presented), &ssh) {
         Decision::Admit => println!("admitted"),
         Decision::Refuse(why) => println!("refused: {why}"),
     }
@@ -114,7 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // A gate reading the same denylist now refuses the narrowed link with Refusal::Revoked.
     let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
     assert!(matches!(
-        gate.admit(peer, Some(&narrowed), &ssh),
+        gate.admit(peer, Some(&presented), &ssh),
         Decision::Refuse(Refusal::Revoked),
     ));
     Ok(())
@@ -122,11 +120,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 For a compile-time proof that a service handler cannot run without a ruling, use `admit_witnessed`, which
-returns an `Admitted` witness (single-use, no public constructor) instead of a plain `Decision`. A
-handler that takes an `Admitted` cannot be reached without a gate having permitted the peer.
+returns an `Admitted` witness (single-use, no public constructor) instead of a plain `Decision`. The
+witness carries the proven peer, the admission kind, and its origin (`Origin::Rooted` or `Origin::Open`),
+so a handler can refuse an open-gate admission even when its route reached it. A handler that takes an
+`Admitted` cannot be reached without a gate having permitted the peer.
 
 A link is `sheer:<key>.<token>`: it carries the authority's public key beside the token, so a holder can
-decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone.
+decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone. The
+`Link` type owns that text; parsing validates the signature chain at the wire edge.
 
 ## Revocation
 
@@ -160,12 +161,16 @@ nauthy is the authorization layer, and no more. Three things are yours:
 nauthy brings the grant vocabulary, offline verification, device binding against replay, the single-use
 `Admitted` witness, and the shipped revocation store.
 
-## Recipes: three things people build with this
+## Three things people build with this
 
-Agentic-AI permissioning: mint a short bearer slip per task, scoped to the one service the agent may
-reach, and revoke it when the task ends. Licensing: mint one device-bound slip per customer machine;
-a copied license file verifies against no other key. Membership badges: mint one badge per device you
-own; the gate admits your fleet with no per-service step.
+- **Agentic-AI permissioning.** Mint a short bearer slip per task, scoped to the one service the agent
+  may reach; revoke it when the task ends.
+- **Licensing.** Mint one device-bound slip per customer machine. A copied license file verifies against
+  no other key.
+- **Membership badges.** Mint one badge per device you own; the gate admits your fleet with no per-service
+  step.
+
+## Recipes
 
 Two patterns you build on nauthy's own primitives.
 
@@ -186,8 +191,9 @@ now". If you need one, build it: at mint time record `cap.root_revocation_id()` 
 you can list outstanding grants, and revoke one by its id alone, without still holding the token.
 
 ```rust
-let root_id = cap.root_revocation_id().expect("a minted cap has an authority block");
-index.insert("alice", root_id.to_hex());          // your directory
+if let Some(root_id) = cap.root_revocation_id() {
+    index.insert("alice", root_id.to_hex());          // your directory
+}
 // later, revoke by that id:
 denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
 ```
