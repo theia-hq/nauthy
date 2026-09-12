@@ -118,9 +118,11 @@ impl Gate {
             // A public node proves nothing about a peer, so it cannot have admitted a MEMBER: the kind is
             // `Slip` (fail-closed). `is_member()` is therefore false on an open node, exactly as a caller
             // layering a member-only ceiling must see it. A default-to-`Member` here would be a trust break.
+            // The origin is `Open`: no token was verified, so a downstream `Never` ceiling must refuse it.
             Gate::Open => Ok(Admitted {
                 peer: peer.key(),
                 kind: Admission::Slip,
+                origin: Origin::Open,
             }),
             // A rooted gate DID rule on a token. Re-read the same member-vs-grant distinction the ruling
             // used (`is_member` before `grants`, `admit_plain`): a whole-node membership badge is `Member`,
@@ -136,6 +138,7 @@ impl Gate {
                         Ok(Admitted {
                             peer: peer.key(),
                             kind,
+                            origin: Origin::Rooted,
                         })
                     }
                     Decision::Refuse(refusal) => Err(refusal),
@@ -159,6 +162,7 @@ impl Gate {
             Gate::Open => Ok(Admitted {
                 peer: peer.key(),
                 kind: Admission::Slip,
+                origin: Origin::Open,
             }),
             Gate::Rooted(root, revocations) => {
                 match admit_authority_bound(
@@ -172,6 +176,7 @@ impl Gate {
                     Decision::Admit => Ok(Admitted {
                         peer: peer.key(),
                         kind: Admission::Slip,
+                        origin: Origin::Rooted,
                     }),
                     Decision::Refuse(refusal) => Err(refusal),
                 }
@@ -223,17 +228,22 @@ impl ProvenPeer {
 /// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
 /// SINGLE-USE, per-stream proof. A consumer takes it BY VALUE, so minting one witness
 /// authorizes exactly one serve; it cannot be duplicated and replayed onto a second stream the gate never
-/// ruled on. It now carries the verified [`peer`](Admitted::peer) and the [`kind`](Admitted::kind) of
-/// admission, so a handler MAY layer a finer per-request policy on the gate's floor (an owner-only lifecycle
-/// verb reads [`is_member`](Admitted::is_member)); the single-use guarantee still relies on admit and serve
-/// sharing one stream frame (never hoist the admit above a per-stream loop), but single-use consumption
-/// removes the accidental-reuse footgun by construction. Adding a `Clone` derive here re-arms that replay,
-/// so the negative-trait assertion below is a fail-if-you-try guard, not documentation.
+/// ruled on. It now carries the verified [`peer`](Admitted::peer), the [`kind`](Admitted::kind) of
+/// admission, and the private [`origin`](Admitted::origin), so a handler MAY layer a finer per-request policy
+/// on the gate's floor (an owner-only lifecycle verb reads [`is_member`](Admitted::is_member); an engine whose
+/// safety precondition is a root-verified peer reads [`origin`](Admitted::origin)); the single-use guarantee
+/// still relies on admit and serve sharing one stream frame (never hoist the admit above a per-stream loop),
+/// but single-use consumption removes the accidental-reuse footgun by construction. Adding a `Clone` derive
+/// here re-arms that replay, so the negative-trait assertion below is a fail-if-you-try guard, not
+/// documentation.
 #[derive(Debug)]
 #[must_use = "an Admitted witness proves a gate ran; serve the one stream it authorized"]
 pub struct Admitted {
     peer: VerifyKey,
     kind: Admission,
+    /// How this witness was minted: a rooted token ruling or an open-gate admit. Module-private: the four
+    /// mints in this file are the only writers, and [`admitted`](Admitted::origin) is the only reader.
+    origin: Origin,
 }
 
 impl Admitted {
@@ -249,6 +259,14 @@ impl Admitted {
         self.kind
     }
 
+    /// How this peer was admitted: under a ROOTED token ruling or an [`Open`](Origin::Open) gate. Exposed as
+    /// the enum, never a bool, so a future origin (a second rooted authority kind) breaks every match site
+    /// and forces a decision there instead of silently reading as one of these two. A downstream `Never`
+    /// ceiling reads this and refuses everything that is not [`Rooted`](Origin::Rooted) (fail-closed).
+    pub fn origin(&self) -> Origin {
+        self.origin
+    }
+
     /// Whether this peer was admitted as a whole-node MEMBER (a `member(true)` badge), not via a per-service
     /// slip. False on a public node, where nothing about the peer is proven (the kind is [`Slip`]). A
     /// lifecycle verb that only an owner device may trigger gates on this.
@@ -257,6 +275,27 @@ impl Admitted {
     pub fn is_member(&self) -> bool {
         matches!(self.kind, Admission::Member)
     }
+}
+
+/// How a [`Gate`] minted an [`Admitted`] witness: by ruling on a rooted token, or by an open gate that ruled
+/// on nothing.
+///
+/// The distinction is a downstream handler's safety precondition, not an admission decision: an engine whose
+/// safety rests on a root-verified peer (a keyless shell) must refuse an open-minted witness even when its
+/// route reached the engine, so the origin travels ON the witness rather than in a side channel. It is a
+/// plain tag (no data), and it is exposed as the enum so a future variant (a second rooted authority kind, a
+/// paired-device origin) forces every match site to decide rather than defaulting into one of these two.
+///
+/// [`Open`](Origin::Open) is the fail-closed read for anything keyless: nothing about the peer was verified,
+/// so only a handler that would serve an unauthenticated stranger may accept it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Origin {
+    /// Admitted after a token rooted at the gate's authority verified (a membership badge or a delegated
+    /// service slip), or through the two-token foreign-authority AND.
+    Rooted,
+    /// Admitted by an [`Open`](Gate::Open) gate: no token was presented or verified, so nothing about the
+    /// peer is proven.
+    Open,
 }
 
 /// The AUTHORITY a [`Gate`] admitted a peer under: the two meanings a rooted token can carry.

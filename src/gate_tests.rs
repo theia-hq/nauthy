@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 use crate::VerifyKey;
 use crate::cap::{Cap, Identity, Request};
-use crate::gate::{Admission, Decision, Gate, ProvenPeer, Refusal};
+use crate::gate::{Admission, Decision, Gate, Origin, ProvenPeer, Refusal};
 use crate::revocations::{FileDenylist, STAT_DEBOUNCE};
 use crate::service::Service;
 
@@ -52,6 +52,35 @@ fn slip(seed: u8, svc: &str) -> Cap {
 
 fn some_peer() -> VerifyKey {
     identity(9).verifying_key()
+}
+
+#[test]
+fn a_witness_carries_the_origin_that_minted_it() {
+    // An open gate rules on nothing, so its witness is `Origin::Open`; a rooted gate verified a token, so
+    // its witness is `Origin::Rooted`. A downstream `Never` ceiling reads this to refuse an open witness,
+    // which is why it is the enum and not a bool: a third origin must break every match site.
+    let opened = Gate::Open
+        .admit_witnessed(proven(some_peer()), None, &service("ssh"))
+        .expect("an open gate admits anyone");
+    assert_eq!(opened.origin(), Origin::Open);
+
+    let gate = rooted_gate(1);
+    let slipped = gate
+        .admit_witnessed(proven(some_peer()), Some(&slip(1, "ssh")), &service("ssh"))
+        .expect("a delegated slip admits its service");
+    assert_eq!(slipped.origin(), Origin::Rooted);
+
+    // The two-token foreign-authority AND is a rooted ruling too: both leaves verified against a root.
+    let hire_device = identity(4).verifying_key();
+    let foreign = gate
+        .admit_foreign_witnessed(
+            proven(hire_device),
+            &authority_slip(2, "ssh"),
+            &foreign_badge(2, hire_device),
+            &service("ssh"),
+        )
+        .expect("slip + valid badge under X admits");
+    assert_eq!(foreign.origin(), Origin::Rooted);
 }
 
 #[test]

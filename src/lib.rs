@@ -71,7 +71,7 @@ mod revocations_tests;
 mod signed_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
-pub use crate::gate::{Admission, Admitted, Decision, Gate, ProvenPeer, Refusal};
+pub use crate::gate::{Admission, Admitted, Decision, Gate, Origin, ProvenPeer, Refusal};
 pub use crate::key::{KeyParseError, VerifyKey};
 pub use crate::link::Link;
 #[cfg(feature = "tokio-fs")]
