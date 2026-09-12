@@ -244,8 +244,8 @@ fn a_link_round_trips_and_carries_the_root() {
     let issuer = identity(1);
     let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
     let link = cap.link().expect("encode");
-    assert!(link.starts_with("sheer:"));
-    let parsed = Cap::parse(&link).expect("parse");
+    assert!(link.as_str().starts_with("sheer:"));
+    let parsed = Cap::parse(link.as_str()).expect("parse");
     assert_eq!(parsed.root(), issuer.verifying_key());
     assert!(issuer.verify(&parsed, &request("ssh", 0)).is_ok());
 }
@@ -256,7 +256,7 @@ fn a_tampered_link_is_rejected() {
     let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
     let link = cap.link().expect("encode");
     // Flip a character in the token body; the signature chain must no longer check against the root.
-    let mut chars: Vec<char> = link.chars().collect();
+    let mut chars: Vec<char> = link.as_str().chars().collect();
     let last = chars.len() - 1;
     chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
     let tampered: String = chars.into_iter().collect();
@@ -306,7 +306,7 @@ fn a_third_party_delegates_a_narrowed_cap_without_the_issuer() {
         .expect("encode");
 
     // Holder parses, narrows the expiry, re-links, hands to a third party.
-    let holder_cap = Cap::parse(&link).expect("holder parse");
+    let holder_cap = Cap::parse(link.as_str()).expect("holder parse");
     let handed = holder_cap
         .attenuate(None, Some(at(600)))
         .expect("holder narrows")
@@ -314,7 +314,7 @@ fn a_third_party_delegates_a_narrowed_cap_without_the_issuer() {
         .expect("holder re-encodes");
 
     // Third party parses the handed link and uses it directly. No issuer in the loop for any of this.
-    let third_party_cap = Cap::parse(&handed).expect("third-party parse");
+    let third_party_cap = Cap::parse(handed.as_str()).expect("third-party parse");
 
     // Issuer, seeing the token for the first time at connect, verifies the whole chain offline.
     assert!(issuer.verify(&third_party_cap, &request("ssh", 60)).is_ok());
@@ -597,5 +597,5 @@ fn a_many_block_cap_is_refused_at_parse() {
         cap = cap.attenuate(None, Some(at(3600))).expect("attenuate");
     }
     let link = cap.link().expect("encode");
-    assert!(matches!(Cap::parse(&link), Err(CapError::TooLarge)));
+    assert!(matches!(Cap::parse(link.as_str()), Err(CapError::TooLarge)));
 }
