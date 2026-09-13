@@ -228,7 +228,7 @@ impl ProvenPeer {
 /// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
 /// SINGLE-USE, per-stream proof. A consumer takes it BY VALUE, so minting one witness
 /// authorizes exactly one serve; it cannot be duplicated and replayed onto a second stream the gate never
-/// ruled on. It now carries the verified [`peer`](Admitted::peer), the [`kind`](Admitted::kind) of
+/// ruled on. It now carries the admitted [`peer`](Admitted::peer), the [`kind`](Admitted::kind) of
 /// admission, and the private [`origin`](Admitted::origin), so a handler MAY layer a finer per-request policy
 /// on the gate's floor (an owner-only lifecycle verb reads [`is_member`](Admitted::is_member); an engine whose
 /// safety precondition is a root-verified peer reads [`origin`](Admitted::origin)); the single-use guarantee
@@ -247,8 +247,9 @@ pub struct Admitted {
 }
 
 impl Admitted {
-    /// The verified identity the gate admitted. The transport handshake proved this key before the gate
-    /// ruled, so it is an un-forgeable fact, not a claim the peer made.
+    /// The identity the gate admitted: on a [`Rooted`](Origin::Rooted) admission the transport proved this
+    /// key before the gate ruled; on an [`Open`](Origin::Open) admission it is the key the peer announced.
+    /// A caller that needs the verified reading checks [`origin`](Self::origin).
     pub fn peer(&self) -> VerifyKey {
         self.peer
     }
