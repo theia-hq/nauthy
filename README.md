@@ -51,8 +51,7 @@ nauthy authorizes an identity; it does not authenticate one. It rests on **one p
 check itself**: that a transport handshake has already proven the peer holds the private key behind its
 public key. That is what `ProvenPeer::from_handshake` marks. It is a well-marked contract at a single
 point you audit, not a guarantee the type system proves: nauthy has no transport to check, so you must
-call it only from the code that finished the handshake, with the key the handshake proved. Every
-device-bound grant rests on that one call being honest.
+call it only from the code that finished the handshake, with the key the handshake proved.
 
 ## The grants
 
@@ -200,7 +199,7 @@ if let Some(root_id) = cap.root_revocation_id() {
 denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
 ```
 
-## The honest limits
+## The limits
 
 - **A bearer slip is a bearer token.** Whoever holds an unexpired, un-revoked one gets that service until
   it expires or you revoke it. Keep bearer slips short-lived; prefer a bound grant where you can.
