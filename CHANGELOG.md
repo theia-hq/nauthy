@@ -2,15 +2,12 @@
 
 All notable changes to nauthy, newest first.
 
-## Unreleased
+## v0.2.0
 
-### Changed
-- **`FileDenylist` no longer creates its parent directory.** Provisioning the directory the denylist lives
-  in, and its permissions, is the consumer's responsibility; `FileDenylist` writes only its own file,
-  owner-only (`0600` on Unix). A consumer that relied on `persist` creating the directory must now create
-  it beforehand.
+A typed `sheer:` link, an admission witness that names its origin, and a denylist that holds under
+concurrent writers.
 
-### Added
+### New
 - **`Link`**, the typed `sheer:` link: `Link::mint`, `Link::mint_bound`, `Link::mint_signet`, `Link::seal`,
   `Link::narrow`, and `Link::revoke`, with `FromStr` validating the signature chain at the wire edge.
 - **`Admitted::origin()`**, exposing an `Origin` (`Rooted` or `Open`) on the admission witness, so a
@@ -19,6 +16,12 @@ All notable changes to nauthy, newest first.
 - **`DESIGN.md`**, the why/compromise/factored-in rationale for each major design choice, linked from the
   README.
 
+### Changed
+- **`FileDenylist` no longer creates its parent directory.** Provisioning the directory the denylist lives
+  in, and its permissions, is the consumer's responsibility; `FileDenylist` writes only its own file,
+  owner-only (`0600` on Unix). A consumer that relied on `persist` creating the directory must now create
+  it beforehand.
+
 ### Fixed
 - **Concurrent revocations no longer drop one.** `FileDenylist` writers take an exclusive lock on a sibling
   `<path>.lock`, re-read under it, and write the union, so two processes revoking different ids both keep
@@ -26,7 +29,7 @@ All notable changes to nauthy, newest first.
 - **Live reload spots a same-tick change.** The freshness stamp is `(mtime, len)`, so a revocation written
   within one coarse mtime tick is still picked up.
 
-## 0.1.0
+## v0.1.0
 
 The first standalone release: generic capability vocabulary, an offline keygen path, a runtime-free core,
 and one coordinated wire/format bump. Tokens and denylist files are not interoperable with any earlier
