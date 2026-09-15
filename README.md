@@ -40,6 +40,8 @@ with any CSPRNG you supply).
 `FileDenylist` is async, so the example below runs on a Tokio runtime: add `tokio` with the `macros` and
 `rt-multi-thread` features to the binary that embeds nauthy.
 
+This page describes the default branch; the released docs are at the newest tag.
+
 ## What you verify, and the one precondition
 
 You verify a presented token offline against one key you hold. No server is ever contacted. The whole
