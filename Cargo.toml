@@ -1,5 +1,6 @@
 [package]
 name = "nauthy"
+description = "Capability tokens rooted at one ed25519 key: mint, narrow, verify offline, revoke. No server."
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
