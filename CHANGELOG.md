@@ -2,6 +2,14 @@
 
 All notable changes to nauthy, newest first.
 
+## Unreleased
+
+### Changed
+- **`Link` is pointer-sized to hold and exposes its parsed `Cap`.** The cap is boxed inside the link, so a
+  `Link` moves by value without dragging a whole token along, and `Link::cap()` hands back the cap the link
+  was parsed or minted from, so a consumer that needs its root or its revocation ids reads them instead of
+  re-decoding and re-verifying the text. No API removed.
+
 ## v0.2.0
 
 A typed `sheer:` link, an admission witness that names its origin, and a denylist that holds under
