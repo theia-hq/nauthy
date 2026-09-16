@@ -15,11 +15,15 @@ use crate::service::Service;
 /// [`FromStr`] runs [`Cap::parse`], the same check the far gate runs, so holding a `Link` proves the bytes
 /// decoded and the signature chain verified against the embedded root; [`Display`](fmt::Display) renders the
 /// exact text to present. It is the typed owner of the raw form: [`Cap::link`] produces one and no public
-/// signature traffics in the raw string. The parsed cap is carried beside the text, so the link's root
-/// (the node it addresses) is a plain read rather than a second parse.
+/// signature traffics in the raw string. The parsed cap is carried beside the text and reachable through
+/// [`cap`](Self::cap), so every cap fact (the root it addresses, its revocation ids) is a plain read rather
+/// than a second decode-and-verify of text the holder already has.
 #[derive(Clone)]
 pub struct Link {
-    cap: Cap,
+    // Boxed so a `Link` stays pointer-sized: a `Cap` carries a whole `Biscuit` inline (hundreds of bytes),
+    // and a `Link` is passed by value through enums and command structs everywhere. `link_tests` pins the
+    // size so the indirection cannot be dropped by accident.
+    cap: Box<Cap>,
     text: String,
 }
 
@@ -115,6 +119,15 @@ impl Link {
         self.cap.root()
     }
 
+    /// The parsed, verified [`Cap`] this link was constructed from: a read, never a re-parse.
+    ///
+    /// The signature chain was checked once, at [`FromStr`] or at mint, so a consumer that needs a cap fact
+    /// ([`Cap::root`], [`Cap::revocation_ids`], [`Cap::root_revocation_id`]) takes it from here instead of
+    /// decoding and re-verifying the text it already holds.
+    pub fn cap(&self) -> &Cap {
+        &self.cap
+    }
+
     /// The exact `sheer:` text, as parsed or minted: what [`Display`](fmt::Display) renders and a caller
     /// presents on the wire.
     pub fn as_str(&self) -> &str {
@@ -125,7 +138,10 @@ impl Link {
     /// minting operation funnel through here, so the text and the cap can never drift apart.
     pub(crate) fn of(cap: Cap) -> Result<Self, CapError> {
         let text = cap.link_text()?;
-        Ok(Self { cap, text })
+        Ok(Self {
+            cap: Box::new(cap),
+            text,
+        })
     }
 }
 
@@ -138,7 +154,7 @@ impl FromStr for Link {
     /// so a present-through link carries the exact bytes the holder pasted.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         Ok(Self {
-            cap: Cap::parse(text)?,
+            cap: Box::new(Cap::parse(text)?),
             text: text.to_owned(),
         })
     }

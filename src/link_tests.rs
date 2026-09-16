@@ -4,7 +4,7 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use super::Link;
-use crate::cap::{CapError, Identity};
+use crate::cap::{Cap, CapError, Identity};
 use crate::revocations::FileDenylist;
 use crate::service::Service;
 
@@ -53,6 +53,45 @@ fn a_minted_link_round_trips_through_display_and_parse() {
         reparsed.to_string(),
         text,
         "display is stable across a parse round trip"
+    );
+}
+
+/// `cap()` hands back the cap the text parses to: same root, same revocation ids, without re-verifying.
+#[test]
+fn cap_matches_what_the_text_parses_to() {
+    let issuer = identity(1);
+    let link = Link::mint(&issuer, &service("ssh"), Duration::from_secs(3600)).expect("mint");
+    let reparsed = Cap::parse(link.as_str()).expect("a minted link parses");
+
+    assert_eq!(
+        link.cap().root(),
+        reparsed.root(),
+        "the carried cap is rooted where the text is"
+    );
+    // `RevocationId` is deliberately not `Debug` (it is opaque bytes), so compare by value, not assert_eq.
+    assert!(
+        link.cap().revocation_ids() == reparsed.revocation_ids(),
+        "the carried cap revokes by the same ids as the text"
+    );
+    assert!(
+        link.cap().root_revocation_id() == reparsed.root_revocation_id(),
+        "the carried cap has the same root revocation id as the text"
+    );
+    assert_eq!(
+        link.root(),
+        link.cap().root(),
+        "root() reads the carried cap"
+    );
+}
+
+/// A `Link` is passed by value through enums and command structs, so it must stay pointer-sized: the `Cap`
+/// it carries is hundreds of bytes inline, and unboxing it would silently make every such move expensive.
+#[test]
+fn a_link_is_pointer_sized() {
+    assert!(
+        size_of::<Link>() <= 64,
+        "Link must stay small enough to pass by value, got {} bytes",
+        size_of::<Link>()
     );
 }
 
