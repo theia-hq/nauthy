@@ -2,7 +2,9 @@
 
 All notable changes to nauthy, newest first.
 
-## Unreleased
+## v0.2.1
+
+A `Link` you can hold by value, and the parsed capability it already carried is now readable.
 
 ### Changed
 - **`Link` is pointer-sized to hold and exposes its parsed `Cap`.** The cap is boxed inside the link, so a
