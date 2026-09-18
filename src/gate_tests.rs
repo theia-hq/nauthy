@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 use crate::VerifyKey;
-use crate::cap::{Cap, Identity, Request};
-use crate::gate::{Admission, Decision, Gate, Origin, ProvenPeer, Refusal};
+use crate::cap::{Cap, CapError, Identity, Request};
+use crate::gate::{Admission, Checked, Decision, Gate, Origin, ProvenPeer, Refusal};
 use crate::revocations::{FileDenylist, STAT_DEBOUNCE};
 use crate::service::Service;
 
@@ -467,4 +467,44 @@ async fn a_revoked_authority_slip_is_refused_even_with_a_valid_badge() {
         "a revoked authority slip is refused even when the foreign badge still verifies"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_undecided_check_refuses_as_undecided_never_as_a_denial() {
+    // A check that ran out of its evaluation budget decided NOTHING about the holder, so the gate must not
+    // report the refusal every non-granting token gets: the peer would read "you are not authorized" from a
+    // host that was merely busy. The connection is still refused, because nothing may be admitted on an
+    // answer that was never computed.
+    let denylist = FileDenylist::empty(PathBuf::new());
+    let cap = slip(1, "ssh");
+    assert_eq!(
+        Checked::from(Err(CapError::Undecided)).decide(&denylist, &cap),
+        Decision::Refuse(Refusal::Undecided)
+    );
+    assert_eq!(
+        Checked::from(Err(CapError::ForeignRoot)).decide(&denylist, &cap),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+}
+
+#[test]
+fn an_undecided_check_survives_the_other_questions_refusal() {
+    // A cap admits on EITHER membership or the requested service, so a stalled membership check paired with
+    // a plain "no" from the service check is still not an answer: reporting `NotGranted` there would hide
+    // the stall behind the other question. A real GRANT does override it, since that answer needs no help
+    // from the question that stalled.
+    let denylist = FileDenylist::empty(PathBuf::new());
+    let cap = slip(1, "ssh");
+    assert_eq!(
+        Checked::Undecided
+            .or_else(|| Checked::NotGranted)
+            .decide(&denylist, &cap),
+        Decision::Refuse(Refusal::Undecided)
+    );
+    assert_eq!(
+        Checked::Undecided
+            .or_else(|| Checked::Granted)
+            .decide(&denylist, &cap),
+        Decision::Admit
+    );
 }

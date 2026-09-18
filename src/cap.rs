@@ -32,7 +32,9 @@ use std::time::SystemTime;
 
 use biscuit_auth::builder::Algorithm;
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
-use biscuit_auth::{Biscuit, KeyPair, PrivateKey, PublicKey};
+use biscuit_auth::{
+    Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, error,
+};
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand_core::{CryptoRng, RngCore};
@@ -62,6 +64,32 @@ const MAX_ENCODED_LEN: usize = 13_200;
 /// sanity bound checked AFTER verification; the actual pre-trust CPU cap is [`MAX_ENCODED_LEN`], which
 /// bounds the bytes (hence the blocks) before the O(blocks) signature check runs.
 const MAX_BLOCKS: usize = 16;
+
+/// The datalog evaluation budget every verification runs under.
+///
+/// Set EXPLICITLY because biscuit's default `max_time` is one millisecond, and that one is a WALL-CLOCK
+/// budget: a merely busy host blows through it mid-evaluation and the call fails, which turned a valid
+/// capability into a refusal whenever the machine was loaded. That is an availability defect, and a lying
+/// one, since the holder is told their authority failed when nothing about it was ever decided.
+///
+/// The time budget is deliberate at both ends:
+/// - LARGE enough that host load never trips it. A real cap is a handful of facts over at most
+///   [`MAX_BLOCKS`] blocks and evaluates in microseconds, so a second is three orders of magnitude of
+///   headroom, far past the tens of milliseconds a loaded scheduler can steal from a thread mid-run.
+/// - SMALL enough to stay a ceiling. A hostile token still cannot pin a verifying thread for longer than
+///   a second, which is the only reason a wall-clock limit exists at all.
+///
+/// The anti-abuse work is done by the two DETERMINISTIC caps, which is why they stay tight: a token that
+/// would generate more than `max_facts` facts or need more than `max_iterations` rule passes is refused
+/// identically on every host at every load, where a clock-based refusal is noise. They are biscuit's own
+/// defaults, spelled out here so an upstream default change cannot silently move nauthy's bound. Together
+/// with [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`], which bound the work before evaluation even starts, they
+/// are the real bound; the wall clock is a last-resort backstop.
+pub(crate) const AUTHORIZER_LIMITS: AuthorizerLimits = AuthorizerLimits {
+    max_facts: 1_000,
+    max_iterations: 100,
+    max_time: Duration::from_secs(1),
+};
 
 /// Domain-separation tag prepended to a document's bytes before signing (and required on verify), so a
 /// document signature can never double as a biscuit authority-block signature (the confused-deputy forgery,
@@ -292,8 +320,10 @@ impl Identity {
     ///
     /// Grants iff the cap is rooted at this node's key AND every check in the chain passes for the
     /// request: the service matches and the token is unexpired at `request.now`. A foreign root, a
-    /// service mismatch, an expired token, or a token narrowed past the request is a denial. Returns this
-    /// node's [`VerifyKey`] on success so a caller can log which identity authorized the grant.
+    /// service mismatch, an expired token, or a token narrowed past the request is a denial;
+    /// [`CapError::Undecided`] is NOT one, it means the evaluation never finished and the question stands
+    /// unanswered. Returns this node's [`VerifyKey`] on success so a caller can log which identity
+    /// authorized the grant.
     ///
     /// This does NOT consult a denylist: it is the headline self-rooted offline-verify path, pure public
     /// key against your own root. To authorize a live connection use [`Gate::admit_witnessed`](crate::Gate),
@@ -343,8 +373,7 @@ impl Cap {
                 .fact(fact!(r#"bound_device({peer})"#, peer = peer.to_string()))
                 .map_err(CapError::Authorize)?;
         }
-        let mut authorizer = builder.build(&self.token).map_err(CapError::Authorize)?;
-        authorizer.authorize().map_err(CapError::Denied)?;
+        self.authorize_under_budget(builder)?;
         Ok(self.root)
     }
 
@@ -374,7 +403,7 @@ impl Cap {
         if self.root != root {
             return Err(CapError::ForeignRoot);
         }
-        let mut authorizer = authorizer!(
+        self.authorize_under_budget(authorizer!(
             r#"
             time({now});
             bound_device({peer});
@@ -382,10 +411,7 @@ impl Cap {
             "#,
             now = now,
             peer = peer.to_string(),
-        )
-        .build(&self.token)
-        .map_err(CapError::Authorize)?;
-        authorizer.authorize().map_err(CapError::Denied)?;
+        ))?;
         Ok(self.root)
     }
 
@@ -426,7 +452,7 @@ impl Cap {
         // injecting the authority it named. This is what makes it authorize HERE and NOWHERE else; the gate
         // still ANDs an independent badge check under `x` before it admits, so this method never admits on
         // its own.
-        let mut authorizer = authorizer!(
+        self.authorize_under_budget(authorizer!(
             r#"
             time({now});
             service({service});
@@ -436,10 +462,7 @@ impl Cap {
             now = request.now,
             service = request.service.as_str(),
             root = x.to_string(),
-        )
-        .build(&self.token)
-        .map_err(CapError::Authorize)?;
-        authorizer.authorize().map_err(CapError::Denied)?;
+        ))?;
         Ok(x)
     }
 
@@ -451,6 +474,11 @@ impl Cap {
     /// dialer attaches no badge and never leaks its own device-to-authority linkage on a non-authority dial.
     /// Reads origin-0 facts only (see the private `authority_bound_text`), so an attenuation-block fact
     /// never reads as authority-bound.
+    ///
+    /// A HINT, so a read that fails (including an [`Undecided`](CapError::Undecided) one) reads as "not
+    /// authority-bound": the dialer attaches no badge and leaks nothing, which is the safe direction for
+    /// this question. A caller that must not lose that distinction reads
+    /// [`authority_bound_root`](Self::authority_bound_root), which returns the typed cause instead.
     pub fn is_authority_bound(&self) -> bool {
         matches!(self.authority_bound_text(), Ok(Some(_)))
     }
@@ -479,11 +507,40 @@ impl Cap {
     /// exactly the one this authority signed. `None` for a plain slip or a membership badge (no such fact).
     /// No root or secret: a pure offline read of the token's own authority block.
     fn authority_bound_text(&self) -> Result<Option<String>, CapError> {
-        let mut authorizer = self.token.authorizer().map_err(CapError::Authorize)?;
+        // Built through the budgeted path, not `Biscuit::authorizer`: a query runs the same datalog engine
+        // under the same limits, so an unbudgeted one here would fail on a busy host exactly as an
+        // unbudgeted authorization did. The program is empty: this reads a fact, it rules on nothing.
+        let mut authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
         let rows: Vec<(String,)> = authorizer
             .query("bound($x) <- authority_bound($x)")
-            .map_err(CapError::Authorize)?;
+            .map_err(CapError::from_evaluation)?;
         Ok(rows.into_iter().next().map(|(x,)| x))
+    }
+
+    /// Evaluate `program` against this token under [`AUTHORIZER_LIMITS`] and rule on its policies.
+    ///
+    /// One of the two places a cap runs datalog (the other is the fact read in `authority_bound_text`), so
+    /// the budget cannot be forgotten at a verify site and the timeout-versus-denial split is decided once,
+    /// in [`CapError::from_evaluation`], rather than at each caller.
+    fn authorize_under_budget(&self, program: AuthorizerBuilder) -> Result<(), CapError> {
+        let mut authorizer = self.budgeted_authorizer(program)?;
+        authorizer.authorize().map_err(CapError::from_evaluation)?;
+        Ok(())
+    }
+
+    /// A datalog engine over this token running `program`, under [`AUTHORIZER_LIMITS`].
+    ///
+    /// The ONE place an authorizer is built, because the budget belongs to the BUILDER: biscuit stores the
+    /// limits on the authorizer and applies them to every later `authorize` and `query`, so a site that
+    /// built its own would silently evaluate on the one-millisecond default no matter what it passed later.
+    pub(crate) fn budgeted_authorizer(
+        &self,
+        program: AuthorizerBuilder,
+    ) -> Result<Authorizer, CapError> {
+        program
+            .set_limits(AUTHORIZER_LIMITS)
+            .build(&self.token)
+            .map_err(CapError::Authorize)
     }
 }
 
@@ -794,7 +851,10 @@ pub enum CapError {
     /// Building the authorizer for the request failed.
     #[error("authorize capability")]
     Authorize(#[source] biscuit_auth::error::Token),
-    /// The token chained to the root, but its checks denied the request (wrong service or expired).
+    /// The token chained to the root, but its checks denied the request (wrong service or expired), or its
+    /// evaluation exceeded a DETERMINISTIC budget (too many facts, too many rule passes). Every cause here
+    /// is a property of the token itself: the same token answers the same way on every host, at every load.
+    /// A wall-clock timeout is NOT one of them, see [`Undecided`](Self::Undecided).
     #[error("capability does not grant this request")]
     Denied(#[source] biscuit_auth::error::Token),
     /// The token is not an authority-bound slip: it carries no `authority_bound` authority fact, so it names
@@ -802,4 +862,29 @@ pub enum CapError {
     /// treats both as "not admitted on the authority-bound arm".
     #[error("capability is not an authority-bound slip")]
     NotAuthorityBound,
+    /// Evaluation ran out of its [`AUTHORIZER_LIMITS`] wall-clock budget, so the request was NOT DECIDED.
+    ///
+    /// NOT a denial, and the distinction is the whole point of the variant: the host ran out of time, which
+    /// says nothing whatever about the holder's authority. It is a TRANSIENT local condition (a loaded
+    /// machine, a descheduled thread), so a caller reports it as "try again", never as "you are not
+    /// authorized", and never records it as a failed authorization attempt. Fail-closed all the same:
+    /// nothing is admitted on an answer that was never computed.
+    #[error("capability evaluation ran out of time")]
+    Undecided,
+}
+
+impl CapError {
+    /// Classify a failure from biscuit's datalog engine.
+    ///
+    /// The ONE place an evaluation failure becomes a nauthy error, so a timeout cannot be folded back into
+    /// a denial by a call site that stopped thinking about it. A wall-clock
+    /// [`Timeout`](biscuit_auth::error::RunLimit::Timeout) is [`Undecided`](Self::Undecided); everything
+    /// else, the deterministic fact and iteration limits included, is a genuine [`Denied`](Self::Denied),
+    /// because it is reproducible from the token alone.
+    pub(crate) fn from_evaluation(failure: error::Token) -> Self {
+        match failure {
+            error::Token::RunLimit(error::RunLimit::Timeout) => CapError::Undecided,
+            denial => CapError::Denied(denial),
+        }
+    }
 }

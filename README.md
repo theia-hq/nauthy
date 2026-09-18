@@ -201,6 +201,10 @@ denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
 
 ## The limits
 
+- **A refusal can mean "not now".** If this host is too loaded to finish evaluating a token, the gate
+  refuses with `Refusal::Undecided`. That is a transient local condition and says nothing about the
+  holder, so retry it, do not count it as a failed authorization, and if you put refusals on a wire, do
+  not send it as the same "not admitted" the other refusals send.
 - **A bearer slip is a bearer token.** Whoever holds an unexpired, un-revoked one gets that service until
   it expires or you revoke it. Keep bearer slips short-lived; prefer a bound grant where you can.
 - **Revocation is node-local.** Revoking on one node does not reach others. An owner running several

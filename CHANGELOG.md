@@ -2,6 +2,22 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.3.0
+
+A busy host no longer refuses a valid capability.
+
+### Fixed
+- **BREAKING: a refusal can now mean "not now".** Every capability check ran on the underlying datalog
+  engine's default budget of one millisecond of WALL CLOCK, so a merely loaded host failed the evaluation
+  and the failure was read as a denial: the holder was told their authority did not grant, when nothing
+  about their authority had been decided. Checks now run under an explicit one-second budget, and an
+  evaluation that still runs out of time reports the new `CapError::Undecided` and `Refusal::Undecided`
+  instead of a denial. Both are new public variants, so a `match` on either enum must handle them.
+  Treat one as transient and retry; never record it as a failed authorization. The deterministic caps
+  (facts, rule passes) are unchanged and still refuse a hostile token identically on every host, which is
+  what actually bounds the work. A refusal is still a refusal: nothing is admitted on an answer that was
+  never computed.
+
 ## v0.2.1
 
 A `Link` you can hold by value, and the parsed capability it already carried is now readable.

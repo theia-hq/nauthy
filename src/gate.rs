@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::cap::{Cap, Request};
+use crate::cap::{Cap, CapError, Request};
 use crate::revocations::Revocations;
 use crate::{Service, VerifyKey};
 
@@ -59,8 +59,10 @@ impl Gate {
     /// on the presented token, not the dialer (the token, not who carries it, is the authority, but
     /// device-bound so only the named device may present it): it admits a membership badge or a slip for
     /// `service`, rooted at the trusted authority; a missing, non-granting, or revoked token is refused with
-    /// a reason. An authority-bound slip handed here correctly refuses [`NotGranted`](Refusal::NotGranted)
-    /// (it is inert alone); the two-token AND is [`admit_foreign`](Gate::admit_foreign).
+    /// a reason, and a token whose evaluation ran out of time is refused as
+    /// [`Undecided`](Refusal::Undecided), which is not an answer about the peer. An authority-bound slip
+    /// handed here correctly refuses [`NotGranted`](Refusal::NotGranted) (it is inert alone); the two-token
+    /// AND is [`admit_foreign`](Gate::admit_foreign).
     pub fn admit(&self, peer: ProvenPeer, presented: Option<&Cap>, service: &Service) -> Decision {
         match self {
             Gate::Open => Decision::Admit,
@@ -131,8 +133,12 @@ impl Gate {
             Gate::Rooted(root, revocations) => {
                 match admit_plain(*root, revocations.as_ref(), presented, service, peer.key()) {
                     Decision::Admit => {
+                        // Fail-closed on anything but a plain grant: an undecided re-read is not proof of
+                        // membership, so the witness is a per-service `Slip`, never an owner device.
                         let kind = match presented {
-                            Some(cap) if is_member(cap, *root, peer.key()) => Admission::Member,
+                            Some(cap) if membership(cap, *root, peer.key()).grants() => {
+                                Admission::Member
+                            }
                             _ => Admission::Slip,
                         };
                         Ok(Admitted {
@@ -345,10 +351,9 @@ fn admit_plain(
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
-    if is_member(cap, root, peer) || grants(cap, root, service, peer) {
-        return revoked_or_admit(revocations, cap);
-    }
-    Decision::Refuse(Refusal::NotGranted)
+    membership(cap, root, peer)
+        .or_else(|| grant(cap, root, service, peer))
+        .decide(revocations, cap)
 }
 
 /// The authority-bound two-token AND: `slip` is a slip rooted at `root` naming a FOREIGN authority `X`; the
@@ -363,19 +368,21 @@ fn admit_authority_bound(
     peer: VerifyKey,
 ) -> Decision {
     let request = Request::now(Service::clone(service)).bound_to(peer);
-    if let Ok(x) = slip.verify_authority_bound_at_root_without_revocation(&request, root) {
+    let checked = match slip.verify_authority_bound_at_root_without_revocation(&request, root) {
         // `X` is the authority the slip named, fed straight into the badge's root check. There is no path
         // that reads a badge-supplied root: `verify_member_at_root_without_revocation` only compares the
         // badge's own root AGAINST this `x`, so a badge under the wrong root fails `ForeignRoot`. The badge
         // is device-bound, so a stolen slip+badge replayed from a different key fails the bound-device check.
-        let member_under_x = badge
-            .verify_member_at_root_without_revocation(SystemTime::now(), peer, x)
-            .is_ok();
-        if member_under_x {
-            return revoked_or_admit(revocations, slip);
-        }
-    }
-    Decision::Refuse(Refusal::NotGranted)
+        Ok(x) => Checked::from(badge.verify_member_at_root_without_revocation(
+            SystemTime::now(),
+            peer,
+            x,
+        )),
+        // A slip that did not verify is classified by the same rule every other check uses, so an undecided
+        // slip evaluation is never reported as a refusal of an authority nothing ruled on.
+        Err(error) => Checked::from(Err(error)),
+    };
+    checked.decide(revocations, slip)
 }
 
 /// A granted cap that is revoked is still refused; else admit. The revocation store governs the SLIP (rooted
@@ -391,21 +398,88 @@ fn revoked_or_admit(revocations: &dyn Revocations, cap: &Cap) -> Decision {
     Decision::Admit
 }
 
-/// Whether `cap` is a MEMBERSHIP badge rooted at `root` for the proven dialer `peer`, evaluated now: it
-/// carries the `member(true)` authority fact and its device binding holds for `peer`. Whole-node.
-fn is_member(cap: &Cap, root: VerifyKey, peer: VerifyKey) -> bool {
-    cap.verify_member_at_root_without_revocation(SystemTime::now(), peer, root)
-        .is_ok()
+/// What the MEMBERSHIP question answers for `cap` at `root` and the proven dialer `peer`, evaluated now: it
+/// grants when the cap carries the `member(true)` authority fact and its device binding holds for `peer`.
+/// Whole-node.
+fn membership(cap: &Cap, root: VerifyKey, peer: VerifyKey) -> Checked {
+    Checked::from(cap.verify_member_at_root_without_revocation(SystemTime::now(), peer, root))
 }
 
-/// Whether `cap` grants `service` rooted at `root` for the proven dialer `peer`, evaluated now. The `peer`
-/// is bound into the request so a device-bound cap admits only its device; an unbound slip ignores it.
-fn grants(cap: &Cap, root: VerifyKey, service: &Service, peer: VerifyKey) -> bool {
-    cap.verify_at_root_without_revocation(
+/// What the SERVICE question answers for `cap` at `root` and the proven dialer `peer`, evaluated now: it
+/// grants when the cap grants `service`. The `peer` is bound into the request so a device-bound cap admits
+/// only its device; an unbound slip ignores it.
+fn grant(cap: &Cap, root: VerifyKey, service: &Service, peer: VerifyKey) -> Checked {
+    Checked::from(cap.verify_at_root_without_revocation(
         &Request::now(Service::clone(service)).bound_to(peer),
         root,
-    )
-    .is_ok()
+    ))
+}
+
+/// What one capability check answered.
+///
+/// Three states, not a bool, because "did not grant" and "was never decided" are different facts about the
+/// world and only one of them is about the holder: a token that fails its checks says the peer has no such
+/// authority, while an evaluation that ran out of its wall-clock budget says only that this host was busy.
+/// Collapsing the second into the first is what made a loaded machine report a valid capability as
+/// unauthorized, so the distinction is carried in the type from the check all the way to the [`Refusal`].
+pub(crate) enum Checked {
+    /// The cap verified: this question grants.
+    Granted,
+    /// The cap verified cleanly and does not grant: a foreign root, the wrong service, expired, or the
+    /// wrong device. An answer ABOUT the holder, reproducible on any host.
+    NotGranted,
+    /// The evaluation never finished (see [`CapError::Undecided`]), so nothing was decided about the
+    /// holder. Transient, and about this host rather than about the peer.
+    Undecided,
+}
+
+impl Checked {
+    /// The gate ruling this answer yields, refusing a revoked cap even where the check granted.
+    ///
+    /// The ONE place an answer becomes a [`Decision`], so a new [`Checked`] state cannot be folded into a
+    /// denial by a caller that forgot it existed.
+    pub(crate) fn decide(self, revocations: &dyn Revocations, cap: &Cap) -> Decision {
+        match self {
+            Checked::Granted => revoked_or_admit(revocations, cap),
+            Checked::NotGranted => Decision::Refuse(Refusal::NotGranted),
+            Checked::Undecided => Decision::Refuse(Refusal::Undecided),
+        }
+    }
+
+    /// Whether this answer GRANTS. For a caller that needs only the affirmative, where "no" and "not
+    /// decided" are equally not a grant: reading the kind off an admission witness, which fails closed.
+    pub(crate) fn grants(self) -> bool {
+        matches!(self, Checked::Granted)
+    }
+
+    /// This answer, or the next question's when this one did not grant. A cap admits on EITHER membership
+    /// or the requested service, so the second question is asked only when the first did not grant.
+    ///
+    /// An UNDECIDED answer survives a later "no": the host was too busy to rule on one of the two, so the
+    /// pair cannot honestly report "not authorized". It still yields to a later GRANT, because an
+    /// affirmative answer is a real one and needs no help from the question that stalled.
+    pub(crate) fn or_else(self, next: impl FnOnce() -> Checked) -> Checked {
+        match self {
+            Checked::Granted => Checked::Granted,
+            Checked::NotGranted => next(),
+            Checked::Undecided => match next() {
+                Checked::Granted => Checked::Granted,
+                Checked::NotGranted | Checked::Undecided => Checked::Undecided,
+            },
+        }
+    }
+}
+
+impl From<Result<VerifyKey, CapError>> for Checked {
+    /// Classify one capability verification. [`CapError::Undecided`] is the ONLY cause that is not an
+    /// answer about the holder; every other error is a genuine "this cap does not grant that".
+    fn from(verified: Result<VerifyKey, CapError>) -> Self {
+        match verified {
+            Ok(_) => Checked::Granted,
+            Err(CapError::Undecided) => Checked::Undecided,
+            Err(_) => Checked::NotGranted,
+        }
+    }
 }
 
 /// The gate's ruling on a connection attempt.
@@ -426,6 +500,10 @@ impl Decision {
 }
 
 /// Why a connection was refused, distinct reasons a caller reports differently.
+///
+/// Three of them ANSWER the question ([`Missing`](Self::Missing), [`NotGranted`](Self::NotGranted),
+/// [`Revoked`](Self::Revoked)); [`Undecided`](Self::Undecided) reports that the question was never
+/// answered. A caller that renders a refusal, to its own logs or to a peer, must keep that split.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
     /// A [`Rooted`](Gate::Rooted) gate required a token and none was presented.
@@ -435,6 +513,21 @@ pub enum Refusal {
     NotGranted,
     /// A capability verified and granted the request, but has been revoked.
     Revoked,
+    /// Authorization was NOT DECIDED: the capability's evaluation ran out of its wall-clock budget (see
+    /// [`CapError::Undecided`]), so nothing about the holder's authority was established.
+    ///
+    /// The odd one out, and deliberately so. The other three are ANSWERS about the peer, stable on any
+    /// host; this one is a transient local condition (a loaded machine, a descheduled thread) and says
+    /// nothing about the token. The connection is still refused, because nothing may be admitted on an
+    /// answer that was never computed, but it is not an authorization outcome:
+    /// - a HOST that logs or reports a refusal renders this as a retryable local failure, and does not
+    ///   count it as a failed authorization attempt;
+    /// - a consumer that puts a refusal ON THE WIRE must NOT send the peer the uniform not-admitted
+    ///   refusal it sends for the other three. Telling a dialer they lack authority when this host merely
+    ///   ran out of time is a lie, and it is one the dialer acts on (it will stop retrying and go looking
+    ///   for a token it already has). It belongs on whatever transient/unavailable refusal that wire
+    ///   already carries.
+    Undecided,
 }
 
 impl core::fmt::Display for Refusal {
@@ -443,6 +536,7 @@ impl core::fmt::Display for Refusal {
             Refusal::Missing => "no capability presented",
             Refusal::NotGranted => "capability does not grant this request",
             Refusal::Revoked => "capability has been revoked",
+            Refusal::Undecided => "authorization did not finish in time, try again",
         };
         f.write_str(reason)
     }
