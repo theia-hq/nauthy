@@ -4,8 +4,10 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
+use biscuit_auth::{AuthorizerBuilder, AuthorizerLimits, error};
+
 use crate::VerifyKey;
-use crate::cap::{Cap, CapError, Identity, Request};
+use crate::cap::{AUTHORIZER_LIMITS, Cap, CapError, Identity, Request};
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -598,4 +600,48 @@ fn a_many_block_cap_is_refused_at_parse() {
     }
     let link = cap.link().expect("encode");
     assert!(matches!(Cap::parse(link.as_str()), Err(CapError::TooLarge)));
+}
+
+#[test]
+fn every_verification_runs_under_the_deliberate_time_budget() {
+    // The defect this pins: biscuit's default budget is ONE MILLISECOND of WALL CLOCK, so a merely busy
+    // host failed the evaluation and the failure was read as a refusal of a valid capability. The assertion
+    // is on the budget the code STAMPS, never on how long an evaluation takes: a test that raced the clock
+    // would be the same flake it is here to prevent.
+    let issuer = identity(1);
+    let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let authorizer = cap
+        .budgeted_authorizer(AuthorizerBuilder::new())
+        .expect("build an authorizer over a freshly minted cap");
+    assert_eq!(authorizer.limits(), &AUTHORIZER_LIMITS);
+    assert!(AUTHORIZER_LIMITS.max_time > AuthorizerLimits::default().max_time);
+}
+
+#[test]
+fn the_deterministic_budgets_stay_bounded() {
+    // The fact and iteration caps are what actually bound a hostile token, and they are deterministic: the
+    // same token trips them on every host at every load. Widening the CLOCK must never come with widening
+    // these, so the budget that was relaxed cannot take the anti-abuse bound with it.
+    assert!(AUTHORIZER_LIMITS.max_facts <= AuthorizerLimits::default().max_facts);
+    assert!(AUTHORIZER_LIMITS.max_iterations <= AuthorizerLimits::default().max_iterations);
+}
+
+#[test]
+fn a_timeout_is_undecided_and_never_a_denial() {
+    // The lie this removes: an evaluation that ran out of WALL CLOCK used to report "capability does not
+    // grant this request", telling a holder their authority failed when nothing about it was decided. Only
+    // the clock is undecided; the deterministic limits are real, reproducible answers about the token, so
+    // they stay denials.
+    assert!(matches!(
+        CapError::from_evaluation(error::Token::RunLimit(error::RunLimit::Timeout)),
+        CapError::Undecided
+    ));
+    assert!(matches!(
+        CapError::from_evaluation(error::Token::RunLimit(error::RunLimit::TooManyFacts)),
+        CapError::Denied(_)
+    ));
+    assert!(matches!(
+        CapError::from_evaluation(error::Token::RunLimit(error::RunLimit::TooManyIterations)),
+        CapError::Denied(_)
+    ));
 }
