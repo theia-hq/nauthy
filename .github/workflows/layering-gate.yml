@@ -3,6 +3,11 @@
 # `swoosh`, `sshh`), and a prime library must not allude to a consumer CLI flag
 # (`--for`/`--public`/`--peer`/`--authkey`/`--to`). Pure sh + grep, no toolchain.
 # The check lives in scripts/layering-gate.sh; see notes/reviews/layering-leak-audit.md.
+# The same job carries the other source-level gates that need no toolchain: process leaks in shipped
+# prose, and the datalog budget (every biscuit Authorizer built by Cap::budgeted_authorizer, never a
+# site that would inherit biscuit's 1 ms default and turn a slow host into a denial). The budget one
+# is here rather than in ci.yml because no test can hold it: only wall clock separates the funnel from
+# a bypass, so the invariant is held over the source instead of over the binary.
 name: layering-gate
 on:
   push:
@@ -18,3 +23,5 @@ jobs:
         run: sh scripts/layering-gate.sh .
       - name: process leaks
         run: sh scripts/prose-gate.sh .
+      - name: authorizer budget
+        run: sh scripts/authorizer-gate.sh .
