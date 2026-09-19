@@ -2,6 +2,30 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.3.1
+
+A holder can read when its own grant dies, and the budget funnel is enforced.
+
+### Added
+- **`Cap::expiry()`.** A holder could not answer when its own grant expires. The instant lived only
+  inside a datalog CHECK, and checks are not facts: a query runs rules over the fact set and can
+  never bind a variable to a comparison bound, so no origin-0 read could reach it. The four mints
+  now emit an `expires_at` AUTHORITY fact beside the check they already write, from the same
+  binding; biscuit dates are whole seconds, so the two cannot disagree. **Advisory only.** The check
+  remains the sole enforcement, and an attenuation can only shorten the life while being invisible
+  to an origin-0 read, so the value is an UPPER BOUND: a caller refusing early on it can never turn
+  away a grant this authority would have admitted. `None` means no fact, never "does not expire".
+
+### Changed
+- **`scripts/authorizer-gate.sh` enforces the budget funnel.** Every datalog evaluation must run on
+  the explicit budget set on the builder, because the library default is one millisecond of WALL
+  CLOCK and a loaded host then reads a timeout as a denial rather than as "undecided". The funnel
+  landed in v0.3.0 and nothing enforced it: swapping a budgeted authorizer for the unbudgeted
+  default leaves the whole suite green. No test can hold it, since only the time limit differs from
+  the defaults and a test that distinguishes one millisecond from one second is the clock race the
+  fix exists to prevent. The gate is verified by introducing the violation it forbids, and it is the
+  only thing in the crate that can see that violation.
+
 ## v0.3.0
 
 A busy host no longer refuses a valid capability.
