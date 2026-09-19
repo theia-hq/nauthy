@@ -590,6 +590,163 @@ fn a_forged_binding_block_cannot_redirect_the_authority() {
 }
 
 #[test]
+fn a_cap_reports_the_expiry_its_check_enforces() {
+    // The reason the advisory fact exists: an expiry encoded only as a check can be evaluated but never
+    // read, so a device could not answer when its own badge dies. The fact and the check must name the
+    // SAME instant, or a device would warn on one deadline and go dark on another. Pinned by taking the
+    // reported instant back to the gate: the badge is still admitted AT it (the check is `<=`) and denied
+    // one second past it, so the value read IS the boundary the enforcement draws.
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let badge = authority.mint_member(device, at(3600)).expect("mint badge");
+    let expiry = badge
+        .expiry()
+        .expect("read the expiry")
+        .expect("a freshly minted badge carries one");
+    assert_eq!(expiry, at(3600), "the instant the authority minted it for");
+    assert!(
+        badge
+            .verify_member_at_root_without_revocation(expiry, device, authority.verifying_key())
+            .is_ok(),
+        "the badge still admits at the instant it reports"
+    );
+    assert!(
+        matches!(
+            badge.verify_member_at_root_without_revocation(
+                expiry + Duration::from_secs(1),
+                device,
+                authority.verifying_key()
+            ),
+            Err(CapError::Denied(_))
+        ),
+        "one second past the instant it reports, the check denies"
+    );
+}
+
+#[test]
+fn every_minted_kind_reports_its_expiry() {
+    // Every grant shape carries an expiry, so every grant shape must be able to say so: a surface reads
+    // one accessor, never a per-kind special case.
+    let authority = identity(1);
+    let other = identity(2).verifying_key();
+    let kinds = [
+        authority.mint(&service("ssh"), at(60)).expect("plain slip"),
+        authority
+            .mint_bound(&service("ssh"), other, at(60))
+            .expect("device-bound slip"),
+        authority.mint_member(other, at(60)).expect("badge"),
+        authority
+            .mint_authority_slip(&service("ssh"), other, at(60))
+            .expect("authority-bound slip"),
+    ];
+    for cap in &kinds {
+        assert_eq!(
+            cap.expiry().expect("read the expiry"),
+            Some(at(60)),
+            "every minted kind reports the expiry it was minted with"
+        );
+    }
+}
+
+#[test]
+fn a_cap_with_no_expires_at_fact_reports_none() {
+    // A badge minted before the advisory fact existed carries its expiry only in the check. It reads
+    // `None`, which a surface renders as unknown and never as "does not expire": the check still expires
+    // it on schedule, unchanged. This is also the proof that the accessor reads the FACT and not the
+    // check, since the check here holds an expiry the accessor does not return.
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let legacy = authority
+        .mint_member_without_expires_at(device, at(3600))
+        .expect("mint a pre-fact badge");
+    assert_eq!(
+        legacy.expiry().expect("read the expiry"),
+        None,
+        "no advisory fact, no answer"
+    );
+    assert!(
+        matches!(
+            legacy.verify_member_at_root_without_revocation(
+                at(7200),
+                device,
+                authority.verifying_key()
+            ),
+            Err(CapError::Denied(_))
+        ),
+        "the check still expires a badge whose expiry cannot be read"
+    );
+}
+
+#[test]
+fn a_forged_expires_at_block_is_unreadable() {
+    // The origin wall for the advisory fact: a holder appends `expires_at` far in the future to make a
+    // dead badge display as alive, or to talk its own pre-dial refusal out of refusing. `query` reads
+    // origin-0 facts only, so the appended fact is invisible and the read stays `None`. Without the wall
+    // the attacker's instant comes straight back.
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let forged = authority
+        .mint_member_with_forged_expires_at(device, at(3600), at(90 * 86_400))
+        .expect("forge an expires_at fact in an attenuation block");
+    assert_eq!(
+        forged.expiry().expect("read the expiry"),
+        None,
+        "an appended expires_at is untrusted origin and never reported"
+    );
+}
+
+#[test]
+fn a_narrowed_cap_reports_the_authority_expiry() {
+    // Attenuation appends CHECKS, never facts, so a narrowed copy still reports the instant the authority
+    // signed: the read is an UPPER BOUND on the effective grant, never a later-than-truth one. That is the
+    // safe direction for a holder's pre-dial refusal, which must never turn away a cap the gate admits.
+    let authority = identity(1);
+    let slip = authority
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    let narrowed = slip
+        .attenuate(None, Some(at(60)))
+        .expect("narrow the expiry");
+    assert_eq!(
+        narrowed.expiry().expect("read the expiry"),
+        Some(at(3600)),
+        "the authority's instant, not the holder's narrower one"
+    );
+    assert!(
+        matches!(
+            authority.verify(&narrowed, &request("ssh", 120)),
+            Err(CapError::Denied(_))
+        ),
+        "the narrower check still enforces, so the report is an upper bound and nothing more"
+    );
+}
+
+#[test]
+fn an_expired_badge_still_reports_when_it_died() {
+    // The display path must work precisely when the cap is dead, which is when its holder needs the date
+    // and the remedy. Reading a fact evaluates no check, so expiry never becomes unreadable by passing.
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let badge = authority.mint_member(device, at(3600)).expect("mint badge");
+    assert!(
+        matches!(
+            badge.verify_member_at_root_without_revocation(
+                at(7200),
+                device,
+                authority.verifying_key()
+            ),
+            Err(CapError::Denied(_))
+        ),
+        "the badge is dead at this moment"
+    );
+    assert_eq!(
+        badge.expiry().expect("read the expiry of a dead badge"),
+        Some(at(3600)),
+        "a dead badge still says when it died"
+    );
+}
+
+#[test]
 fn a_many_block_cap_is_refused_at_parse() {
     // A deeply-attenuated token is O(blocks) to verify; a legitimate delegation chain is short, so one
     // past the block bound is refused at parse rather than burning CPU.

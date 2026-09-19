@@ -11,6 +11,12 @@
 //! - a **service** check (`check if service($s), $s == "ssh"`): the token is usable only for that service.
 //! - an **expiry** check (`check if time($t), $t <= <expiry>`): the token is usable only until that time.
 //!
+//! Beside that expiry check, every mint also emits an `expires_at(<date>)` AUTHORITY FACT carrying the
+//! same instant, because a check can be evaluated but never read: a holder could not answer "when does my
+//! own badge die" from the token it is holding. The fact is ADVISORY, for display and for a holder's own
+//! pre-dial refusal ([`Cap::expiry`]); the CHECK remains the sole enforcement and no authorization path
+//! here reads the fact.
+//!
 //! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the issuer's [`VerifyKey`] (its public
 //! identity, never a secret) alongside the token, so any holder can decode, attenuate, and hand it off
 //! entirely offline, and a dialer learns which node to dial from the link alone.
@@ -188,8 +194,12 @@ impl Identity {
     /// The root grant. The holder may narrow it further offline with [`Cap::attenuate`]; they can never
     /// broaden it, so this is the widest the cap will ever be.
     pub fn mint(&self, service: &Service, expiry: SystemTime) -> Result<Cap, CapError> {
+        // `expires_at` is the advisory, READABLE twin of the expiry check: the same instant, as a fact, so
+        // a holder can see its own deadline without authorizing anything. The check still enforces it, and
+        // only the check does. See [`Cap::expiry`].
         let token = biscuit!(
             r#"
+            expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
             "#,
@@ -225,9 +235,14 @@ impl Identity {
         // so there is no way to mint an unbound whole-node badge: the "reserved service" footgun is
         // unrepresentable. The badge stays bound to `bound_to`, so only the proven device it names may
         // present it.
+        //
+        // `expires_at` rides along as the advisory, READABLE twin of the expiry check (see
+        // [`Cap::expiry`]), so the badged device can answer when its own badge dies. Advisory only: the
+        // check is what expires this badge, here and at every gate.
         let token = biscuit!(
             r#"
             member(true);
+            expires_at({expiry});
             check if time($t), $t <= {expiry};
             check if bound_device($d), $d == {bound};
             "#,
@@ -261,8 +276,10 @@ impl Identity {
         bound_to: VerifyKey,
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
+        // `expires_at`: the advisory, readable twin of the expiry check (see [`Cap::expiry`]).
         let token = biscuit!(
             r#"
+            expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
             check if bound_device($d), $d == {bound};
@@ -297,9 +314,11 @@ impl Identity {
         foreign_root: VerifyKey,
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
+        // `expires_at`: the advisory, readable twin of the expiry check (see [`Cap::expiry`]).
         let token = biscuit!(
             r#"
             authority_bound({root});
+            expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
             check if authority_bound($x), foreign_member($x);
@@ -466,6 +485,40 @@ impl Cap {
         Ok(x)
     }
 
+    /// When the issuing authority set this cap to expire, from its `expires_at` AUTHORITY fact. `None` for
+    /// a cap that carries none.
+    ///
+    /// ADVISORY, for DISPLAY and for a holder's own pre-dial refusal. The expiry CHECK is the SOLE
+    /// enforcement and nothing on an authorization path may consult this instead: the check is datalog
+    /// evaluated over the WHOLE chain at the moment of the request, this is one fact read out of one
+    /// block. Substituting the fact for the check would silently drop every narrowing an attenuation block
+    /// added and move the decision off the engine that is the actual gate. This answers a holder's
+    /// question about its own credential ("when does my badge die", so it can warn, print a date, or
+    /// decline to dial); it answers no one else's, and it admits nothing.
+    ///
+    /// Reads origin-0 facts only, the same wall [`authority_bound_root`](Self::authority_bound_root)
+    /// stands behind: `query`, not `query_all`, so an `expires_at` forged into an attenuation block is
+    /// invisible and the instant returned is the one THIS authority signed. That also makes it an UPPER
+    /// BOUND on the effective grant, since an attenuation can only shorten the life further and is unread
+    /// here: this never reports EARLIER than the token really allows, so a refusal built on it can never
+    /// turn away a cap the gate would have admitted. A mint writes the fact and the check from one
+    /// `SystemTime` and biscuit dates are whole seconds, so the two cannot disagree.
+    ///
+    /// `None` means the token carries no such fact (a cap minted before the fact existed, whose expiry
+    /// lives only in its check), NOT that it never expires: a surface renders that as unknown. Reading a
+    /// fact evaluates no check, so a DEAD cap still reports when it died, which is exactly when its holder
+    /// needs to be told.
+    pub fn expiry(&self) -> Result<Option<SystemTime>, CapError> {
+        // Built through the budgeted path, not `Biscuit::authorizer`: a query runs the same datalog engine
+        // under the same limits, so an unbudgeted one here would fail on a busy host exactly as an
+        // unbudgeted authorization did. The program is empty: this reads a fact, it rules on nothing.
+        let mut authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
+        let rows: Vec<(SystemTime,)> = authorizer
+            .query("expiry($t) <- expires_at($t)")
+            .map_err(CapError::from_evaluation)?;
+        Ok(rows.into_iter().next().map(|(expiry,)| expiry))
+    }
+
     /// Whether this cap is an AUTHORITY-BOUND slip: it carries an `authority_bound` fact in its AUTHORITY
     /// block.
     ///
@@ -519,9 +572,10 @@ impl Cap {
 
     /// Evaluate `program` against this token under [`AUTHORIZER_LIMITS`] and rule on its policies.
     ///
-    /// One of the two places a cap runs datalog (the other is the fact read in `authority_bound_text`), so
-    /// the budget cannot be forgotten at a verify site and the timeout-versus-denial split is decided once,
-    /// in [`CapError::from_evaluation`], rather than at each caller.
+    /// The only place a cap RULES on datalog (the others run it to READ one authority fact:
+    /// `authority_bound_text` and [`expiry`](Cap::expiry)), so the budget cannot be forgotten at a verify
+    /// site and the timeout-versus-denial split is decided once, in [`CapError::from_evaluation`], rather
+    /// than at each caller.
     fn authorize_under_budget(&self, program: AuthorizerBuilder) -> Result<(), CapError> {
         let mut authorizer = self.budgeted_authorizer(program)?;
         authorizer.authorize().map_err(CapError::from_evaluation)?;
@@ -715,6 +769,54 @@ impl Identity {
             root: self.verifying_key(),
             token,
         })
+    }
+
+    /// Test-only: mint a membership badge the way this crate did BEFORE the advisory `expires_at` fact
+    /// existed, with the expiry living ONLY in the check. Two things ride on it: a badge minted by an older
+    /// version reads [`Cap::expiry`] as `None` (the case every surface must render as unknown), and the
+    /// accessor is proved to read the FACT, never the check, since here the check carries an expiry the
+    /// accessor cannot see.
+    pub(crate) fn mint_member_without_expires_at(
+        &self,
+        bound_to: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            member(true);
+            check if time($t), $t <= {expiry};
+            check if bound_device($d), $d == {bound};
+            "#,
+            expiry = expiry,
+            bound = bound_to.to_string(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: the same pre-fact badge with an `expires_at` FORGED into an attenuation block, which is
+    /// what a holder would append to make a dead badge display as alive. [`Cap::expiry`] must still read
+    /// `None`: `query` sees origin-0 facts only. The forgery is pinned in the pre-fact form ON PURPOSE,
+    /// because it is the form that cannot pass by luck. With a genuine authority fact present as well, a
+    /// regression to `query_all` would return TWO rows and the assertion could still happen to pick the
+    /// honest one; with none, the wall either holds and the read is `None`, or it does not and the
+    /// attacker's instant comes straight back. Reaches past the public API on purpose ([`Cap::attenuate`]
+    /// appends only CHECKS, never facts).
+    pub(crate) fn mint_member_with_forged_expires_at(
+        &self,
+        bound_to: VerifyKey,
+        expiry: SystemTime,
+        forged: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let Cap { root, token } = self.mint_member_without_expires_at(bound_to, expiry)?;
+        let token = token
+            .append(block!(r#"expires_at({forged});"#, forged = forged))
+            .map_err(CapError::Attenuate)?;
+        Ok(Cap { root, token })
     }
 
     /// Test-only: mint a real authority-bound slip naming `real_root` in the AUTHORITY block, then append a
