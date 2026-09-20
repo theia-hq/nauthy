@@ -4,6 +4,7 @@
 use core::time::Duration;
 use std::time::{Instant, SystemTime};
 
+use biscuit_auth::builder::{Binary, Op, Unary};
 use biscuit_auth::{AuthorizerBuilder, AuthorizerLimits, error};
 
 use crate::VerifyKey;
@@ -846,12 +847,157 @@ fn a_join_bomb_is_refused_before_it_can_pin_the_thread() {
 }
 
 #[test]
+fn a_closure_bomb_is_refused_before_it_can_pin_the_thread() {
+    // The defect this pins, measured and not asserted: biscuit runs a closure body once per element of
+    // the operand beside it, recursively, INSIDE one expression, and the clock it samples between
+    // iterations is never reached while one expression is being walked. The 1.3 KB token below nests
+    // six deep over eight-element arrays, so one comparison runs 8^6 times, and the innermost body is
+    // TRUE, so without the bound the host burns half a second and then GRANTS: the cost is paid and the
+    // peer admitted, with no refusal anywhere to notice (on a slower host it burns past the one-second
+    // budget instead and reads as Undecided, which is the same break wearing a retry). On every
+    // dimension the join bound measures it is a legitimate token (one fact, no rule, a one-predicate
+    // body), which is why only reading the operators refuses it. It arrives the way a presented token
+    // arrives, through the wire edge, because that is the path an attacker has.
+    let issuer = identity(1);
+    let slip = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let bomb = slip
+        .attenuate_with_closure_bomb(6)
+        .expect("append a closure-bomb block");
+    let link = bomb.link().expect("encode");
+    let presented =
+        Cap::parse(link.as_str()).expect("a closure bomb is a well-formed, valid-chain token");
+
+    let started = Instant::now();
+    let refused =
+        presented.verify_at_root_without_revocation(&request("ssh", 0), issuer.verifying_key());
+    let elapsed = started.elapsed();
+
+    assert!(
+        refused.is_err(),
+        "a token nauthy never minted must never verify, and this one GRANTS unguarded"
+    );
+    assert!(
+        !matches!(refused, Err(CapError::Undecided)),
+        "no budget is sampled inside one expression, so a bomb that reads as Undecided is one that ran"
+    );
+    assert!(
+        matches!(refused, Err(CapError::TooComplex)),
+        "the structural bound is what refuses a bomb, deterministically and before any of it runs"
+    );
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "the refusal must cost a token read, not an evaluation; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn every_operator_biscuit_evaluates_lazily_is_refused() {
+    // The drift gate, and the reason the guard needs only ONE clause. The whitelist is drawn over an AST
+    // this crate does not own, so the day biscuit adds a kind of operator is the day the whitelist is
+    // silently incomplete: a join bound that read a rule's body and never its expressions is exactly
+    // that failure, and a closure walked through it. `evaluates_lazily` below is EXHAUSTIVE over every
+    // operator enum biscuit exposes, so that day this test stops COMPILING and a person has to classify
+    // the new operator before the suite runs again.
+    //
+    // The behaviour half, proven and not argued: biscuit compiles EVERY lazy operator to a closure
+    // operand, so refusing the closure refuses the family. One real token per operator, through the wire
+    // edge and the ordinary verify. The strict column is proven by the shapes this crate mints, whose
+    // every check expression is one strict comparison.
+    let issuer = identity(1);
+    let slip = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let lazy = [
+        (Op::Binary(Binary::All), "[1, 2].all($v -> $v >= 0)"),
+        (Op::Binary(Binary::Any), "[1, 2].any($v -> $v >= 0)"),
+        (Op::Binary(Binary::LazyAnd), "true && true"),
+        (Op::Binary(Binary::LazyOr), "false || true"),
+        (Op::Binary(Binary::TryOr), "(1 / 0).try_or(true)"),
+    ];
+
+    for (operator, expression) in lazy {
+        assert!(
+            evaluates_lazily(&operator),
+            "{operator:?} defers work into a closure and must be classified as lazy"
+        );
+        let bomb = slip
+            .attenuate_with_raw_datalog(&format!("check if service($s), {expression};"))
+            .expect("append a lazy-operator block");
+        let link = bomb.link().expect("encode");
+        let presented = Cap::parse(link.as_str()).expect("a valid-chain token");
+        let refused =
+            presented.verify_at_root_without_revocation(&request("ssh", 0), issuer.verifying_key());
+        assert!(
+            refused.is_err(),
+            "`{expression}` is datalog nauthy never writes, so it must never verify"
+        );
+        assert!(
+            matches!(refused, Err(CapError::TooComplex)),
+            "`{expression}` carries a closure the structural bound must see and refuse"
+        );
+    }
+}
+
+/// Whether biscuit evaluates this operator LAZILY, which it does by compiling a closure operand beside
+/// it. The whole value of this function is that every match is EXHAUSTIVE: a biscuit release that adds
+/// an operator breaks this test's compile, which is the only way a whitelist over someone else's
+/// grammar learns that the grammar grew.
+fn evaluates_lazily(op: &Op) -> bool {
+    match op {
+        // The closure IS the deferred work, and the guard refuses exactly this.
+        Op::Closure(..) => true,
+        Op::Value(_) => false,
+        // Each takes one value that is already evaluated.
+        Op::Unary(
+            Unary::Negate | Unary::Parens | Unary::Length | Unary::TypeOf | Unary::Ffi(_),
+        ) => false,
+        // `.all()` and `.any()` run their body once per element of the operand; `&&` and `||` defer
+        // their right operand and `try_or` its left. All five carry an `Op::Closure`.
+        Op::Binary(
+            Binary::All | Binary::Any | Binary::LazyAnd | Binary::LazyOr | Binary::TryOr,
+        ) => true,
+        // Strict: both operands are values by the time the operator runs, so one application is one
+        // step over what the token already carries.
+        Op::Binary(
+            Binary::LessThan
+            | Binary::GreaterThan
+            | Binary::LessOrEqual
+            | Binary::GreaterOrEqual
+            | Binary::Equal
+            | Binary::NotEqual
+            | Binary::HeterogeneousEqual
+            | Binary::HeterogeneousNotEqual
+            | Binary::Contains
+            | Binary::Prefix
+            | Binary::Suffix
+            | Binary::Regex
+            | Binary::Add
+            | Binary::Sub
+            | Binary::Mul
+            | Binary::Div
+            | Binary::And
+            | Binary::Or
+            | Binary::Intersection
+            | Binary::Union
+            | Binary::BitwiseAnd
+            | Binary::BitwiseOr
+            | Binary::BitwiseXor
+            | Binary::Get
+            | Binary::Ffi(_),
+        ) => false,
+    }
+}
+
+#[test]
 fn the_evaluation_bound_admits_every_shape_nauthy_mints() {
     // The arm most likely to be wrong: the bound is a WHITELIST over this crate's own grammar, so a bound
     // that refuses bombs and honest tokens alike is not a fix. Every mint shape, the deepest delegation
     // chain `MAX_BLOCKS` allows, and both fact READS (which run the same engine through the same funnel)
     // must pass it. The authority-bound slip is the tight one: its `check if authority_bound($x),
     // foreign_member($x)` is the widest join nauthy emits, so it sits exactly at `MAX_JOIN_ARITY`.
+    //
+    // This is also where drift in nauthy's OWN grammar surfaces. Every check expression below is one
+    // strict comparison against a literal, which is the whole of the expression grammar this crate
+    // writes: the day a mint or an attenuation emits a closure, the whitelist refuses that mint's own
+    // tokens and this test is what says so, loudly, before the shape ever ships.
     let authority = identity(1);
     let device = identity(2).verifying_key();
     let foreign = identity(3).verifying_key();

@@ -36,7 +36,7 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
-use biscuit_auth::builder::Algorithm;
+use biscuit_auth::builder::{Algorithm, Check, Expression, Op, Rule};
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{
     Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, error,
@@ -95,8 +95,9 @@ const MAX_BLOCKS: usize = 16;
 /// identically on every host at every load, where a clock-based refusal is noise; they are biscuit's own
 /// defaults, spelled out here so an upstream default change cannot silently move nauthy's bound.
 /// [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`] bound the parse and signature-chain work before evaluation
-/// starts. And [`bound_evaluation_cost`] answers the join above, which none of the others reach: it caps
-/// `F` and `k` structurally, before `run()`.
+/// starts. And [`bound_evaluation_cost`] answers what none of the others reach, structurally and before
+/// `run()`: it caps `F` and `k`, and it refuses a CLOSURE, whose nested evaluation is not sampled even
+/// at an iteration boundary because it never leaves the one expression it lives in.
 pub(crate) const AUTHORIZER_LIMITS: AuthorizerLimits = AuthorizerLimits {
     max_facts: 1_000,
     max_iterations: 100,
@@ -877,8 +878,22 @@ impl Identity {
 
 #[cfg(test)]
 impl Cap {
-    /// Test-only: append the JOIN BOMB, the attenuation block a hostile holder appends to a token the
-    /// authority really signed. `facts` facts under ONE rule whose body joins `arity` of them, so the
+    /// Test-only: append `source` as a raw datalog block, the way a hostile holder attenuates a token
+    /// the authority really signed. Reaches past [`Cap::attenuate`] on purpose, and that is the attack:
+    /// attenuation here appends only this crate's own fixed checks, while a holder appends whatever
+    /// datalog they like with biscuit's own block builder, needing no secret and no network.
+    pub(crate) fn attenuate_with_raw_datalog(&self, source: &str) -> Result<Self, CapError> {
+        let block = biscuit_auth::builder::BlockBuilder::new()
+            .code(source)
+            .map_err(CapError::Attenuate)?;
+        let token = self.token.append(block).map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
+    }
+
+    /// Test-only: the JOIN BOMB, `facts` facts under ONE rule whose body joins `arity` of them, so the
     /// engine walks `facts ^ arity` candidate tuples in a single uninterrupted `apply`.
     ///
     /// The rule's expression is unsatisfiable, so the join DERIVES NOTHING and `max_facts` never trips:
@@ -886,9 +901,6 @@ impl Cap {
     /// samples the clock only between iterations). The result is a small, well-formed, signature-valid
     /// token that passes [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`] with room to spare, which is why the bound
     /// it must trip is a structural one.
-    ///
-    /// Reaches past the public API on purpose: [`Cap::attenuate`] appends only checks, and no nauthy mint
-    /// emits a rule, so an attacker builds this with biscuit's own block builder, as this does.
     pub(crate) fn attenuate_with_join_bomb(
         &self,
         facts: usize,
@@ -903,14 +915,28 @@ impl Cap {
             .collect::<Vec<_>>()
             .join(", ");
         source.push_str(&format!("burn($v0) <- {join}, $v0 < 0;\n"));
-        let block = biscuit_auth::builder::BlockBuilder::new()
-            .code(source)
-            .map_err(CapError::Attenuate)?;
-        let token = self.token.append(block).map_err(CapError::Attenuate)?;
-        Ok(Self {
-            root: self.root,
-            token,
-        })
+        self.attenuate_with_raw_datalog(&source)
+    }
+
+    /// Test-only: the CLOSURE BOMB, ONE check whose expression nests `.all()` closures `depth` deep (at
+    /// least one) over an eight-element array, so the innermost comparison runs `8 ^ depth` times.
+    ///
+    /// Worse than the join bomb in two ways. The whole nest lives inside ONE expression, which biscuit
+    /// walks recursively and never interrupts, not even at the iteration boundary where it samples its
+    /// clock. And the innermost body is always TRUE, so the check PASSES: an unguarded host burns the
+    /// entire nest and then admits the peer, spending the cost with no refusal to point at. On every
+    /// dimension the join bound measures it is a legitimate token: one fact, no rule, a one-predicate
+    /// body, and around a kilobyte of link.
+    pub(crate) fn attenuate_with_closure_bomb(&self, depth: usize) -> Result<Self, CapError> {
+        // Eight elements per level, each level evaluating the next once per element. The body of the
+        // innermost closure compares the deepest bound variable, so every level is really walked.
+        let mut expression = format!("$v{} >= 0", depth.saturating_sub(1));
+        for level in (0..depth).rev() {
+            expression = format!("[0, 1, 2, 3, 4, 5, 6, 7].all($v{level} -> {expression})");
+        }
+        // Hung off `service`, the fact every service verification injects, so the check is reached and
+        // the nest is evaluated on the ordinary presented-token path.
+        self.attenuate_with_raw_datalog(&format!("check if service($s), {expression};\n"))
     }
 }
 
@@ -972,22 +998,46 @@ fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
     PublicKey::from_bytes(node.bytes(), Algorithm::Ed25519).map_err(CapError::Key)
 }
 
-/// Refuse a loaded-but-not-yet-evaluated token before it can ask for a join no budget would interrupt.
+/// Refuse a loaded-but-not-yet-evaluated token before it can ask for work no budget would interrupt.
 ///
-/// THE BOUND THE CLOCK CANNOT GIVE (see [`AUTHORIZER_LIMITS`]). A datalog join walks `O(F^k)` candidate
-/// tuples in the fact count `F` and the widest body arity `k`, and biscuit checks its limits only BETWEEN
-/// iterations, so one rule's join runs to completion however long it takes. `F` and `k` are the two quantities that
-/// decide that cost, they are readable before anything runs, and reading them is `O(F)`, not `O(F^k)`:
-/// the 64-fact, 4-way token in `cap_tests` is refused in tens of microseconds and evaluates for nine
-/// seconds without this.
+/// THE CONTRACT: inspect the FULL SHAPE of a presented token before evaluating it, and refuse anything
+/// this crate could not itself have minted or narrowed. The shape is read against nauthy's OWN emission
+/// grammar, which this crate authors and can therefore enumerate exactly, so the bound holds without
+/// knowing anything about how biscuit evaluates.
+///
+/// THE BOUND THE CLOCK CANNOT GIVE (see [`AUTHORIZER_LIMITS`]). biscuit samples its limits only BETWEEN
+/// iterations, and one iteration runs every rule to completion, so a single query runs as long as it
+/// likes. Two dimensions of the token decide how long, both readable before anything runs:
+/// - the JOIN. A body of arity `k` over `F` facts walks `O(F^k)` candidate tuples, so bounding `F` and
+///   `k` pins the worst case. Reading them is `O(F)`, not `O(F^k)`: the 64-fact, 4-way token in
+///   `cap_tests` is refused in tens of microseconds and evaluates for nine seconds without this.
+/// - the EXPRESSION. A closure (`.all()`, `.any()`, and the lazy `&&`, `||`, `try_or`) runs its body
+///   once per element of its operand, recursively, INSIDE one expression, so a nest `d` deep over an
+///   eight-element operand is `8^d` evaluations that no iteration boundary ever interrupts. The 1.3 KB
+///   token in `cap_tests` nests six deep and, without this bound, burns hundreds of milliseconds and is
+///   then GRANTED: the cost is paid and the peer admitted, which is worse than a refusal and invisible
+///   to the join bound, whose every dimension such a token matches (one fact, no rule, a one-predicate
+///   body).
 ///
 /// A WHITELIST, which is only honest because this crate AUTHORED the grammar. A legitimate token is a
 /// handful of authority facts, ZERO rules (no mint emits one, and [`Cap::attenuate`] appends only
-/// checks), and checks whose bodies join at most [`MAX_JOIN_ARITY`] predicates. So the bound refuses
-/// every token nauthy could not have minted or narrowed, and refuses nothing it could: a full
-/// [`MAX_BLOCKS`]-deep delegation chain passes, because attenuation adds checks, never facts or rules.
-/// A refusal here is DETERMINISTIC, a property of the token that reads the same on every host at every
-/// load, which is what keeps it a denial and not an [`Undecided`](CapError::Undecided).
+/// checks), checks whose bodies join at most [`MAX_JOIN_ARITY`] predicates, and check expressions that
+/// are one comparison against a literal. No mint and no attenuation writes a closure of ANY kind, so the
+/// honest bound on closures is zero: refusing the operator outright has no headroom number to get wrong
+/// and refuses the wide-but-shallow closure a depth budget would admit. So the bound refuses every token
+/// nauthy could not have minted or narrowed and refuses nothing it could: a full [`MAX_BLOCKS`]-deep
+/// delegation chain passes, because attenuation adds checks, never facts, rules, or operators. A refusal
+/// here is DETERMINISTIC, a property of the token that reads the same on every host at every load, which
+/// is what keeps it a denial and not an [`Undecided`](CapError::Undecided).
+///
+/// THE WHITELIST IS ENUMERATED, NEVER SAMPLED. Every node on the path from the loaded program to an
+/// operator is destructured or matched EXHAUSTIVELY here, and the suite does the same over biscuit's
+/// operators, so a release that adds a dimension to a rule or a kind of operator STOPS THE BUILD until
+/// someone decides what it costs. That is the whole defence: a whitelist over someone else's grammar is
+/// only as good as its coverage, and reading `body` while leaving `expressions` unread is exactly how a
+/// token that carries no rule and joins one predicate still burned a thread. Drift in nauthy's own
+/// grammar fails the other way, closed and loud: a mint that began emitting a closure would have its
+/// own tokens refused at the first verify, which the suite catches on every shape this crate mints.
 ///
 /// `dump` is the typed read, not `dump_code`, and its internal unwraps cannot fire on an authorizer
 /// `build` returned: `build` converts every block's facts, rules, and checks out of the block's symbols
@@ -998,16 +1048,60 @@ fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
 /// not attacker-influenced and not bounded here.
 fn bound_evaluation_cost(authorizer: &Authorizer) -> Result<(), CapError> {
     let (facts, rules, checks, _policies) = authorizer.dump();
-    if facts.len() > MAX_TOKEN_FACTS
+    let beyond_the_grammar = facts.len() > MAX_TOKEN_FACTS
         || !rules.is_empty()
         || checks
             .iter()
-            .flat_map(|check| &check.queries)
-            .any(|query| query.body.len() > MAX_JOIN_ARITY)
-    {
+            // `kind` picks how a check quantifies its queries (one, all, reject), which chooses an
+            // answer and never an amount of work. Destructured rather than read by field so a field
+            // biscuit adds to a check cannot arrive unconsidered.
+            .flat_map(|Check { queries, kind: _ }| queries)
+            .any(query_beyond_the_grammar);
+    if beyond_the_grammar {
         return Err(CapError::TooComplex);
     }
     Ok(())
+}
+
+/// Whether one check query asks for work no mint or attenuation here ever writes: a join wider than
+/// [`MAX_JOIN_ARITY`] predicates, or an expression that opens a closure.
+fn query_beyond_the_grammar(query: &Rule) -> bool {
+    // Destructured, never read by field, because the omission IS the bug class: the unread member of
+    // this struct is the dimension the next bomb rides. The rest cost nothing to walk: `head` names the
+    // predicate a match would derive, `parameters` and `scope_parameters` are builder-time
+    // substitutions already applied in a token read off the wire, and `scopes` only narrows which
+    // origins a body may see. None of them adds a tuple or an evaluation.
+    let Rule {
+        head: _,
+        body,
+        expressions,
+        parameters: _,
+        scopes: _,
+        scope_parameters: _,
+    } = query;
+    body.len() > MAX_JOIN_ARITY
+        || expressions
+            .iter()
+            .any(|Expression { ops }| ops.iter().any(opens_a_closure))
+}
+
+/// Whether this operator IS a closure: a body biscuit evaluates once per element of the operand beside
+/// it (`.all()`, `.any()`) or defers and may evaluate later (`&&`, `||`, `try_or`). Every lazy operator
+/// biscuit offers compiles to a closure operand, so refusing the closure refuses the whole family, and
+/// the suite proves that operator by operator against real tokens.
+///
+/// Nesting needs no recursion here: a closure appears either at the top of an expression or inside
+/// another closure, so the OUTERMOST closure of any nest is always among the ops this scans.
+///
+/// EXHAUSTIVE on purpose. A biscuit release that adds a kind of operator stops this crate compiling
+/// until someone decides what that operator costs, rather than admitting it by falling through.
+fn opens_a_closure(op: &Op) -> bool {
+    match op {
+        Op::Closure(..) => true,
+        // A value and a unary or binary operator each consume operands that are already evaluated, so
+        // one application is one step over what the token already carries.
+        Op::Value(_) | Op::Unary(_) | Op::Binary(_) => false,
+    }
 }
 
 /// Why a capability operation failed.
@@ -1032,8 +1126,9 @@ pub enum CapError {
     #[error("capability is too large")]
     TooLarge,
     /// The token's datalog is a shape this crate never emits: too many facts, a rule (there are none in a
-    /// legitimate token), or a check body joining more predicates than any mint or attenuation writes.
-    /// Refused before evaluation to cap the `O(facts ^ arity)` work an untrusted peer can force, which no
+    /// legitimate token), a check body joining more predicates than any mint or attenuation writes, or a
+    /// check expression carrying a closure (`.all()`, `.any()`, `&&`, `||`, `try_or`), of which this
+    /// crate writes none. Refused before evaluation to cap the work an untrusted peer can force, which no
     /// wall-clock budget can bound (see `bound_evaluation_cost`). A property of the token, so it is a
     /// denial and not an [`Undecided`](Self::Undecided): the same token reads the same way on every host.
     #[error("capability is too complex to evaluate")]
