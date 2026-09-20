@@ -1015,7 +1015,14 @@ fn bound_evaluation_cost(authorizer: &Authorizer) -> Result<(), CapError> {
 /// The failure modes a caller must distinguish: a malformed link, a token that does not chain to the
 /// expected root, and a token that chains but whose checks deny the request. The underlying
 /// [`biscuit_auth`] cause is carried by reference in the source chain, never stringified away.
+///
+/// Non-exhaustive, on the argument `bifrost::Refusal` and `bifrost_wire::Error` both took on
+/// 2026-09-20: hardening a capability model ADDS causes, `TooComplex` being the third this week, and
+/// a downstream match that silently inherits a new one is the failure this type exists to prevent.
+/// Adding the attribute is free while the enum is already breaking and costs a release train the day
+/// it is deferred. Every consumer outside this crate already carries a catch-all, so nothing breaks.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum CapError {
     /// The link did not start with the `sheer:` scheme.
     #[error("not a sheer link")]

@@ -491,10 +491,42 @@ impl From<Result<VerifyKey, CapError>> for Checked {
     /// Classify one capability verification. [`CapError::Undecided`] is the ONLY cause that is not an
     /// answer about the holder; every other error is a genuine "this cap does not grant that".
     fn from(verified: Result<VerifyKey, CapError>) -> Self {
+        // EXHAUSTIVE, with no wildcard, and that is the point of the arm list below.
+        //
+        // `Err(_) => NotGranted` stood here until 2026-09-20 and it is the shape that once let a
+        // whole verb dial as a stranger for months: a cause added upstream inherits whatever the
+        // fall-through happened to be, silently, and here the fall-through is a DENIAL. `Undecided`
+        // exists precisely because "I could not decide" must never read as "you are not authorized",
+        // so a new cause landing in that arm by default is the exact lie this type is shaped around.
+        //
+        // `CapError` is now non-exhaustive, but that only forces a catch-all OUTSIDE this crate. In
+        // here the compiler still checks the list, so adding a variant breaks this match and someone
+        // has to rule on it. That is the guard. A reviewer who restores the wildcard to make it build
+        // has thrown it away.
         match verified {
             Ok(_) => Checked::Granted,
+            // Not an answer about the holder: the evaluation never finished, or was refused before
+            // it began because its shape could have burned the host.
             Err(CapError::Undecided) => Checked::Undecided,
-            Err(_) => Checked::NotGranted,
+            // Answers about the token or the holder, every one of which is a genuine "no".
+            Err(
+                CapError::Scheme
+                | CapError::TooLarge
+                | CapError::TooComplex
+                | CapError::Encoding
+                | CapError::Malformed
+                | CapError::Unverified
+                | CapError::Key(_)
+                | CapError::Mint(_)
+                | CapError::Encode(_)
+                | CapError::Attenuate(_)
+                | CapError::Seal(_)
+                | CapError::EmptyAttenuation
+                | CapError::ForeignRoot
+                | CapError::Authorize(_)
+                | CapError::Denied(_)
+                | CapError::NotAuthorityBound,
+            ) => Checked::NotGranted,
         }
     }
 }
