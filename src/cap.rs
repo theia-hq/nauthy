@@ -78,24 +78,48 @@ const MAX_BLOCKS: usize = 16;
 /// capability into a refusal whenever the machine was loaded. That is an availability defect, and a lying
 /// one, since the holder is told their authority failed when nothing about it was ever decided.
 ///
-/// The time budget is deliberate at both ends:
-/// - LARGE enough that host load never trips it. A real cap is a handful of facts over at most
-///   [`MAX_BLOCKS`] blocks and evaluates in microseconds, so a second is three orders of magnitude of
-///   headroom, far past the tens of milliseconds a loaded scheduler can steal from a thread mid-run.
-/// - SMALL enough to stay a ceiling. A hostile token still cannot pin a verifying thread for longer than
-///   a second, which is the only reason a wall-clock limit exists at all.
+/// The time budget is LARGE enough that host load never trips it: a real cap is a handful of facts over
+/// at most [`MAX_BLOCKS`] blocks and evaluates in microseconds, so a second is three orders of magnitude
+/// of headroom, far past the tens of milliseconds a loaded scheduler can steal from a thread mid-run.
 ///
-/// The anti-abuse work is done by the two DETERMINISTIC caps, which is why they stay tight: a token that
-/// would generate more than `max_facts` facts or need more than `max_iterations` rule passes is refused
-/// identically on every host at every load, where a clock-based refusal is noise. They are biscuit's own
-/// defaults, spelled out here so an upstream default change cannot silently move nauthy's bound. Together
-/// with [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`], which bound the work before evaluation even starts, they
-/// are the real bound; the wall clock is a last-resort backstop.
+/// It is NOT a ceiling on hostile work, and nothing here should be read as one. biscuit samples the clock
+/// only at ITERATION boundaries, and one iteration runs every rule to completion, so a single rule whose
+/// body joins `k` predicates over `F` facts walks all `F^k` tuples uninterrupted: `max_time` bounds the
+/// NUMBER of iterations times the cost of one, and the cost of one is unbounded. A token carrying ~40
+/// facts and one 4-way rule (1.6 KB, 2 blocks, well inside [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`]) burns
+/// seconds of one thread under this one-second budget. So the clock is a BACKSTOP for a legitimate token
+/// on a starved host, nothing more.
+///
+/// The anti-abuse work is done by bounds that hold without a clock. The two DETERMINISTIC caps refuse a
+/// token that would generate more than `max_facts` facts or need more than `max_iterations` rule passes
+/// identically on every host at every load, where a clock-based refusal is noise; they are biscuit's own
+/// defaults, spelled out here so an upstream default change cannot silently move nauthy's bound.
+/// [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`] bound the parse and signature-chain work before evaluation
+/// starts. And [`bound_evaluation_cost`] answers the join above, which none of the others reach: it caps
+/// `F` and `k` structurally, before `run()`.
 pub(crate) const AUTHORIZER_LIMITS: AuthorizerLimits = AuthorizerLimits {
     max_facts: 1_000,
     max_iterations: 100,
     max_time: Duration::from_secs(1),
 };
+
+/// The most facts an evaluation may start from: the token's own authority facts plus the ones nauthy's
+/// authorizer program injects. This crate AUTHORED every legitimate token, so the real number is known
+/// and small: at most `authority_bound` + `expires_at` + `member` from the authority block (three, and no
+/// mint emits all three), plus `time` + `service` + `bound_device` + `foreign_member` from the verify
+/// programs (at most three of the four on any one path). Six, so sixteen is double headroom for a grant
+/// shape we have not minted yet, and still leaves the worst case tiny (see [`MAX_JOIN_ARITY`]).
+const MAX_TOKEN_FACTS: usize = 16;
+
+/// The widest join a check body may ask for. Every check this crate emits joins ONE predicate
+/// (`check if service($s), $s == ...`) except the authority-bound slip's, which joins two
+/// (`check if authority_bound($x), foreign_member($x)`), so two is exactly the grammar and not a guess.
+///
+/// With [`MAX_TOKEN_FACTS`] this is the whole structural guarantee: evaluation cost is `O(F^k)` in the
+/// fact count `F` and the body arity `k`, so bounding BOTH pins the worst case at `16^2` = 256 candidate
+/// tuples per query. Bounding either alone does nothing: eight facts under a 25-predicate body is `8^25`,
+/// and 640 facts under a 2-predicate body is 409,600.
+const MAX_JOIN_ARITY: usize = 2;
 
 /// Domain-separation tag prepended to a document's bytes before signing (and required on verify), so a
 /// document signature can never double as a biscuit authority-block signature (the confused-deputy forgery,
@@ -587,14 +611,21 @@ impl Cap {
     /// The ONE place an authorizer is built, because the budget belongs to the BUILDER: biscuit stores the
     /// limits on the authorizer and applies them to every later `authorize` and `query`, so a site that
     /// built its own would silently evaluate on the one-millisecond default no matter what it passed later.
+    /// It is also the one place the token's SHAPE is bounded ([`bound_evaluation_cost`]), for the same
+    /// reason: every path that runs the engine on a presented token comes through here, so no verify site
+    /// and no fact read can forget it.
     pub(crate) fn budgeted_authorizer(
         &self,
         program: AuthorizerBuilder,
     ) -> Result<Authorizer, CapError> {
-        program
+        let authorizer = program
             .set_limits(AUTHORIZER_LIMITS)
             .build(&self.token)
-            .map_err(CapError::Authorize)
+            .map_err(CapError::Authorize)?;
+        // `build` LOADS the token into the world but evaluates nothing, so this is the last moment before
+        // any join runs and the only one where refusing is still free.
+        bound_evaluation_cost(&authorizer)?;
+        Ok(authorizer)
     }
 }
 
@@ -844,6 +875,45 @@ impl Identity {
     }
 }
 
+#[cfg(test)]
+impl Cap {
+    /// Test-only: append the JOIN BOMB, the attenuation block a hostile holder appends to a token the
+    /// authority really signed. `facts` facts under ONE rule whose body joins `arity` of them, so the
+    /// engine walks `facts ^ arity` candidate tuples in a single uninterrupted `apply`.
+    ///
+    /// The rule's expression is unsatisfiable, so the join DERIVES NOTHING and `max_facts` never trips:
+    /// the entire cost is the walk, which is exactly the cost no wall-clock budget can bound (biscuit
+    /// samples the clock only between iterations). The result is a small, well-formed, signature-valid
+    /// token that passes [`MAX_ENCODED_LEN`] and [`MAX_BLOCKS`] with room to spare, which is why the bound
+    /// it must trip is a structural one.
+    ///
+    /// Reaches past the public API on purpose: [`Cap::attenuate`] appends only checks, and no nauthy mint
+    /// emits a rule, so an attacker builds this with biscuit's own block builder, as this does.
+    pub(crate) fn attenuate_with_join_bomb(
+        &self,
+        facts: usize,
+        arity: usize,
+    ) -> Result<Self, CapError> {
+        let mut source = String::new();
+        for fact in 0..facts {
+            source.push_str(&format!("bomb({fact});\n"));
+        }
+        let join = (0..arity)
+            .map(|slot| format!("bomb($v{slot})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        source.push_str(&format!("burn($v0) <- {join}, $v0 < 0;\n"));
+        let block = biscuit_auth::builder::BlockBuilder::new()
+            .code(source)
+            .map_err(CapError::Attenuate)?;
+        let token = self.token.append(block).map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
+    }
+}
+
 /// What a presented cap is asked to grant: a service, at a moment in time.
 ///
 /// Built at the verify boundary so `verify` receives an already-valid request. `now` is normally the
@@ -902,6 +972,44 @@ fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
     PublicKey::from_bytes(node.bytes(), Algorithm::Ed25519).map_err(CapError::Key)
 }
 
+/// Refuse a loaded-but-not-yet-evaluated token before it can ask for a join no budget would interrupt.
+///
+/// THE BOUND THE CLOCK CANNOT GIVE (see [`AUTHORIZER_LIMITS`]). A datalog join walks `O(F^k)` candidate
+/// tuples in the fact count `F` and the widest body arity `k`, and biscuit checks its limits only BETWEEN
+/// iterations, so one rule's join runs to completion however long it takes. `F` and `k` are the two quantities that
+/// decide that cost, they are readable before anything runs, and reading them is `O(F)`, not `O(F^k)`:
+/// the 64-fact, 4-way token in `cap_tests` is refused in tens of microseconds and evaluates for nine
+/// seconds without this.
+///
+/// A WHITELIST, which is only honest because this crate AUTHORED the grammar. A legitimate token is a
+/// handful of authority facts, ZERO rules (no mint emits one, and [`Cap::attenuate`] appends only
+/// checks), and checks whose bodies join at most [`MAX_JOIN_ARITY`] predicates. So the bound refuses
+/// every token nauthy could not have minted or narrowed, and refuses nothing it could: a full
+/// [`MAX_BLOCKS`]-deep delegation chain passes, because attenuation adds checks, never facts or rules.
+/// A refusal here is DETERMINISTIC, a property of the token that reads the same on every host at every
+/// load, which is what keeps it a denial and not an [`Undecided`](CapError::Undecided).
+///
+/// `dump` is the typed read, not `dump_code`, and its internal unwraps cannot fire on an authorizer
+/// `build` returned: `build` converts every block's facts, rules, and checks out of the block's symbols
+/// and RE-INTERNS them into the authorizer's own table, fallibly, before it returns, so a token with a
+/// dangling symbol has already failed as [`Authorize`](CapError::Authorize) and every id `dump` resolves
+/// was inserted by the conversion that put it there. This runs before `run()`, so no derived fact is in
+/// the world yet either. The policies are this crate's own program rather than the token's, so they are
+/// not attacker-influenced and not bounded here.
+fn bound_evaluation_cost(authorizer: &Authorizer) -> Result<(), CapError> {
+    let (facts, rules, checks, _policies) = authorizer.dump();
+    if facts.len() > MAX_TOKEN_FACTS
+        || !rules.is_empty()
+        || checks
+            .iter()
+            .flat_map(|check| &check.queries)
+            .any(|query| query.body.len() > MAX_JOIN_ARITY)
+    {
+        return Err(CapError::TooComplex);
+    }
+    Ok(())
+}
+
 /// Why a capability operation failed.
 ///
 /// The failure modes a caller must distinguish: a malformed link, a token that does not chain to the
@@ -916,6 +1024,13 @@ pub enum CapError {
     /// untrusted peer can force.
     #[error("capability is too large")]
     TooLarge,
+    /// The token's datalog is a shape this crate never emits: too many facts, a rule (there are none in a
+    /// legitimate token), or a check body joining more predicates than any mint or attenuation writes.
+    /// Refused before evaluation to cap the `O(facts ^ arity)` work an untrusted peer can force, which no
+    /// wall-clock budget can bound (see `bound_evaluation_cost`). A property of the token, so it is a
+    /// denial and not an [`Undecided`](Self::Undecided): the same token reads the same way on every host.
+    #[error("capability is too complex to evaluate")]
+    TooComplex,
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,

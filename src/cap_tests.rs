@@ -2,7 +2,7 @@
 //! proof that broadening is impossible by construction.
 
 use core::time::Duration;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use biscuit_auth::{AuthorizerBuilder, AuthorizerLimits, error};
 
@@ -776,9 +776,11 @@ fn every_verification_runs_under_the_deliberate_time_budget() {
 
 #[test]
 fn the_deterministic_budgets_stay_bounded() {
-    // The fact and iteration caps are what actually bound a hostile token, and they are deterministic: the
-    // same token trips them on every host at every load. Widening the CLOCK must never come with widening
-    // these, so the budget that was relaxed cannot take the anti-abuse bound with it.
+    // The fact and iteration caps bound what an evaluation DERIVES, deterministically: the same token
+    // trips them on every host at every load. Widening the CLOCK must never come with widening these, so
+    // the budget that was relaxed cannot take a deterministic bound with it. They do not bound the cost of
+    // ONE iteration, which is the join walk; that is the structural bound's job (see
+    // `a_join_bomb_is_refused_before_it_can_pin_the_thread`).
     assert!(AUTHORIZER_LIMITS.max_facts <= AuthorizerLimits::default().max_facts);
     assert!(AUTHORIZER_LIMITS.max_iterations <= AuthorizerLimits::default().max_iterations);
 }
@@ -801,4 +803,110 @@ fn a_timeout_is_undecided_and_never_a_denial() {
         CapError::from_evaluation(error::Token::RunLimit(error::RunLimit::TooManyIterations)),
         CapError::Denied(_)
     ));
+}
+
+#[test]
+fn a_join_bomb_is_refused_before_it_can_pin_the_thread() {
+    // The defect this pins, measured and not asserted: biscuit samples its clock only BETWEEN iterations,
+    // and one iteration runs a rule's join to completion, so a token carrying a few dozen facts and one
+    // 4-way rule burns SECONDS of one thread under a one-second `max_time`. The token below is
+    // signature-valid, two blocks, and a fraction of `MAX_ENCODED_LEN`, so every bound that existed before
+    // the structural one waves it through. It arrives the way a presented token arrives, through the wire
+    // edge, because that is the path an attacker has.
+    let issuer = identity(1);
+    let slip = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let bomb = slip
+        .attenuate_with_join_bomb(64, 4)
+        .expect("append a join-bomb block");
+    let link = bomb.link().expect("encode");
+    let presented =
+        Cap::parse(link.as_str()).expect("a join bomb is a well-formed, valid-chain token");
+
+    let started = Instant::now();
+    let refused =
+        presented.verify_at_root_without_revocation(&request("ssh", 0), issuer.verifying_key());
+    let elapsed = started.elapsed();
+
+    assert!(
+        refused.is_err(),
+        "a token nauthy never minted must never verify"
+    );
+    assert!(
+        !matches!(refused, Err(CapError::Undecided)),
+        "the wall clock cannot bound a single join, so a bomb that reads as Undecided is one that ran"
+    );
+    assert!(
+        matches!(refused, Err(CapError::TooComplex)),
+        "the structural bound is what refuses a bomb, deterministically and before any of it runs"
+    );
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "the refusal must cost a token read, not an evaluation; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn the_evaluation_bound_admits_every_shape_nauthy_mints() {
+    // The arm most likely to be wrong: the bound is a WHITELIST over this crate's own grammar, so a bound
+    // that refuses bombs and honest tokens alike is not a fix. Every mint shape, the deepest delegation
+    // chain `MAX_BLOCKS` allows, and both fact READS (which run the same engine through the same funnel)
+    // must pass it. The authority-bound slip is the tight one: its `check if authority_bound($x),
+    // foreign_member($x)` is the widest join nauthy emits, so it sits exactly at `MAX_JOIN_ARITY`.
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let foreign = identity(3).verifying_key();
+
+    let plain = authority.mint(&service("ssh"), at(3600)).expect("slip");
+    assert!(authority.verify(&plain, &request("ssh", 0)).is_ok());
+
+    let badge = authority.mint_member(device, at(3600)).expect("badge");
+    assert!(
+        badge
+            .verify_member_at_root_without_revocation(at(0), device, authority.verifying_key())
+            .is_ok()
+    );
+
+    let bound = authority
+        .mint_bound(&service("ssh"), device, at(3600))
+        .expect("device-bound slip");
+    assert!(
+        bound
+            .verify_at_root_without_revocation(
+                &bound_request("ssh", 0, device),
+                authority.verifying_key()
+            )
+            .is_ok()
+    );
+
+    let authority_bound = authority
+        .mint_authority_slip(&service("ssh"), foreign, at(3600))
+        .expect("authority-bound slip");
+    assert_eq!(
+        authority_bound
+            .verify_authority_bound_at_root_without_revocation(
+                &request("ssh", 0),
+                authority.verifying_key()
+            )
+            .expect("an authority-bound slip verifies on its own authority checks"),
+        foreign
+    );
+    assert!(authority_bound.is_authority_bound());
+    assert_eq!(
+        authority_bound.expiry().expect("read the expiry"),
+        Some(at(3600))
+    );
+
+    // A full-depth delegation chain: attenuation appends CHECKS, never facts or rules, so depth never
+    // moves the two quantities the bound measures. Fifteen narrowings plus the authority block is
+    // `MAX_BLOCKS`, the most a presented token may carry.
+    let mut delegated = plain;
+    for step in 1..16 {
+        delegated = delegated
+            .attenuate(None, Some(at(3600 - step)))
+            .expect("narrow");
+    }
+    assert!(
+        authority.verify(&delegated, &request("ssh", 0)).is_ok(),
+        "a chain at MAX_BLOCKS still grants: the bound counts facts and join arity, not blocks"
+    );
 }
