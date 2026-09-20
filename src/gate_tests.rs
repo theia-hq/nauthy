@@ -508,3 +508,30 @@ fn an_undecided_check_survives_the_other_questions_refusal() {
         Decision::Admit
     );
 }
+
+#[tokio::test]
+async fn a_revoked_token_is_refused_before_its_grant_is_evaluated() {
+    // The order this holds, and the only way to observe it from outside. Revocation is a set lookup over
+    // the token's own block signatures, independent of whether the token grants, so it is asked BEFORE the
+    // datalog: a revoked but persistent holder can no longer make this node pay for an evaluation it was
+    // always going to throw away. A revoked token that would ALSO have failed its checks (this one is for
+    // `web`, asked for `ssh`) reports the answer reached FIRST. Ask the store after the verify instead and
+    // the same token reports `NotGranted`.
+    let authority = identity(1);
+    let revoked = authority
+        .mint(&service("web"), hour())
+        .expect("mint a slip for another service");
+
+    let path = std::env::temp_dir().join(format!("nauthy-revoke-order-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
+    denylist.revoke(&revoked).await.expect("revoke");
+    let gate = Gate::rooted(authority.verifying_key(), denylist);
+
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&revoked), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked),
+        "the recall is the answer, and it is reached without running the token's checks"
+    );
+    let _ = std::fs::remove_file(&path);
+}

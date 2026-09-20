@@ -351,6 +351,16 @@ fn admit_plain(
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
+    // Revocation FIRST, before any datalog runs. It is a pure offline read of the token's own block
+    // signatures plus a set lookup ([`Cap::revocation_ids`]), and it is INDEPENDENT of whether the token
+    // grants, so asking it earlier only decides sooner: a revoked token is refused either way, and a token
+    // that is not revoked still faces the whole verify. What it buys is that a revoked but persistent
+    // holder stops making this node pay for an evaluation it was always going to discard, which is the one
+    // lever the design keeps against a former insider. The post-grant check below stays: it is what refuses
+    // a token revoked between these two answers.
+    if revocations.is_revoked(cap) {
+        return Decision::Refuse(Refusal::Revoked);
+    }
     membership(cap, root, peer)
         .or_else(|| grant(cap, root, service, peer))
         .decide(revocations, cap)
@@ -367,6 +377,11 @@ fn admit_authority_bound(
     service: &Service,
     peer: VerifyKey,
 ) -> Decision {
+    // Revocation first, for the reason `admit_plain` gives. This node's store governs the SLIP only; the
+    // foreign badge roots at `X` and is that authority's to recall.
+    if revocations.is_revoked(slip) {
+        return Decision::Refuse(Refusal::Revoked);
+    }
     let request = Request::now(Service::clone(service)).bound_to(peer);
     let checked = match slip.verify_authority_bound_at_root_without_revocation(&request, root) {
         // `X` is the authority the slip named, fed straight into the badge's root check. There is no path
@@ -389,8 +404,10 @@ fn admit_authority_bound(
 /// at `root`); an authority-bound slip's foreign badge (rooted at `X`) is out of this node's revocation
 /// authority. A foreign authority is the party that revokes a lost DEVICE in its own set; this node's only
 /// lever over a foreign member is revoking the whole SLIP (all-or-nothing), inherent to cross-authority
-/// trust. Checked after the grant so a token that never granted (foreign root, wrong service) reports
-/// `NotGranted`, not `Revoked`.
+/// trust.
+///
+/// The SECOND of the two revocation reads, and the one that catches a token recalled while its own
+/// evaluation was running; the admit paths ask first, before they pay for the verify.
 fn revoked_or_admit(revocations: &dyn Revocations, cap: &Cap) -> Decision {
     if revocations.is_revoked(cap) {
         return Decision::Refuse(Refusal::Revoked);
@@ -511,7 +528,9 @@ pub enum Refusal {
     /// A token was presented but did not grant the request (foreign root, neither membership nor the
     /// requested service, or expired).
     NotGranted,
-    /// A capability verified and granted the request, but has been revoked.
+    /// The capability presented has been revoked. Asked before the grant, so a revoked token reports this
+    /// whether or not it would also have granted: the recall is the answer, and a store lookup is cheaper
+    /// than the verify it replaces.
     Revoked,
     /// Authorization was NOT DECIDED: the capability's evaluation ran out of its wall-clock budget (see
     /// [`CapError::Undecided`]), so nothing about the holder's authority was established.
