@@ -2,6 +2,51 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.4.0
+
+A token should not be able to name its own cost.
+
+### Fixed
+- **A presented capability could pin a verifying thread for as long as it liked.** Measured, not
+  argued: a 1.5 KB two-block token burned 1.4 seconds under a one-second budget, and a 1.9 KB one
+  burned 9.4 seconds.
+
+  The wall clock could not stop it, and the code's own comment claiming otherwise was wrong. The
+  datalog engine samples its fact, iteration and time limits only BETWEEN evaluation passes, while a
+  single pass runs to completion, so one expensive join inside one pass is bounded by nothing.
+
+  The bound is structural and runs before evaluation, which is the only place a bound can work: a
+  presented token is refused if it carries more facts than nauthy mints, any rule at all, or a check
+  wider than nauthy writes. That is sound because nauthy authored its own grammar, so the whitelist
+  IS the grammar. It costs 52 microseconds against the 9.4 seconds it guards, and a legitimate slip
+  is unchanged at 60.
+
+- **A second bomb walked through that fix, and this one was admitted rather than refused.** A
+  legitimate slip and a nested-closure token are identical on every dimension the first bound
+  reads, and differ only in whether a check carries a closure, which the bound never looked at.
+  Cost is 8^depth on a token growing about 92 bytes per level: at depth 6 the host burned 489
+  milliseconds and then GRANTED. Nothing was refused, so nothing logged a refusal.
+
+  nauthy emits no closures anywhere, so the bound is to refuse any, rather than to permit some
+  depth. A whitelist over our own grammar has no headroom number that can be set wrong.
+
+  The contract is now stated at the guard: inspect the full shape of a presented token before
+  evaluating it, and refuse anything this crate could not itself have minted. It is held by the
+  compiler rather than by a comment. The biscuit rule and check types are destructured with no rest
+  pattern and its operator type is matched exhaustively, so a release that adds a field or an
+  operator stops the build until someone decides what it costs.
+
+- **Revocation is consulted before verification.** A revoked but persistent holder previously spent
+  the host's evaluation budget first and was refused afterwards.
+
+### Changed
+- **`CapError` is `#[non_exhaustive]` and gains `TooComplex`.** Hardening a capability model adds
+  causes, and a consumer that silently inherits a new one is the failure this type exists to
+  prevent. Inside the crate, the one place a verification result becomes a decision no longer
+  carries a wildcard: a new cause breaks that match until someone rules on it, because the
+  fall-through there was a DENIAL, and "I could not decide" must never read as "you are not
+  authorized".
+
 ## v0.3.1
 
 A holder can read when its own grant dies, and the budget funnel is enforced.
