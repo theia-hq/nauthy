@@ -989,6 +989,71 @@ fn a_member_cap_rooted_at_own_is_refused() {
 }
 
 #[test]
+fn a_narrowed_member_cap_rooted_at_own_is_refused() {
+    // Narrowing a badge to one service adds a service check the membership question cannot satisfy, since
+    // it supplies no service fact, while the service question still passes it. The badge is still a badge:
+    // refused on both paths, whatever service its holder picked.
+    let device = identity(4).verifying_key();
+    let badge = bound_badge(OWN, device);
+    let narrowed = badge
+        .attenuate(Some(&service("ssh")), None)
+        .expect("a holder narrows an unsealed badge");
+    let gate = anchored_gate(Some(PIN), &[&badge]);
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&narrowed), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_witnessed(proven(device), Some(&narrowed), &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+    // With no pin, the own key is the only authority, and it still makes no member.
+    let pinless = anchored_gate(None, &[&badge]);
+    assert_eq!(
+        pinless.admit(proven(device), Some(&narrowed), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+
+    // On the two-token path: the recorded member fleet slip, narrowed to the service it is presented for.
+    let slip = member_fleet_slip(OWN, 2);
+    let narrowed = slip
+        .attenuate(Some(&service("ssh")), None)
+        .expect("a holder narrows the slip");
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+    let fleet_badge = foreign_badge(2, device);
+    assert_eq!(
+        gate.admit_foreign(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_foreign_witnessed(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+}
+
+#[test]
+fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
+    // The badge read sees the authority block only, so a slip a holder appends `member(true)` to is still
+    // a slip, and an own slip that is recorded still admits its service.
+    let slip = slip(OWN, "ssh");
+    let appended = slip
+        .attenuate_with_raw_datalog("member(true);")
+        .expect("append a fact");
+    assert!(!appended.is_member_badge().expect("read"));
+    assert!(
+        bound_badge(OWN, some_peer())
+            .is_member_badge()
+            .expect("read")
+    );
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&appended), &service("ssh")),
+        Decision::Admit
+    );
+}
+
+#[test]
 fn an_undecided_membership_refuses_the_own_key_path_as_undecided() {
     // The own-key path refuses a member cap, so a membership question that never finished cannot let the
     // cap through to the slip check: it may be a member. It is refused, and as `Undecided`, since nothing
