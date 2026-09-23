@@ -33,6 +33,7 @@ fn denylist(tag: &str) -> FileDenylist {
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
     FileDenylist::empty(path)
 }
 
@@ -166,13 +167,13 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
     let held = handle.metadata().await.expect("stat the opened handle");
     assert_eq!(
         stamp,
-        Some((held.modified().expect("mtime"), held.len())),
+        crate::revocations::Stamp::of(&held),
         "the stamp describes the same inode as the ids"
     );
     let replaced = std::fs::metadata(&path).expect("stat the replacement path");
     assert_ne!(
         stamp,
-        Some((replaced.modified().expect("mtime"), replaced.len())),
+        crate::revocations::Stamp::of(&replaced),
         "the stamp is not the replacement path's"
     );
 
@@ -215,14 +216,14 @@ fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
     // mtime is not asserted: a stat can race the write's mtime visibility on some filesystems, and
     // the security property here is which bytes the stamp describes, never the clock tick.
     assert_eq!(
-        stamp.map(|(_, len)| len),
+        stamp.map(|stamp| stamp.len),
         Some(7),
         "the adopted stamp carries the bytes the handle wrote, not a replacement's length"
     );
     let foreign = std::fs::metadata(&path).expect("stat the replacement path");
     assert_ne!(
         stamp,
-        Some((foreign.modified().expect("mtime"), foreign.len())),
+        crate::revocations::Stamp::of(&foreign),
         "the adopted stamp is not the replacement path's"
     );
 
@@ -244,6 +245,7 @@ async fn two_instances_revoking_different_ids_both_survive_on_disk() {
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 
     // Both load the absent file: each holds the same empty view the losing writer had.
     let mut first = FileDenylist::load(path.clone()).await.expect("load first");
@@ -301,6 +303,7 @@ async fn two_instances_revoking_different_ids_both_survive_on_disk() {
     let _ = std::fs::remove_file(&path);
     #[cfg(unix)]
     let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }
 
 /// Each write gets its own temp sibling: the old fixed `<denylist>.tmp` name let two writers share one
@@ -321,4 +324,82 @@ fn each_write_gets_a_unique_temp_sibling() {
         path.parent(),
         "the temp is a sibling in the denylist's dir"
     );
+}
+
+/// No write leaves an empty denylist, so an empty body beside a witness that counts one id is a crash or a
+/// truncation. A fresh load must refuse it rather than un-revoke every cap, and a running denylist must not
+/// replace its set with it.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_emptied_denylist_neither_loads_nor_replaces_the_running_set() {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-denylist-emptied-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    let cap = identity(21)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint");
+    let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
+    denylist.revoke(&cap).await.expect("revoke");
+
+    std::fs::write(&path, "").expect("truncate the denylist");
+    std::thread::sleep(crate::revocations::STAT_DEBOUNCE + Duration::from_millis(50));
+
+    assert!(
+        denylist.is_revoked(&cap),
+        "a running denylist keeps its set over an emptied file"
+    );
+    assert!(
+        matches!(
+            FileDenylist::load(path.clone()).await,
+            Err(crate::revocations::DenylistError::Lost {
+                expected: 1,
+                found: 0,
+                ..
+            })
+        ),
+        "an emptied denylist that was written before refuses to load"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+}
+
+/// The same law as the latch, through the same check: a deleted denylist beside its witness is a loss, not
+/// a fresh start, or deleting `revoked` would un-revoke every cap at the next start.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_deleted_denylist_is_lost_at_load() {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-denylist-deleted-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    let cap = identity(22)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint");
+    let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
+    denylist.revoke(&cap).await.expect("revoke");
+    std::fs::remove_file(&path).expect("delete the denylist");
+
+    assert!(
+        matches!(
+            FileDenylist::load(path.clone()).await,
+            Err(crate::revocations::DenylistError::Lost {
+                expected: 1,
+                found: 0,
+                ..
+            })
+        ),
+        "a deleted denylist beside its witness refuses to load"
+    );
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }

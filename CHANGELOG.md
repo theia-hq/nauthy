@@ -2,6 +2,47 @@
 
 All notable changes to nauthy, newest first.
 
+## Unreleased
+
+### Breaking
+- **This release is 0.5.0, and it breaks.** `DenylistError` has a new `Lost` variant, and
+  `DenylistError` and `DisabledRootsError` are now `#[non_exhaustive]`. A `match` on either needs a
+  wildcard arm. Code that only passes the error on with `?` is unaffected. Future variants will not
+  break it again.
+
+### Added
+- **A node can stop trusting a root key.** `DisabledRoots` is a file of root keys, one `bf01` key per
+  line. `Latch` wraps any `Revocations` store and refuses every cap whose root is on that list. A
+  denylist can only name grants a key has already signed. This list names the key, so it also refuses
+  whatever the key signs later.
+
+  The list only grows. A running process keeps every key it has read, even if the file is rewritten
+  shorter, corrupted, or deleted. A line that is not a key does not hide the keys around it, and
+  `malformed_line` reports it. Nothing in the API removes a key. The limit: a process that starts after
+  both the file and its `.written` witness are gone trusts those roots again. Keep them in a directory
+  only the node's user can write.
+
+### Fixed
+- **A revocation could vanish in a power cut after `revoke` returned.** The file is now flushed to
+  disk before it replaces the old one, and so is its directory. A running denylist no longer swaps its
+  set for an empty file.
+- **A lost or truncated store no longer loads as if nothing were revoked.** Each successful write now
+  records how many entries it left in a `<path>.written` file beside the store. `load` refuses a store
+  that holds fewer, a missing file included, with `Lost`. The error names three ways out:
+  - restore the file;
+  - write everything again, through `FileDenylist::empty` or `DisabledRoots::open_for_repair` (this
+    clears `Lost` only once every missing entry is back);
+  - delete the `.written` file, which accepts the loss.
+
+  Never delete the `.lock` file: writers use it to take turns. A store last written by an earlier
+  version has no `.written` file, and gets this protection from its next write.
+
+### Changed
+- **The authority-bound check now asks the revocation store about the foreign badge too.** Before,
+  it asked only about the slip. With `Latch`, disabling a foreign authority's root refuses all of that
+  authority's devices at once. A store keyed on revocation ids is unaffected. A custom store now sees
+  foreign badges, and refusing one can only deny, never admit.
+
 ## v0.4.0
 
 A token should not be able to name its own cost.

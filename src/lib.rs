@@ -46,12 +46,15 @@
 //! - **The secret stays secret AND never signs hostile bytes.** [`Identity::sign_document`] domain-separates
 //!   its signatures so a document signature can never be reused as a biscuit block signature.
 //! - **The revocation store is DURABLE and never reset-to-empty.** A restart on ephemeral storage
-//!   resurrects every revoked cap (an absent [`FileDenylist`] file is an empty set). A monotone high-water
-//!   mark is out of scope; durable storage is the precondition.
+//!   resurrects every revoked cap (an absent [`FileDenylist`] file is an empty set) and re-trusts every
+//!   disabled root (so is an absent [`DisabledRoots`] file). A monotone high-water mark is out of scope;
+//!   durable storage is the precondition.
 //! - **The local clock is roughly right, or expiries are short.** Expiry is checked against the local clock;
 //!   a badly-wrong clock widens or voids a grant's window.
 
 mod cap;
+#[cfg(feature = "tokio-fs")]
+mod disabled_roots;
 mod gate;
 mod key;
 mod link;
@@ -62,6 +65,9 @@ mod signed;
 #[cfg(test)]
 mod cap_tests;
 #[cfg(test)]
+#[cfg(feature = "tokio-fs")]
+mod disabled_roots_tests;
+#[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
 mod link_tests;
@@ -71,6 +77,8 @@ mod revocations_tests;
 mod signed_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
+#[cfg(feature = "tokio-fs")]
+pub use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
 pub use crate::gate::{Admission, Admitted, Decision, Gate, Origin, ProvenPeer, Refusal};
 pub use crate::key::{KeyParseError, VerifyKey};
 pub use crate::link::Link;
