@@ -13,10 +13,10 @@
 //! feature), a persisted set of ids on disk.
 //!
 //! Revocation through [`FileDenylist`] is LIVE: [`is_revoked`](FileDenylist::is_revoked) re-reads the file
-//! when its `(mtime, len)` stamp changes, so a revocation written by a separate process takes effect on
-//! the next connection to a long-running issuer; it does not wait for a restart. The length rides with
-//! the mtime on purpose: a revoke only ever grows the file, so a change within one coarse mtime tick is
-//! still seen. The reload is a small, rare read (only when the file actually changed), guarded by
+//! when its [`FileStamp`](crate::FileStamp) changes, so a revocation written by a separate process takes effect on
+//! the next connection to a long-running issuer; it does not wait for a restart. The stamp carries the
+//! length with the mtime on purpose: a revoke only ever grows the file, so a change within one coarse
+//! mtime tick is still seen. The reload is a small, rare read (only when the file actually changed), guarded by
 //! interior mutability so the gate's synchronous admit path stays synchronous.
 //!
 //! Revocation WRITES are SERIALIZED: [`revoke`](FileDenylist::revoke) takes an exclusive advisory lock on a
@@ -29,8 +29,6 @@
 #[cfg(feature = "tokio-fs")]
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "tokio-fs")]
-use core::time::Duration;
-#[cfg(feature = "tokio-fs")]
 use std::collections::HashSet;
 #[cfg(all(feature = "tokio-fs", unix))]
 use std::os::fd::AsRawFd as _;
@@ -42,13 +40,15 @@ use std::sync::Arc;
 #[cfg(feature = "tokio-fs")]
 use std::sync::{Mutex, PoisonError};
 #[cfg(feature = "tokio-fs")]
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use data_encoding::HEXLOWER;
 #[cfg(feature = "tokio-fs")]
 use tokio::io::AsyncRead as _;
 
 use crate::cap::Cap;
+#[cfg(feature = "tokio-fs")]
+use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 
 /// The revocation oracle a [`Gate::Rooted`](crate::Gate::Rooted) consults on the admit hot path.
 ///
@@ -123,7 +123,7 @@ pub struct RevocationIdParseError;
 ///
 /// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
 /// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the
-/// `(mtime, len)` stamp it was read at, so a check can refresh it in place when the file changed
+/// [`FileStamp`](crate::FileStamp) it was read at, so a check can refresh it in place when the file changed
 /// underneath a running process.
 ///
 /// CONCURRENT REVOCATIONS SURVIVE. A write locks a sibling `<path>.lock` file, re-reads the on-disk set
@@ -141,24 +141,16 @@ pub struct FileDenylist {
     state: Mutex<State>,
 }
 
-/// The loaded ids, the `(mtime, len)` stamp of the file they were read at (`None` = the file was absent
-/// when loaded), and the last moment we stat'd the file. The length pairs with mtime so a change within one
+/// The loaded ids, the [`FileStamp`](crate::FileStamp) of the file they were read at (`None` = the file was absent or
+/// reported no stamp), and the last moment we stat'd the file. The length pairs with mtime so a change within one
 /// coarse mtime tick is still seen: a revoke only ever GROWS the file, so a differing length is a reliable
 /// "changed" signal on its own.
 #[cfg(feature = "tokio-fs")]
 struct State {
     ids: HashSet<RevocationId>,
-    stamp: Option<Stamp>,
+    stamp: Option<FileStamp>,
     last_stat: Option<Instant>,
 }
-
-/// The admit hot path calls [`is_revoked`](FileDenylist::is_revoked) once per connection, but a revocation
-/// written by another process only needs to be seen within a short window. So the refresh stats the file at
-/// most once per this interval rather than on every admit under the lock; a revocation goes live within one
-/// interval, which is well inside "the next connection" the doc promises. `pub(crate)` so a timing-sensitive
-/// test can wait past it deterministically.
-#[cfg(feature = "tokio-fs")]
-pub(crate) const STAT_DEBOUNCE: Duration = Duration::from_millis(100);
 
 #[cfg(feature = "tokio-fs")]
 impl FileDenylist {
@@ -204,7 +196,7 @@ impl FileDenylist {
         ids.into_iter().any(|id| state.ids.contains(id))
     }
 
-    /// Reload the ids in place if the backing file's `(mtime, len)` stamp differs from what we last read.
+    /// Reload the ids in place if the backing file's [`FileStamp`](crate::FileStamp) differs from what we last read.
     /// Synchronous and on the admit hot path, so it debounces the stat to at most once per
     /// [`STAT_DEBOUNCE`] and re-reads only on change.
     ///
@@ -226,11 +218,11 @@ impl FileDenylist {
         }
         state.last_stat = Some(Instant::now());
         let current = match std::fs::metadata(&self.path) {
-            Ok(meta) => Stamp::of(&meta),
+            Ok(meta) => FileStamp::of(&meta),
             // Missing file: keep the last-known set. If one was ever loaded, this is deletion, not empty.
             Err(_) => return,
         };
-        if current == state.stamp {
+        if FileStamp::unchanged(state.stamp, current) {
             return;
         }
         let ids = match std::fs::read_to_string(&self.path) {
@@ -352,7 +344,7 @@ impl FileDenylist {
     /// local users; the lock and temp are created owner-only too.
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
-    fn persist(&self) -> Result<Option<Stamp>, DenylistError> {
+    fn persist(&self) -> Result<Option<FileStamp>, DenylistError> {
         // Held across the WHOLE read-merge-write: the re-read must see every id another writer already
         // persisted, and no other writer may slip a rename in before ours. Dropping the guard releases it,
         // so a crash never strands the lock.
@@ -558,7 +550,7 @@ pub(crate) fn write_atomically(
     path: &Path,
     body: &[u8],
     entries: usize,
-) -> std::io::Result<Option<Stamp>> {
+) -> std::io::Result<Option<FileStamp>> {
     let stamp = replace_durably(path, body)?;
     raise_witness(path, entries)?;
     Ok(stamp)
@@ -566,7 +558,7 @@ pub(crate) fn write_atomically(
 
 /// The one place a file is renamed into place: temp sibling, `fsync`, rename, parent `fsync`.
 #[cfg(feature = "tokio-fs")]
-fn replace_durably(path: &Path, body: &[u8]) -> std::io::Result<Option<Stamp>> {
+fn replace_durably(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
     let tmp = temp_path(path);
     let written = write_body(&tmp, body).and_then(|stamp| {
         std::fs::rename(&tmp, path)?;
@@ -583,7 +575,7 @@ fn replace_durably(path: &Path, body: &[u8]) -> std::io::Result<Option<Stamp>> {
 /// Write `body` through a fresh temp sibling, owner-only (unix) before the first byte lands, and return the
 /// stamp of the bytes written. The rename carries the `0600` mode onto the target.
 #[cfg(feature = "tokio-fs")]
-fn write_body(path: &Path, body: &[u8]) -> std::io::Result<Option<Stamp>> {
+fn write_body(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
     let mut file = open_tmp(path)?;
     #[cfg(unix)]
     {
@@ -677,43 +669,6 @@ pub(crate) fn check_witness(path: &Path, found: usize) -> Result<(), WitnessErro
     }
 }
 
-/// One generation of a store file as a stat sees it. A refresh re-reads only when this changes.
-///
-/// The length rides with the mtime so a change inside one coarse mtime tick is still seen when it grows
-/// the file. On unix the inode and ctime ride too: every writer here renames a new inode into place, so a
-/// same-length replacement is seen however coarse the clock, and an `mtime` set back by hand still moves
-/// the ctime. What stays invisible is an in-place rewrite to the same length inside one tick of a coarse
-/// filesystem, which no writer in this crate performs.
-#[cfg(feature = "tokio-fs")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stamp {
-    mtime: SystemTime,
-    pub(crate) len: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(unix)]
-    ctime: (i64, i64),
-}
-
-#[cfg(feature = "tokio-fs")]
-impl Stamp {
-    /// The stamp of `meta`, or `None` when the platform will not report an mtime, so the next refresh
-    /// re-reads rather than trusting a stamp it never had.
-    pub(crate) fn of(meta: &std::fs::Metadata) -> Option<Self> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-
-        Some(Self {
-            mtime: meta.modified().ok()?,
-            len: meta.len(),
-            #[cfg(unix)]
-            ino: meta.ino(),
-            #[cfg(unix)]
-            ctime: (meta.ctime(), meta.ctime_nsec()),
-        })
-    }
-}
-
 /// Write `body` to ONE already-open handle, `fsync` it, and return that handle's stamp. The single
 /// handle is the invariant: the stamp names the same inode the bytes went to, so a writer that replaces the
 /// target path can never pair these bytes with the replacement's freshness and make the next refresh skip
@@ -724,7 +679,7 @@ impl Stamp {
 pub(crate) fn write_and_stamp(
     file: &mut std::fs::File,
     body: &[u8],
-) -> std::io::Result<Option<Stamp>> {
+) -> std::io::Result<Option<FileStamp>> {
     use std::io::Write as _;
 
     file.write_all(body)?;
@@ -738,11 +693,8 @@ pub(crate) fn write_and_stamp(
     let stamp = file
         .metadata()
         .ok()
-        .and_then(|meta| Stamp::of(&meta))
-        .map(|stamp| Stamp {
-            len: written,
-            ..stamp
-        });
+        .and_then(|meta| FileStamp::of(&meta))
+        .map(|stamp| stamp.with_len(written));
     Ok(stamp)
 }
 
@@ -751,7 +703,9 @@ pub(crate) fn write_and_stamp(
 // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
 #[cfg(feature = "tokio-fs")]
 #[allow(clippy::std_instead_of_core)]
-async fn read_ids(path: &Path) -> Result<(HashSet<RevocationId>, Option<Stamp>), DenylistError> {
+async fn read_ids(
+    path: &Path,
+) -> Result<(HashSet<RevocationId>, Option<FileStamp>), DenylistError> {
     // Open ONCE and take both the ids and the stamp from that handle (`read_ids_from`). Reading the path
     // and then stat-ing the path again is the defect this closes: a writer that replaces the file between
     // the two calls made the old ids wear the new file's stamp, so every later refresh saw the
@@ -781,13 +735,17 @@ async fn read_ids(path: &Path) -> Result<(HashSet<RevocationId>, Option<Stamp>),
 #[cfg(feature = "tokio-fs")]
 pub(crate) async fn read_ids_from(
     file: &mut tokio::fs::File,
-) -> Result<(HashSet<RevocationId>, Option<Stamp>), DenylistError> {
+) -> Result<(HashSet<RevocationId>, Option<FileStamp>), DenylistError> {
     // Unbounded, as the denylist has always been: an issuer's own revocations are its to grow.
     let text = read_to_string(file, u64::MAX)
         .await
         .map_err(DenylistError::Io)?;
     let ids = parse_ids(&text)?;
-    let stamp = file.metadata().await.ok().and_then(|meta| Stamp::of(&meta));
+    let stamp = file
+        .metadata()
+        .await
+        .ok()
+        .and_then(|meta| FileStamp::of(&meta));
     Ok((ids, stamp))
 }
 

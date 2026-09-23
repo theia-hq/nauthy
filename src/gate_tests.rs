@@ -4,12 +4,12 @@ use core::time::Duration;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::VerifyKey;
 use crate::cap::{Cap, CapError, Identity, Request};
 use crate::disabled_roots::{DisabledRoots, Latch};
 use crate::gate::{Admission, Checked, Decision, Gate, Origin, ProvenPeer, Refusal};
-use crate::revocations::{FileDenylist, STAT_DEBOUNCE};
+use crate::revocations::FileDenylist;
 use crate::service::Service;
+use crate::{STAT_DEBOUNCE, VerifyKey};
 
 fn identity(seed: u8) -> Identity {
     Identity::from_secret(&[seed; 32]).expect("valid ed25519 secret")
