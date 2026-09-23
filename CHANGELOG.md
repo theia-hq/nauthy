@@ -2,6 +2,43 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.7.0
+
+### Breaking
+- **`Gate` has a new variant, `Anchored`.** `Gate` is not `#[non_exhaustive]`, so a `match` on it
+  without a wildcard arm no longer compiles. Add an arm for `Gate::Anchored`. Code that only builds a
+  gate and calls its methods is unaffected.
+
+### Added
+- **A machine can trust its own key for the service grants it issued.** `Gate::anchored` takes four
+  things: a `PinSource`, the machine's own key, a revocation store, and an `IssuedIds` record.
+  - The pin is read on every admission, so a root written while the gate serves is trusted at the next
+    connection. A token rooted at the pin is ruled exactly as `Gate::rooted` rules. With no pin, no
+    token admits a member.
+  - A token rooted at the own key is admitted only as a service slip, and only when `IssuedIds` holds
+    its root revocation id. Record that id when you mint. A copy of the key mints slips with fresh ids,
+    so it cannot mint access. A membership badge the own key signed is refused, even one narrowed to a
+    single service, and so is a fleet slip that names the own key as its authority.
+  - A pin equal to the own key is no pin.
+
+  Its admissions carry `Origin::Rooted`, and one made under the own key is never a member.
+  `PinSource` is implemented for `Arc<P>`. `Gate::wants_capability` answers `true` for an anchored gate.
+- **A revocation store can revoke a device's key.** `Revocations::is_revoked_peer` is asked about the
+  transport-proven peer before any token is read. A `true` refuses that device whatever it presents,
+  including a token minted for it later. It has a default that answers `false`, so an existing store
+  keeps its behavior. `Latch` and the `Arc` impl pass the question to the store they wrap. A wrapper of
+  your own must do the same, or it answers `false`.
+- **`FileStamp` and `STAT_DEBOUNCE` are public**, for a store of your own that reloads a file another
+  process writes. `FileStamp::of` stamps a file's metadata (length, mtime and, on unix, inode and
+  ctime). `FileStamp::unchanged` compares two stamps. Stat at most once per `STAT_DEBOUNCE`. Both build
+  without the `tokio-fs` feature.
+
+### Fixed
+- **A file whose platform reports no mtime is now re-read.** `FileDenylist` and `DisabledRoots` held
+  no stamp for such a file and compared a missing stamp to a missing stamp as "unchanged", so a
+  revocation or a disabled root written by another process was never seen. A missing stamp now always
+  means "re-read". A missing or unreadable file still keeps the last set read.
+
 ## v0.6.0
 
 ### Added
