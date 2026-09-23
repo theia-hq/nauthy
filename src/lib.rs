@@ -6,11 +6,14 @@
 //! identity is permitted. nauthy sits above the transport and never reaches out itself, so it is usable
 //! wherever a peer can be named by an ed25519 key.
 //!
-//! Two policies:
+//! Three policies:
 //! - [`Gate::Open`] permits any peer.
 //! - [`Gate::Rooted`] permits a peer that *presents a signed token* ([`Cap`]) rooted at a trusted authority
 //!   (a [`VerifyKey`] you own). One key you own authorizes both your own devices and anyone you delegate to,
 //!   offline and revocably: the thing `authorized_keys` cannot do.
+//! - [`Gate::Anchored`] permits what a rooted gate permits under a pin it reads live ([`PinSource`]), plus
+//!   the service slips this machine's own key signed and recorded ([`IssuedIds`]). The own key never makes a
+//!   member.
 //!
 //! One authority signs four grant shapes, verified offline against it:
 //! - a **membership badge** ([`Identity::mint_member`]): whole-node admission, bound to one device;
@@ -82,7 +85,9 @@ mod stamp_tests;
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
 #[cfg(feature = "tokio-fs")]
 pub use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
-pub use crate::gate::{Admission, Admitted, Decision, Gate, Origin, ProvenPeer, Refusal};
+pub use crate::gate::{
+    Admission, Admitted, Anchor, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
+};
 pub use crate::key::{KeyParseError, VerifyKey};
 pub use crate::link::Link;
 #[cfg(feature = "tokio-fs")]

@@ -1,9 +1,10 @@
 //! The authorization gate: the policy that decides whether a proven peer may connect.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::cap::{Cap, CapError, Request};
-use crate::revocations::Revocations;
+use crate::revocations::{RevocationId, Revocations};
 use crate::{Service, VerifyKey};
 
 /// An authorization policy over proven peer identities.
@@ -21,6 +22,9 @@ use crate::{Service, VerifyKey};
 ///   key you own, not a list of keys to keep in sync, which is why there is no allowlist gate. An
 ///   authority-rooted membership badge IS the allowlist, and a better one: delegatable, attenuable,
 ///   revocable, no sync.
+/// - [`Gate::Anchored`] trusts two authorities: a pin it reads afresh on every admission, ruled exactly as
+///   a rooted gate rules on its authority, and this machine's own key, which admits only the service slips
+///   this machine recorded issuing and never a member. A machine with no pin admits no member at all.
 pub enum Gate {
     /// Admit any peer.
     Open,
@@ -34,6 +38,52 @@ pub enum Gate {
     /// parameter to thread. The box is `Send + Sync` so a `Gate` can be shared across async tasks (a server
     /// hands one gate to every connection); a custom [`Revocations`] impl stored in a gate must be too.
     Rooted(VerifyKey, Box<dyn Revocations + Send + Sync>),
+    /// Admit a peer that presents a token rooted at the pin the [`Anchor`] reads now, ruled as
+    /// [`Rooted`](Gate::Rooted) rules, or a service slip rooted at this machine's own key that this machine
+    /// recorded issuing. Built only by [`Gate::anchored`].
+    Anchored(Anchor),
+}
+
+/// Where an anchored gate reads its pin: the root key it trusts for membership and delegated slips.
+///
+/// Asked on EVERY admission, never once at construction, so a pin written while the gate is serving is
+/// trusted at the next connection with no restart. An impl that reads a file must read it fail-closed: a pin
+/// it cannot read is `None`, which admits no member, never a pin kept from an earlier read that may since
+/// have been replaced. A pin equal to the gate's own key is no pin (see [`Gate::anchored`]).
+pub trait PinSource: Send + Sync {
+    /// The pinned root key as it stands now, or `None` when this machine trusts no root.
+    fn current(&self) -> Option<VerifyKey>;
+}
+
+/// A shared source answers as the source it shares, so one instance can back the gate and any other reader
+/// that must agree with it on the pin.
+impl<P: PinSource + ?Sized> PinSource for Arc<P> {
+    fn current(&self) -> Option<VerifyKey> {
+        P::current(self)
+    }
+}
+
+/// The ids this machine recorded when it signed a service slip with its own key.
+///
+/// An anchored gate admits a slip rooted at its own key only when the slip's
+/// [`root_revocation_id`](Cap::root_revocation_id) is here. A copy of the key mints slips whose ids were
+/// never recorded, since every mint yields a fresh id even for the same service and lifetime, so a stolen
+/// key cannot mint access to this machine. An impl that cannot read its record must answer `false`.
+pub trait IssuedIds: Send + Sync {
+    /// Whether this machine recorded issuing the slip whose root revocation id is `id`.
+    fn is_issued(&self, id: &RevocationId) -> bool;
+}
+
+/// What an [`Anchored`](Gate::Anchored) gate trusts: a live pin, this machine's own key, the revocation
+/// store, and the record of slips the own key issued.
+///
+/// The fields are private and [`Gate::anchored`] is the only way to build one, so every anchored gate
+/// carries all four and none can be swapped out after the fact.
+pub struct Anchor {
+    root: Box<dyn PinSource>,
+    own: VerifyKey,
+    revocations: Box<dyn Revocations + Send + Sync>,
+    issued: Box<dyn IssuedIds>,
 }
 
 impl Gate {
@@ -50,6 +100,29 @@ impl Gate {
         revocations: impl Revocations + Send + Sync + 'static,
     ) -> Gate {
         Gate::Rooted(authority, Box::new(revocations))
+    }
+
+    /// Build an [`Anchored`](Gate::Anchored) gate: `root` names the pin, read on every admission; `own` is
+    /// this machine's own key; `revocations` recalls tokens and device keys on both paths; `issued` is the
+    /// record of slips `own` signed.
+    ///
+    /// A token rooted at the pin is ruled exactly as a [`Rooted`](Gate::Rooted) gate rules on its authority.
+    /// A token rooted at `own` is admitted only as a service slip: a membership badge `own` signed is
+    /// refused, since a machine's own key may not make members, and a slip is admitted only when `issued`
+    /// holds its root revocation id. A pin equal to `own` anchors nothing, so a source that reports this
+    /// machine's own key cannot turn the own key into a root.
+    pub fn anchored(
+        root: impl PinSource + 'static,
+        own: VerifyKey,
+        revocations: impl Revocations + Send + Sync + 'static,
+        issued: impl IssuedIds + 'static,
+    ) -> Gate {
+        Gate::Anchored(Anchor {
+            root: Box::new(root),
+            own,
+            revocations: Box::new(revocations),
+            issued: Box::new(issued),
+        })
     }
 
     /// Decide whether a peer presenting an optional capability may reach `service`.
@@ -70,6 +143,10 @@ impl Gate {
             Gate::Rooted(root, revocations) => {
                 admit_plain(*root, revocations.as_ref(), presented, service, peer.key())
             }
+            Gate::Anchored(anchor) => match anchor.admit(presented, service, peer.key()) {
+                Ok(_) => Decision::Admit,
+                Err(refusal) => Decision::Refuse(refusal),
+            },
         }
     }
 
@@ -106,13 +183,22 @@ impl Gate {
                 service,
                 peer.key(),
             ),
+            Gate::Anchored(anchor) => anchor.admit_foreign(slip, badge, service, peer.key()),
         }
     }
 
-    /// Whether this gate decides on a presented token rather than the dialer's identity alone. The connect
-    /// path presents a token only for a [`Rooted`](Gate::Rooted) gate, so `false` means "no token required".
+    /// Whether this gate decides on a presented token rather than the dialer's identity alone. `false` means
+    /// "no token required", so a caller may skip proving the peer and presenting a token. A
+    /// [`Rooted`](Gate::Rooted) and an [`Anchored`](Gate::Anchored) gate both rule on tokens bound to a
+    /// proven peer, so both answer `true`, and a caller that records admissions to cut them on a later
+    /// revocation records theirs.
     pub fn wants_capability(&self) -> bool {
-        matches!(self, Gate::Rooted(..))
+        // Exhaustive, with no wildcard: a new variant fails to compile here until someone decides whether
+        // it rules on tokens, rather than inheriting "no token required" and switching off peer proof.
+        match self {
+            Gate::Open => false,
+            Gate::Rooted(..) | Gate::Anchored(..) => true,
+        }
     }
 
     /// Like [`admit`](Gate::admit) but yields an [`Admitted`] witness on success. The witness has no
@@ -141,23 +227,28 @@ impl Gate {
             // `is_member` is checked first, so a badge is `Member` even where it would also grant.
             Gate::Rooted(root, revocations) => {
                 match admit_plain(*root, revocations.as_ref(), presented, service, peer.key()) {
-                    Decision::Admit => {
-                        // Fail-closed on anything but a plain grant: an undecided re-read is not proof of
-                        // membership, so the witness is a per-service `Slip`, never an owner device.
-                        let kind = match presented {
-                            Some(cap) if membership(cap, *root, peer.key()).grants() => {
-                                Admission::Member
-                            }
-                            _ => Admission::Slip,
-                        };
-                        Ok(Admitted {
-                            peer: peer.key(),
-                            kind,
-                            origin: Origin::Rooted,
-                        })
-                    }
+                    Decision::Admit => Ok(Admitted {
+                        peer: peer.key(),
+                        kind: admitted_kind(presented, *root, peer.key()),
+                        origin: Origin::Rooted,
+                    }),
                     Decision::Refuse(refusal) => Err(refusal),
                 }
+            }
+            // A token rooted at the pin reads its kind exactly as a rooted gate does. One rooted at the own
+            // key is a `Slip` and never a `Member`: the own-key path never admits a membership badge, so
+            // nothing it admitted may pass an owner-only check. Both are `Rooted` in origin, since each
+            // verified against one of the gate's own authorities.
+            Gate::Anchored(anchor) => {
+                let kind = match anchor.admit(presented, service, peer.key())? {
+                    Authority::Pin(pin) => admitted_kind(presented, pin, peer.key()),
+                    Authority::Own => Admission::Slip,
+                };
+                Ok(Admitted {
+                    peer: peer.key(),
+                    kind,
+                    origin: Origin::Rooted,
+                })
             }
         }
     }
@@ -196,7 +287,152 @@ impl Gate {
                     Decision::Refuse(refusal) => Err(refusal),
                 }
             }
+            Gate::Anchored(anchor) => {
+                match anchor.admit_foreign(slip, badge, service, peer.key()) {
+                    Decision::Admit => Ok(Admitted {
+                        peer: peer.key(),
+                        kind: Admission::Slip,
+                        origin: Origin::Rooted,
+                    }),
+                    Decision::Refuse(refusal) => Err(refusal),
+                }
+            }
         }
+    }
+}
+
+/// Which of an anchored gate's two authorities a token roots at.
+#[derive(Clone, Copy)]
+enum Authority {
+    /// The pin, as the gate read it for this admission.
+    Pin(VerifyKey),
+    /// This machine's own key.
+    Own,
+}
+
+impl Anchor {
+    /// The pin as it stands now. A pin equal to the own key is no pin: the own key's tokens are ruled only on
+    /// the own-key path, whatever the source reports.
+    fn pin(&self) -> Option<VerifyKey> {
+        self.root.current().filter(|pin| *pin != self.own)
+    }
+
+    /// Which authority `cap` roots at, against the pin read now, or `None` for a token rooted at neither.
+    ///
+    /// The pin is asked first. Since [`pin`](Self::pin) is never the own key, the two answers cannot
+    /// overlap, and a pin that did equal the own key would reach membership only through this order, which
+    /// is why the filter is the guard.
+    fn authority_of(&self, cap: &Cap) -> Option<Authority> {
+        let root = cap.root();
+        if self.pin() == Some(root) {
+            return Some(Authority::Pin(root));
+        }
+        if root == self.own {
+            return Some(Authority::Own);
+        }
+        None
+    }
+
+    /// The plain path on an anchored gate, naming the authority that admitted on success.
+    fn admit(
+        &self,
+        presented: Option<&Cap>,
+        service: &Service,
+        peer: VerifyKey,
+    ) -> Result<Authority, Refusal> {
+        let revocations = self.revocations.as_ref();
+        if revocations.is_revoked_peer(&peer) {
+            return Err(Refusal::Revoked);
+        }
+        let Some(cap) = presented else {
+            return Err(Refusal::Missing);
+        };
+        let Some(authority) = self.authority_of(cap) else {
+            return Err(Refusal::NotGranted);
+        };
+        let decision = match authority {
+            Authority::Pin(pin) => admit_token(pin, revocations, cap, service, peer),
+            Authority::Own => self.admit_own(cap, service, peer),
+        };
+        match decision {
+            Decision::Admit => Ok(authority),
+            Decision::Refuse(refusal) => Err(refusal),
+        }
+    }
+
+    /// A token rooted at this machine's own key, on the plain path: never a member, a slip for `service`,
+    /// unrevoked on both reads, and recorded as issued.
+    fn admit_own(&self, cap: &Cap, service: &Service, peer: VerifyKey) -> Decision {
+        let revocations = self.revocations.as_ref();
+        // The first read, before any datalog, for the reason `admit_plain` gives.
+        if revocations.is_revoked(cap) {
+            return Decision::Refuse(Refusal::Revoked);
+        }
+        if let Err(refusal) = membership(cap, self.own, peer).refuse_member() {
+            return Decision::Refuse(refusal);
+        }
+        match grant(cap, self.own, service, peer).decide(revocations, cap) {
+            Decision::Admit => self.recorded(cap),
+            refused => refused,
+        }
+    }
+
+    /// The two-token path on an anchored gate. A slip rooted at the pin is ruled as a rooted gate rules it.
+    /// A slip rooted at the own key must also be no member, may not name the own key as its authority, and
+    /// must be recorded as issued.
+    fn admit_foreign(
+        &self,
+        slip: &Cap,
+        badge: &Cap,
+        service: &Service,
+        peer: VerifyKey,
+    ) -> Decision {
+        let revocations = self.revocations.as_ref();
+        if pair_is_revoked(revocations, peer, slip, badge) {
+            return Decision::Refuse(Refusal::Revoked);
+        }
+        match self.authority_of(slip) {
+            Some(Authority::Pin(pin)) => {
+                verify_pair(pin, revocations, slip, badge, service, peer, None)
+            }
+            Some(Authority::Own) => {
+                if let Err(refusal) = membership(slip, self.own, peer).refuse_member() {
+                    return Decision::Refuse(refusal);
+                }
+                // The own key as the slip's authority would let anyone holding a copy of it badge any key
+                // they like into the fleet the slip names, so it is refused before the badge is read.
+                match verify_pair(
+                    self.own,
+                    revocations,
+                    slip,
+                    badge,
+                    service,
+                    peer,
+                    Some(self.own),
+                ) {
+                    Decision::Admit => self.recorded(slip),
+                    refused => refused,
+                }
+            }
+            None => Decision::Refuse(Refusal::NotGranted),
+        }
+    }
+
+    /// Admit `cap` only if this machine recorded issuing it.
+    fn recorded(&self, cap: &Cap) -> Decision {
+        if is_recorded(self.issued.as_ref(), cap.root_revocation_id()) {
+            return Decision::Admit;
+        }
+        Decision::Refuse(Refusal::NotGranted)
+    }
+}
+
+/// Whether a token with root revocation id `root_id` is in `issued`. A token with no root id was never
+/// recorded, since there is nothing to record it by, so it is never issued.
+pub(crate) fn is_recorded(issued: &dyn IssuedIds, root_id: Option<RevocationId>) -> bool {
+    match root_id {
+        Some(id) => issued.is_issued(&id),
+        None => false,
     }
 }
 
@@ -256,7 +492,7 @@ impl ProvenPeer {
 pub struct Admitted {
     peer: VerifyKey,
     kind: Admission,
-    /// How this witness was minted: a rooted token ruling or an open-gate admit. Module-private: the four
+    /// How this witness was minted: a rooted token ruling or an open-gate admit. Module-private: the
     /// mints in this file are the only writers, and [`admitted`](Admitted::origin) is the only reader.
     origin: Origin,
 }
@@ -276,8 +512,9 @@ impl Admitted {
     }
 
     /// How this peer was admitted: under a ROOTED token ruling or an [`Open`](Origin::Open) gate. Exposed as
-    /// the enum, never a bool, so a future origin (a second rooted authority kind) breaks every match site
-    /// and forces a decision there instead of silently reading as one of these two. A downstream `Never`
+    /// the enum, never a bool, so a future origin breaks every match site and forces a decision there
+    /// instead of silently reading as one of these two. An anchored gate's own-key admissions are `Rooted`;
+    /// the authority that signed a slip is not an origin. A downstream `Never`
     /// ceiling reads this and refuses everything that is not [`Rooted`](Origin::Rooted) (fail-closed).
     pub fn origin(&self) -> Origin {
         self.origin
@@ -299,15 +536,17 @@ impl Admitted {
 /// The distinction is a downstream handler's safety precondition, not an admission decision: an engine whose
 /// safety rests on a root-verified peer (a keyless shell) must refuse an open-minted witness even when its
 /// route reached the engine, so the origin travels ON the witness rather than in a side channel. It is a
-/// plain tag (no data), and it is exposed as the enum so a future variant (a second rooted authority kind, a
-/// paired-device origin) forces every match site to decide rather than defaulting into one of these two.
+/// plain tag (no data), and it is exposed as the enum so a future variant (a paired-device origin) forces
+/// every match site to decide rather than defaulting into one of these two. An anchored gate's own-key
+/// admissions are `Rooted`; the authority that signed a slip is not an origin.
 ///
 /// [`Open`](Origin::Open) is the fail-closed read for anything keyless: nothing about the peer was verified,
 /// so only a handler that would serve an unauthenticated stranger may accept it.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Origin {
     /// Admitted after a token rooted at the gate's authority verified (a membership badge or a delegated
-    /// service slip), or through the two-token foreign-authority AND.
+    /// service slip), or through the two-token foreign-authority AND. The gate's authority is its pin or, on
+    /// an anchored gate, its own key.
     Rooted,
     /// Admitted by an [`Open`](Gate::Open) gate: no token was presented or verified, so nothing about the
     /// peer is proven.
@@ -363,6 +602,19 @@ fn admit_plain(
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
+    admit_token(root, revocations, cap, service, peer)
+}
+
+/// One presented token on the plain path, rooted at `root`: the rooted gate's ruling once the peer's own key
+/// and the presence of a token are settled. An anchored gate rules on a token rooted at its pin through this
+/// same function.
+fn admit_token(
+    root: VerifyKey,
+    revocations: &dyn Revocations,
+    cap: &Cap,
+    service: &Service,
+    peer: VerifyKey,
+) -> Decision {
     // Revocation FIRST, before any datalog runs. It is a pure offline read of the token's own block
     // signatures plus a set lookup ([`Cap::revocation_ids`]), and it is INDEPENDENT of whether the token
     // grants, so asking it earlier only decides sooner: a revoked token is refused either way, and a token
@@ -394,14 +646,39 @@ fn admit_authority_bound(
     // root keys refuse `X`'s devices here. `Cap::parse` authenticated the badge's root, so it cannot be
     // claimed. See `revoked_or_admit` for which powers this does and does not give the node. The peer's own
     // key is asked before either token, as on the plain path.
-    if revocations.is_revoked_peer(&peer)
-        || revocations.is_revoked(slip)
-        || revocations.is_revoked(badge)
-    {
+    if pair_is_revoked(revocations, peer, slip, badge) {
         return Decision::Refuse(Refusal::Revoked);
     }
+    verify_pair(root, revocations, slip, badge, service, peer, None)
+}
+
+/// The first revocation read on the two-token path: the peer's own key, then both tokens.
+fn pair_is_revoked(
+    revocations: &dyn Revocations,
+    peer: VerifyKey,
+    slip: &Cap,
+    badge: &Cap,
+) -> bool {
+    revocations.is_revoked_peer(&peer)
+        || revocations.is_revoked(slip)
+        || revocations.is_revoked(badge)
+}
+
+/// The two-token AND once the first read has passed: the slip at `root` names `X`, the badge proves the
+/// peer a member under `X`, and the second read finds neither token recalled. `refused_authority` is an `X`
+/// this gate never accepts from a slip, refused before the badge is read.
+fn verify_pair(
+    root: VerifyKey,
+    revocations: &dyn Revocations,
+    slip: &Cap,
+    badge: &Cap,
+    service: &Service,
+    peer: VerifyKey,
+    refused_authority: Option<VerifyKey>,
+) -> Decision {
     let request = Request::now(Service::clone(service)).bound_to(peer);
     let checked = match slip.verify_authority_bound_at_root_without_revocation(&request, root) {
+        Ok(x) if refused_authority == Some(x) => Checked::NotGranted,
         // `X` is the authority the slip named, fed straight into the badge's root check. There is no path
         // that reads a badge-supplied root: `verify_member_at_root_without_revocation` only compares the
         // badge's own root AGAINST this `x`, so a badge under the wrong root fails `ForeignRoot`. The badge
@@ -453,6 +730,18 @@ fn membership(cap: &Cap, root: VerifyKey, peer: VerifyKey) -> Checked {
     Checked::from(cap.verify_member_at_root_without_revocation(SystemTime::now(), peer, root))
 }
 
+/// The kind an admission on the plain path carries, for a token rooted at `root`: `Member` for a membership
+/// badge, `Slip` otherwise.
+///
+/// Fail-closed on anything but a plain grant: an undecided re-read is not proof of membership, so the
+/// witness is a per-service `Slip`, never an owner device.
+fn admitted_kind(presented: Option<&Cap>, root: VerifyKey, peer: VerifyKey) -> Admission {
+    match presented {
+        Some(cap) if membership(cap, root, peer).grants() => Admission::Member,
+        _ => Admission::Slip,
+    }
+}
+
 /// What the SERVICE question answers for `cap` at `root` and the proven dialer `peer`, evaluated now: it
 /// grants when the cap grants `service`. The `peer` is bound into the request so a device-bound cap admits
 /// only its device; an unbound slip ignores it.
@@ -498,6 +787,17 @@ impl Checked {
     /// decided" are equally not a grant: reading the kind off an admission witness, which fails closed.
     pub(crate) fn grants(self) -> bool {
         matches!(self, Checked::Granted)
+    }
+
+    /// Read as the answer to "is this a member cap", on a path that must never admit one: a member is
+    /// refused as [`NotGranted`](Refusal::NotGranted), an undecided answer is refused as
+    /// [`Undecided`](Refusal::Undecided) rather than passed on, and only a clean "not a member" continues.
+    pub(crate) fn refuse_member(self) -> Result<(), Refusal> {
+        match self {
+            Checked::Granted => Err(Refusal::NotGranted),
+            Checked::NotGranted => Ok(()),
+            Checked::Undecided => Err(Refusal::Undecided),
+        }
     }
 
     /// This answer, or the next question's when this one did not grant. A cap admits on EITHER membership
@@ -587,7 +887,8 @@ impl Decision {
 /// answered. A caller that renders a refusal, to its own logs or to a peer, must keep that split.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// A [`Rooted`](Gate::Rooted) gate required a token and none was presented.
+    /// A [`Rooted`](Gate::Rooted) or [`Anchored`](Gate::Anchored) gate required a token and none was
+    /// presented.
     Missing,
     /// A token was presented but did not grant the request (foreign root, neither membership nor the
     /// requested service, or expired).
