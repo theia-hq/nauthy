@@ -838,6 +838,58 @@ fn a_clock_check_in_a_shape_never_minted_is_unreadable() {
 }
 
 #[test]
+fn a_clock_bound_past_the_clocks_range_is_unreadable_not_a_panic() {
+    // A holder appends the one clock shape nauthy writes, at `Date(u64::MAX)`. The gate admits it (the
+    // root's own check still holds, and this one always passes), so reading its expiry must not panic
+    // on a date `SystemTime` cannot hold: it reads as unreadable, and a caller refuses the stream.
+    let authority = identity(1);
+    let slip = authority
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    let far = slip
+        .attenuate_with_raw_clock_bound(u64::MAX)
+        .expect("append the block");
+    // Round-tripped through its link, the way it arrives off the wire.
+    let far =
+        Cap::parse(&far.link().expect("link").to_string()).expect("the appended cap verifies");
+    assert!(
+        authority.verify(&far, &request("ssh", 0)).is_ok(),
+        "the fixture is a cap the gate admits"
+    );
+    assert!(
+        matches!(far.valid_until(), Err(CapError::UnreadableExpiry)),
+        "a date past the clock's range must read as unreadable"
+    );
+}
+
+#[test]
+fn a_root_signed_date_past_the_clocks_range_is_unreadable_not_a_panic() {
+    // A hostile root signs `expires_at` and its clock check at `Date(u64::MAX)` into a link it hands
+    // out. Displaying that link's expiry, or reading its chain's, must fail closed rather than panic.
+    let far = identity(1)
+        .mint_with_raw_expiry(&service("ssh"), u64::MAX)
+        .expect("mint the hand-signed slip");
+    assert!(
+        matches!(far.expiry(), Err(CapError::UnreadableExpiry)),
+        "a signed expiry past the clock's range must read as unreadable"
+    );
+    assert!(
+        matches!(far.valid_until(), Err(CapError::UnreadableExpiry)),
+        "a root's clock bound past the clock's range must read as unreadable"
+    );
+    // The same hand-signed shape at a date the clock holds reads cleanly both ways, so only the range
+    // made it unreadable.
+    let near = identity(1)
+        .mint_with_raw_expiry(&service("ssh"), 1_700_003_600)
+        .expect("mint the hand-signed slip");
+    assert_eq!(near.expiry().expect("read the expiry"), Some(at(3600)));
+    assert_eq!(
+        near.valid_until().expect("read the chain's expiry"),
+        Some(at(3600))
+    );
+}
+
+#[test]
 fn a_check_of_several_clock_alternatives_ends_at_the_latest() {
     // A check passes when any of its queries does, so of two clock bounds the later one is the check's.
     let slip = identity(1)

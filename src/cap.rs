@@ -534,16 +534,22 @@ impl Cap {
     /// `None` means the token carries no such fact (a cap minted before the fact existed, whose expiry
     /// lives only in its check), NOT that it never expires: a surface renders that as unknown. Reading a
     /// fact evaluates no check, so a DEAD cap still reports when it died, which is exactly when its holder
-    /// needs to be told.
+    /// needs to be told. A signed date past what `SystemTime` can hold is
+    /// [`UnreadableExpiry`](CapError::UnreadableExpiry), never a panic.
     pub fn expiry(&self) -> Result<Option<SystemTime>, CapError> {
         // Built through the budgeted path, not `Biscuit::authorizer`: a query runs the same datalog engine
         // under the same limits, so an unbudgeted one here would fail on a busy host exactly as an
         // unbudgeted authorization did. The program is empty: this reads a fact, it rules on nothing.
         let mut authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
-        let rows: Vec<(SystemTime,)> = authorizer
+        // Read as raw seconds, not `SystemTime`: biscuit's conversion panics on a date past the clock's
+        // range, and a hostile ROOT signs whatever `expires_at` it likes into a link it hands out.
+        let rows: Vec<(DateSecs,)> = authorizer
             .query("expiry($t) <- expires_at($t)")
             .map_err(CapError::from_evaluation)?;
-        Ok(rows.into_iter().next().map(|(expiry,)| expiry))
+        rows.into_iter()
+            .next()
+            .map(|(DateSecs(secs),)| date_at(secs).ok_or(CapError::UnreadableExpiry))
+            .transpose()
     }
 
     /// The last instant this cap can grant anything, read from the time checks of EVERY block: the
@@ -561,7 +567,8 @@ impl Cap {
     ///   signed by its root with no expiry at all reads this way.
     /// - `Err(`[`UnreadableExpiry`](CapError::UnreadableExpiry)`)`: some check reads the clock in a shape
     ///   this crate never writes (another comparison, another predicate joined in, an alternative that
-    ///   can pass without the clock, or a `check all` / `reject if`). Its expiry cannot be read, and a
+    ///   can pass without the clock, or a `check all` / `reject if`), or bounds it by a date past what
+    ///   `SystemTime` can hold (biscuit dates are any `u64`). Its expiry cannot be read, and a
     ///   caller treats that as expired. Refusing here rather than guessing is safe for the same reason
     ///   the evaluation-cost whitelist is: this crate authored the grammar, so only a token it could not
     ///   have minted or narrowed is refused. A token too complex to load at all is an error too
@@ -904,6 +911,33 @@ impl Identity {
         })
     }
 
+    /// Test-only: a slip for `service` whose root signed `expires_at` and its clock check at `secs` past
+    /// the epoch, as raw seconds. A mint takes a `SystemTime` and so cannot write a date past the clock's
+    /// range, but a hostile root signs any `u64` date by hand into a link it hands out.
+    pub(crate) fn mint_with_raw_expiry(
+        &self,
+        service: &Service,
+        secs: u64,
+    ) -> Result<Cap, CapError> {
+        let token = Biscuit::builder()
+            .code_with_params(
+                r#"expires_at({expiry}); check if service($s), $s == {service};
+                check if time($t), $t <= {expiry};"#,
+                std::collections::HashMap::from([
+                    ("expiry".to_owned(), Term::Date(secs)),
+                    ("service".to_owned(), Term::Str(service.as_str().to_owned())),
+                ]),
+                std::collections::HashMap::new(),
+            )
+            .map_err(CapError::Mint)?
+            .build(&self.root)
+            .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
     /// Test-only: mint a real authority-bound slip naming `real_root` in the AUTHORITY block, then append a
     /// second `authority_bound(forged_root)` fact in an ATTENUATION block, exactly what an attacker would
     /// attempt to redirect the bound authority to one THEY control.
@@ -938,6 +972,24 @@ impl Cap {
     pub(crate) fn attenuate_with_raw_datalog(&self, source: &str) -> Result<Self, CapError> {
         let block = biscuit_auth::builder::BlockBuilder::new()
             .code(source)
+            .map_err(CapError::Attenuate)?;
+        let token = self.token.append(block).map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
+    }
+
+    /// Test-only: append `check if time($t), $t <= <secs>` with the date as raw seconds, the one clock
+    /// shape this crate writes but at a date a `SystemTime` cannot hold. A holder writes it with biscuit's
+    /// public builder; datalog text cannot, since it spells dates as RFC 3339.
+    pub(crate) fn attenuate_with_raw_clock_bound(&self, secs: u64) -> Result<Self, CapError> {
+        let block = biscuit_auth::builder::BlockBuilder::new()
+            .code_with_params(
+                "check if time($t), $t <= {bound};",
+                std::collections::HashMap::from([("bound".to_owned(), Term::Date(secs))]),
+                std::collections::HashMap::new(),
+            )
             .map_err(CapError::Attenuate)?;
         let token = self.token.append(block).map_err(CapError::Attenuate)?;
         Ok(Self {
@@ -1207,7 +1259,34 @@ fn time_at_most(query: &Rule) -> Option<SystemTime> {
     };
     // The compared variable must be the clock itself: biscuit accepts a comparison over a variable the
     // body never binds, and that one bounds nothing.
-    (bound == compared).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(*secs))
+    // A date the clock cannot hold is unreadable, not a panic: `Term::Date` is any `u64` off the wire, and
+    // one past `SystemTime`'s range would overflow the std `Add`, which panics, on a token the gate admits.
+    (bound == compared).then_some(*secs).and_then(date_at)
+}
+
+/// The instant `secs` seconds past the unix epoch, or `None` when `SystemTime` cannot hold it.
+///
+/// The ONE conversion from a biscuit date to a `SystemTime` in this crate. biscuit's own
+/// `TryFrom<Term> for SystemTime` adds unchecked, and a holder writes any `u64` date into a block, so
+/// every date read off a token comes through here and an out-of-range one fails closed.
+fn date_at(secs: u64) -> Option<SystemTime> {
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
+}
+
+/// A biscuit date as its raw seconds, so a query reads it without biscuit's unchecked conversion.
+struct DateSecs(u64);
+
+impl TryFrom<Term> for DateSecs {
+    type Error = error::Token;
+
+    fn try_from(term: Term) -> Result<Self, Self::Error> {
+        match term {
+            Term::Date(secs) => Ok(Self(secs)),
+            other => Err(error::Token::ConversionError(format!(
+                "expected a date, got {other:?}"
+            ))),
+        }
+    }
 }
 
 /// Why a capability operation failed.
@@ -1296,8 +1375,9 @@ pub enum CapError {
     /// nothing is admitted on an answer that was never computed.
     #[error("capability evaluation ran out of time")]
     Undecided,
-    /// A check reads the clock in a shape this crate never writes, so when the cap stops granting cannot
-    /// be read. From [`Cap::valid_until`], whose callers treat it as already expired.
+    /// A check reads the clock in a shape this crate never writes, or a date the clock cannot hold, so
+    /// when the cap stops granting cannot be read. From [`Cap::valid_until`], whose callers treat it as
+    /// already expired, and from [`Cap::expiry`] for an `expires_at` date past the clock's range.
     #[error("capability expiry cannot be read")]
     UnreadableExpiry,
 }
