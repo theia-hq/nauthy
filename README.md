@@ -147,6 +147,12 @@ live when the file changes, so a revocation written by another process takes eff
 connection without a restart. Revocation does not evict a session already in progress; short expiry backs
 it up.
 
+A store can also revoke a device's key itself. `Revocations::is_revoked_peer` is asked about the
+transport-proven dialer before any token is read, and a `true` refuses that device whatever it presents,
+including a token minted for it later. It defaults to `false`, so a store that keeps only token ids
+needs nothing new. `Latch` and `Arc` pass the question on to the store they wrap; a wrapper of your own
+must do the same, or it answers the default.
+
 A store of your own can reload the same way. `FileStamp::of` takes a file's metadata and returns its
 stamp (length, mtime and, on unix, inode and ctime). Stat at most once per `STAT_DEBOUNCE` and re-read
 when the stamp differs from the one you read at. `of` returns `None` when the platform reports no mtime.
@@ -159,7 +165,7 @@ nauthy is the authorization layer, and no more. Three things are yours:
 
 - **A transport-proven peer.** You call `ProvenPeer::from_handshake` from the code that finished the
   handshake. nauthy consumes the proof; it does not perform the handshake.
-- **A revocation store.** Use the shipped `FileDenylist`, or implement the one-method `Revocations` trait
+- **A revocation store.** Use the shipped `FileDenylist`, or implement the `Revocations` trait (one required method)
   over whatever you keep (a database, Redis, a gossip set). The gate consults it synchronously.
 - **Where secrets come from.** An identity is any 32-byte ed25519 secret. Deriving many device secrets
   from one root seed (so one person's devices share an authority) is your identity layer's job; nauthy

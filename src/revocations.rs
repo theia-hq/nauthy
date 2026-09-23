@@ -46,6 +46,7 @@ use data_encoding::HEXLOWER;
 #[cfg(feature = "tokio-fs")]
 use tokio::io::AsyncRead as _;
 
+use crate::VerifyKey;
 use crate::cap::Cap;
 #[cfg(feature = "tokio-fs")]
 use crate::stamp::{FileStamp, STAT_DEBOUNCE};
@@ -66,6 +67,19 @@ pub trait Revocations {
     /// inherited from the grant it was attenuated from) is recalled, or anything else the store keys on,
     /// such as the cap's [`root`](Cap::root). See [`Cap::revocation_ids`].
     fn is_revoked(&self, cap: &Cap) -> bool;
+
+    /// Whether the proven peer's own key is revoked: a device key recalled as a key, not through any cap
+    /// it carries. A [`Gate::Rooted`](crate::Gate::Rooted) asks this about the transport-proven dialer
+    /// first, before it reads or verifies any presented cap, and refuses a `true` as
+    /// [`Revoked`](crate::Refusal::Revoked), so a revoked device is refused whatever token it presents,
+    /// including one minted for it after the revocation.
+    ///
+    /// Provided, answering `false`: a store that keeps no keys keeps the default. A wrapper that holds a
+    /// store must forward this as well as [`is_revoked`](Self::is_revoked), because a provided method a
+    /// wrapper does not write answers the default, not the inner store.
+    fn is_revoked_peer(&self, _peer: &VerifyKey) -> bool {
+        false
+    }
 }
 
 /// A shared store answers as the store it shares, so one instance can back a gate and any other reader
@@ -73,6 +87,10 @@ pub trait Revocations {
 impl<R: Revocations + ?Sized> Revocations for Arc<R> {
     fn is_revoked(&self, cap: &Cap) -> bool {
         R::is_revoked(self, cap)
+    }
+
+    fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
+        R::is_revoked_peer(self, peer)
     }
 }
 

@@ -59,7 +59,8 @@ impl Gate {
     /// on the presented token, not the dialer (the token, not who carries it, is the authority, but
     /// device-bound so only the named device may present it): it admits a membership badge or a slip for
     /// `service`, rooted at the trusted authority; a missing, non-granting, or revoked token is refused with
-    /// a reason, and a token whose evaluation ran out of time is refused as
+    /// a reason, a peer whose own key the store revokes ([`is_revoked_peer`](Revocations::is_revoked_peer))
+    /// is refused as [`Revoked`](Refusal::Revoked) before any token is read, and a token whose evaluation ran out of time is refused as
     /// [`Undecided`](Refusal::Undecided), which is not an answer about the peer. An authority-bound slip
     /// handed here correctly refuses [`NotGranted`](Refusal::NotGranted) (it is inert alone); the two-token
     /// AND is [`admit_foreign`](Gate::admit_foreign).
@@ -356,6 +357,9 @@ fn admit_plain(
     service: &Service,
     peer: VerifyKey,
 ) -> Decision {
+    if revocations.is_revoked_peer(&peer) {
+        return Decision::Refuse(Refusal::Revoked);
+    }
     let Some(cap) = presented else {
         return Decision::Refuse(Refusal::Missing);
     };
@@ -388,8 +392,12 @@ fn admit_authority_bound(
     // Revocation first, for the reason `admit_plain` gives, and on BOTH tokens. The slip is this node's
     // grant; the badge roots at the foreign `X`, and asking about it is what lets a store that disables
     // root keys refuse `X`'s devices here. `Cap::parse` authenticated the badge's root, so it cannot be
-    // claimed. See `revoked_or_admit` for which powers this does and does not give the node.
-    if revocations.is_revoked(slip) || revocations.is_revoked(badge) {
+    // claimed. See `revoked_or_admit` for which powers this does and does not give the node. The peer's own
+    // key is asked before either token, as on the plain path.
+    if revocations.is_revoked_peer(&peer)
+        || revocations.is_revoked(slip)
+        || revocations.is_revoked(badge)
+    {
         return Decision::Refuse(Refusal::Revoked);
     }
     let request = Request::now(Service::clone(service)).bound_to(peer);
