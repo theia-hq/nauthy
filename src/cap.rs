@@ -36,7 +36,9 @@
 use core::time::Duration;
 use std::time::SystemTime;
 
-use biscuit_auth::builder::{Algorithm, Check, Expression, Op, Rule};
+use biscuit_auth::builder::{
+    Algorithm, Binary, Check, CheckKind, Expression, Op, Predicate, Rule, Term,
+};
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{
     Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, error,
@@ -544,6 +546,41 @@ impl Cap {
         Ok(rows.into_iter().next().map(|(expiry,)| expiry))
     }
 
+    /// The last instant this cap can grant anything, read from the time checks of EVERY block: the
+    /// earliest bound any of them sets, so a holder's narrower attenuation wins over the authority's.
+    ///
+    /// Unlike [`expiry`](Self::expiry), which reads the one fact the authority signed and is only an upper
+    /// bound, this reads what the engine enforces: past the instant returned, at least one check denies,
+    /// so a caller that stops honouring the cap there never ends a grant the gate would still admit. It
+    /// still admits nothing on its own; the checks remain the gate.
+    ///
+    /// Three answers, kept apart by type:
+    /// - `Ok(Some(t))`: every check that reads the clock is `check if time($t), $t <= <date>`, and `t` is
+    ///   the earliest such date. Every mint and [`attenuate`](Self::attenuate) writes exactly that shape.
+    /// - `Ok(None)`: no check in any block reads the clock, so time alone never ends this cap. A token
+    ///   signed by its root with no expiry at all reads this way.
+    /// - `Err(`[`UnreadableExpiry`](CapError::UnreadableExpiry)`)`: some check reads the clock in a shape
+    ///   this crate never writes (another comparison, another predicate joined in, an alternative that
+    ///   can pass without the clock, or a `check all` / `reject if`). Its expiry cannot be read, and a
+    ///   caller treats that as expired. Refusing here rather than guessing is safe for the same reason
+    ///   the evaluation-cost whitelist is: this crate authored the grammar, so only a token it could not
+    ///   have minted or narrowed is refused. A token too complex to load at all is an error too
+    ///   ([`TooComplex`](CapError::TooComplex)), and reads the same way.
+    ///
+    /// A check reads the clock when a query's body names the `time` predicate, the only fact that carries
+    /// the request's clock. Checks that do not (service, device binding, membership) set no bound.
+    pub fn valid_until(&self) -> Result<Option<SystemTime>, CapError> {
+        let authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
+        let (_facts, _rules, checks, _policies) = authorizer.dump();
+        checks.iter().filter_map(clock_bound).try_fold(
+            None,
+            |earliest: Option<SystemTime>, bound| {
+                let bound = bound?;
+                Ok(Some(earliest.map_or(bound, |held| held.min(bound))))
+            },
+        )
+    }
+
     /// Whether this cap is an AUTHORITY-BOUND slip: it carries an `authority_bound` fact in its AUTHORITY
     /// block.
     ///
@@ -851,6 +888,22 @@ impl Identity {
         Ok(Cap { root, token })
     }
 
+    /// Test-only: a slip whose authority signed no expiry at all, neither the fact nor the check. No mint
+    /// here writes one; it is the legitimate "never expires by time" a root may still sign by hand, and
+    /// [`Cap::valid_until`] must tell it apart from an expiry it cannot read.
+    pub(crate) fn mint_without_expiry(&self, service: &Service) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"check if service($s), $s == {service};"#,
+            service = service.as_str(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
     /// Test-only: mint a real authority-bound slip naming `real_root` in the AUTHORITY block, then append a
     /// second `authority_bound(forged_root)` fact in an ATTENUATION block, exactly what an attacker would
     /// attempt to redirect the bound authority to one THEY control.
@@ -1104,6 +1157,59 @@ fn opens_a_closure(op: &Op) -> bool {
     }
 }
 
+/// The latest instant `check` can pass at, or `None` when it does not read the clock at all.
+///
+/// A check passes when ANY of its queries does, so a check of several recognized time queries is bounded
+/// by the latest of them. A check that reads the clock in any other shape is unreadable, including one
+/// whose other query could pass with no clock at all, since that alternative makes the bound a guess.
+fn clock_bound(check: &Check) -> Option<Result<SystemTime, CapError>> {
+    let Check { queries, kind } = check;
+    if !queries.iter().any(reads_the_clock) {
+        return None;
+    }
+    if *kind != CheckKind::One {
+        return Some(Err(CapError::UnreadableExpiry));
+    }
+    let bound = queries
+        .iter()
+        .map(|query| time_at_most(query).ok_or(CapError::UnreadableExpiry))
+        .try_fold(SystemTime::UNIX_EPOCH, |latest, date| Ok(latest.max(date?)));
+    Some(bound)
+}
+
+/// Whether a check query joins the `time` fact, the only fact that carries the request's clock.
+fn reads_the_clock(query: &Rule) -> bool {
+    query
+        .body
+        .iter()
+        .any(|Predicate { name, .. }| name == "time")
+}
+
+/// The date `query` bounds the clock by, when it is exactly `time($t), $t <= <date>`: the one shape every
+/// mint and attenuation writes. `None` for any other shape.
+fn time_at_most(query: &Rule) -> Option<SystemTime> {
+    // The one predicate is `time`: the caller only asks about a query that joins it.
+    let [Predicate { name: _, terms }] = query.body.as_slice() else {
+        return None;
+    };
+    let ([Term::Variable(bound)], [Expression { ops }]) =
+        (terms.as_slice(), query.expressions.as_slice())
+    else {
+        return None;
+    };
+    let [
+        Op::Value(Term::Variable(compared)),
+        Op::Value(Term::Date(secs)),
+        Op::Binary(Binary::LessOrEqual),
+    ] = ops.as_slice()
+    else {
+        return None;
+    };
+    // The compared variable must be the clock itself: biscuit accepts a comparison over a variable the
+    // body never binds, and that one bounds nothing.
+    (bound == compared).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(*secs))
+}
+
 /// Why a capability operation failed.
 ///
 /// The failure modes a caller must distinguish: a malformed link, a token that does not chain to the
@@ -1190,6 +1296,10 @@ pub enum CapError {
     /// nothing is admitted on an answer that was never computed.
     #[error("capability evaluation ran out of time")]
     Undecided,
+    /// A check reads the clock in a shape this crate never writes, so when the cap stops granting cannot
+    /// be read. From [`Cap::valid_until`], whose callers treat it as already expired.
+    #[error("capability expiry cannot be read")]
+    UnreadableExpiry,
 }
 
 impl CapError {

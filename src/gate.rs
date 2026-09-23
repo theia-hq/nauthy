@@ -548,7 +548,8 @@ impl From<Result<VerifyKey, CapError>> for Checked {
                 | CapError::ForeignRoot
                 | CapError::Authorize(_)
                 | CapError::Denied(_)
-                | CapError::NotAuthorityBound,
+                | CapError::NotAuthorityBound
+                | CapError::UnreadableExpiry,
             ) => Checked::NotGranted,
         }
     }
