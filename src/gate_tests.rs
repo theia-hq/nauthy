@@ -671,3 +671,162 @@ async fn a_revoked_token_is_refused_before_its_grant_is_evaluated() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// A store that revokes one device key and no token, and counts every question it is asked about a cap, so
+/// a test can see that the peer was refused before any presented token was read.
+struct RevokedKey {
+    key: VerifyKey,
+    caps_asked: core::sync::atomic::AtomicU32,
+}
+
+impl RevokedKey {
+    fn new(key: VerifyKey) -> Self {
+        Self {
+            key,
+            caps_asked: core::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    fn caps_asked(&self) -> u32 {
+        self.caps_asked.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl crate::revocations::Revocations for RevokedKey {
+    fn is_revoked(&self, _cap: &Cap) -> bool {
+        self.caps_asked
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        false
+    }
+
+    fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
+        *peer == self.key
+    }
+}
+
+#[test]
+fn a_revoked_peer_key_is_refused_before_any_cap() {
+    // A device whose key is revoked is refused on every entry point, whatever it presents: a valid badge
+    // bound to it, nothing at all, or a valid foreign pair. The refusal comes before the store is asked
+    // about any token, so nothing presented is read. A device whose key is not revoked is still admitted.
+    let device = identity(4).verifying_key();
+    let store = std::sync::Arc::new(RevokedKey::new(device));
+    let gate = Gate::rooted(identity(1).verifying_key(), std::sync::Arc::clone(&store));
+
+    assert_eq!(
+        gate.admit(
+            proven(device),
+            Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked),
+        "a valid badge does not carry a revoked device key"
+    );
+    assert_eq!(
+        gate.admit(proven(device), None, &service("ssh")),
+        Decision::Refuse(Refusal::Revoked),
+        "the key is refused before the gate looks for a token"
+    );
+    assert!(matches!(
+        gate.admit_witnessed(
+            proven(device),
+            Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Err(Refusal::Revoked)
+    ));
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &authority_slip(2, "ssh"),
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked),
+        "the two-token path asks about the key before either token"
+    );
+    assert!(matches!(
+        gate.admit_foreign_witnessed(
+            proven(device),
+            &authority_slip(2, "ssh"),
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Err(Refusal::Revoked)
+    ));
+    assert_eq!(store.caps_asked(), 0, "no presented token was read");
+
+    let sibling = identity(5).verifying_key();
+    assert_eq!(
+        gate.admit(
+            proven(sibling),
+            Some(&bound_badge(1, sibling)),
+            &service("ssh")
+        ),
+        Decision::Admit,
+        "a device whose key is not revoked is admitted"
+    );
+}
+
+#[tokio::test]
+async fn a_latch_forwards_is_revoked_peer() {
+    // `is_revoked_peer` is a provided method, so a `Latch` that did not forward it would answer the default
+    // and admit a revoked device through the store it wraps.
+    let path = std::env::temp_dir().join(format!("nauthy-latch-peer-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    let disabled = DisabledRoots::load(path.clone()).await.expect("load");
+    let device = identity(4).verifying_key();
+    let gate = Gate::rooted(
+        identity(1).verifying_key(),
+        Latch::new(disabled, RevokedKey::new(device)),
+    );
+
+    assert_eq!(
+        gate.admit(
+            proven(device),
+            Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked),
+        "the latch passes the key question to its inner store"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn an_arc_forwards_is_revoked_peer() {
+    // One store shared behind an `Arc` answers the key question as the store itself does.
+    let device = identity(4).verifying_key();
+    let gate = Gate::rooted(
+        identity(1).verifying_key(),
+        std::sync::Arc::new(RevokedKey::new(device)),
+    );
+
+    assert_eq!(
+        gate.admit(
+            proven(device),
+            Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked),
+        "the Arc passes the key question to the store it shares"
+    );
+}
+
+#[test]
+fn a_store_that_keeps_no_keys_revokes_no_peer() {
+    // The default: a store written before the key question existed, answering only about tokens, revokes
+    // no device key, so its gate admits exactly what it admitted before.
+    let device = identity(4).verifying_key();
+    let gate = rooted_gate(1);
+
+    assert_eq!(
+        gate.admit(
+            proven(device),
+            Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Decision::Admit
+    );
+}

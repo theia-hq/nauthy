@@ -366,6 +366,12 @@ impl<R: Revocations> Revocations for Latch<R> {
     fn is_revoked(&self, cap: &Cap) -> bool {
         self.disabled.is_disabled(cap.root()) || self.inner.is_revoked(cap)
     }
+
+    /// The inner store's answer. The disabled roots are authority keys, not device keys, so they are not
+    /// asked about the peer.
+    fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
+        self.inner.is_revoked_peer(peer)
+    }
 }
 
 /// Why loading or persisting the disabled roots failed.
