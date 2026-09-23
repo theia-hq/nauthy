@@ -3,11 +3,11 @@
 use core::time::Duration;
 use std::path::PathBuf;
 
-use crate::VerifyKey;
 use crate::cap::{Cap, Identity, Request};
 use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
-use crate::revocations::{FileDenylist, Revocations, STAT_DEBOUNCE, witness_path};
+use crate::revocations::{FileDenylist, Revocations, witness_path};
 use crate::service::Service;
+use crate::{STAT_DEBOUNCE, VerifyKey};
 
 fn identity(seed: u8) -> Identity {
     Identity::from_secret(&[seed; 32]).expect("valid ed25519 secret")

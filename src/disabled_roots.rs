@@ -25,9 +25,10 @@ use std::time::Instant;
 use crate::cap::Cap;
 use crate::key::{KeyParseError, VerifyKey};
 use crate::revocations::{
-    LockError, Revocations, STAT_DEBOUNCE, Stamp, WitnessError, WriteLock, check_witness,
-    read_to_string, write_atomically,
+    LockError, Revocations, WitnessError, WriteLock, check_witness, read_to_string,
+    write_atomically,
 };
+use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 
 /// The largest latch file read, in bytes: room for some eighteen thousand keys. The file is read on the
 /// admit hot path under the latch's lock, so a local writer that grows it without bound must not be able
@@ -78,7 +79,7 @@ pub struct DisabledRoots {
 /// stat'd, and the first line of the last read that was not a key.
 struct State {
     roots: HashSet<VerifyKey>,
-    stamp: Option<Stamp>,
+    stamp: Option<FileStamp>,
     last_stat: Option<Instant>,
     malformed: Option<u32>,
 }
@@ -99,7 +100,11 @@ impl DisabledRoots {
                 let text = read_to_string(&mut file, MAX_LEN)
                     .await
                     .map_err(DisabledRootsError::from_read)?;
-                let stamp = file.metadata().await.ok().and_then(|meta| Stamp::of(&meta));
+                let stamp = file
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|meta| FileStamp::of(&meta));
                 let parsed = Parsed::from(text.as_str());
                 if let Some(rejected) = parsed.rejected.into_iter().next() {
                     return Err(DisabledRootsError::Parse {
@@ -133,7 +138,7 @@ impl DisabledRoots {
     }
 
     /// An instance over `path` holding `roots`, read at `stamp`, not yet stat'd by a refresh.
-    fn unread(path: PathBuf, roots: HashSet<VerifyKey>, stamp: Option<Stamp>) -> Self {
+    fn unread(path: PathBuf, roots: HashSet<VerifyKey>, stamp: Option<FileStamp>) -> Self {
         Self {
             path,
             state: Mutex::new(State {
@@ -209,8 +214,8 @@ impl DisabledRoots {
         let Ok(meta) = std::fs::metadata(&self.path) else {
             return;
         };
-        let current = Stamp::of(&meta);
-        if current == state.stamp {
+        let current = FileStamp::of(&meta);
+        if FileStamp::unchanged(state.stamp, current) {
             return;
         }
         let Some(text) = read_bounded(&self.path) else {
@@ -234,7 +239,7 @@ impl DisabledRoots {
     /// waits for it.
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
-    fn persist(&self) -> Result<Option<Stamp>, DisabledRootsError> {
+    fn persist(&self) -> Result<Option<FileStamp>, DisabledRootsError> {
         let _lock = WriteLock::acquire(&self.path)?;
         let text = match std::fs::File::open(&self.path) {
             Ok(file) => read_capped(file).map_err(DisabledRootsError::from_read)?,

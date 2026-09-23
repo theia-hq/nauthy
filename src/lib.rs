@@ -61,6 +61,7 @@ mod link;
 mod revocations;
 mod service;
 mod signed;
+mod stamp;
 
 #[cfg(test)]
 mod cap_tests;
@@ -75,6 +76,8 @@ mod link_tests;
 mod revocations_tests;
 #[cfg(test)]
 mod signed_tests;
+#[cfg(test)]
+mod stamp_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
 #[cfg(feature = "tokio-fs")]
@@ -87,3 +90,4 @@ pub use crate::revocations::{DenylistError, FileDenylist};
 pub use crate::revocations::{RevocationId, RevocationIdParseError, Revocations};
 pub use crate::service::{Service, ServiceParseError};
 pub use crate::signed::{SignError, Signed};
+pub use crate::stamp::{FileStamp, STAT_DEBOUNCE};

@@ -147,6 +147,12 @@ live when the file changes, so a revocation written by another process takes eff
 connection without a restart. Revocation does not evict a session already in progress; short expiry backs
 it up.
 
+A store of your own can reload the same way. `FileStamp::of` takes a file's metadata and returns its
+stamp (length, mtime and, on unix, inode and ctime). Stat at most once per `STAT_DEBOUNCE` and re-read
+when the stamp differs from the one you read at. `of` returns `None` when the platform reports no mtime.
+Treat that as "re-read", never as "unchanged". What a missing file means stays your store's decision:
+`FileDenylist` keeps the last set it read, because deleting a denylist must never un-revoke.
+
 ## The boundaries: what you bring
 
 nauthy is the authorization layer, and no more. Three things are yours:

@@ -167,13 +167,13 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
     let held = handle.metadata().await.expect("stat the opened handle");
     assert_eq!(
         stamp,
-        crate::revocations::Stamp::of(&held),
+        crate::FileStamp::of(&held),
         "the stamp describes the same inode as the ids"
     );
     let replaced = std::fs::metadata(&path).expect("stat the replacement path");
     assert_ne!(
         stamp,
-        crate::revocations::Stamp::of(&replaced),
+        crate::FileStamp::of(&replaced),
         "the stamp is not the replacement path's"
     );
 
@@ -223,7 +223,7 @@ fn revoke_stamps_the_handle_it_wrote_not_a_replacement_path() {
     let foreign = std::fs::metadata(&path).expect("stat the replacement path");
     assert_ne!(
         stamp,
-        crate::revocations::Stamp::of(&foreign),
+        crate::FileStamp::of(&foreign),
         "the adopted stamp is not the replacement path's"
     );
 
@@ -347,7 +347,7 @@ async fn an_emptied_denylist_neither_loads_nor_replaces_the_running_set() {
     denylist.revoke(&cap).await.expect("revoke");
 
     std::fs::write(&path, "").expect("truncate the denylist");
-    std::thread::sleep(crate::revocations::STAT_DEBOUNCE + Duration::from_millis(50));
+    std::thread::sleep(crate::STAT_DEBOUNCE + Duration::from_millis(50));
 
     assert!(
         denylist.is_revoked(&cap),
