@@ -79,7 +79,15 @@ impl Gate {
     ///
     /// `X` comes from the SLIP (never the badge); the proven `peer` is bound into both checks. The slip is
     /// inert on the plain path ([`admit`](Gate::admit)), so this method is the only way a foreign member is
-    /// admitted. [`Open`](Gate::Open) admits unconditionally.
+    /// admitted. The revocation store is asked about BOTH tokens, so a store that disables `X`'s root key
+    /// refuses every one of `X`'s devices here. [`Open`](Gate::Open) admits unconditionally.
+    ///
+    /// The store is asked BEFORE either token is verified, so anyone holding one genuine cap rooted at
+    /// `X` can pair it with a slip of their own and learn from the refusal whether this node disabled
+    /// `X`: [`Revoked`](Refusal::Revoked) against [`NotGranted`](Refusal::NotGranted). A consumer that puts
+    /// refusals on a wire must send those two as one. Timing still separates them, since a disabled root
+    /// skips the verify, and no reordering removes that without paying the verify for every recalled
+    /// token; the residual is small, because a thief holding `X`'s key learns the same by trying to connect.
     pub fn admit_foreign(
         &self,
         peer: ProvenPeer,
@@ -377,9 +385,11 @@ fn admit_authority_bound(
     service: &Service,
     peer: VerifyKey,
 ) -> Decision {
-    // Revocation first, for the reason `admit_plain` gives. This node's store governs the SLIP only; the
-    // foreign badge roots at `X` and is that authority's to recall.
-    if revocations.is_revoked(slip) {
+    // Revocation first, for the reason `admit_plain` gives, and on BOTH tokens. The slip is this node's
+    // grant; the badge roots at the foreign `X`, and asking about it is what lets a store that disables
+    // root keys refuse `X`'s devices here. `Cap::parse` authenticated the badge's root, so it cannot be
+    // claimed. See `revoked_or_admit` for which powers this does and does not give the node.
+    if revocations.is_revoked(slip) || revocations.is_revoked(badge) {
         return Decision::Refuse(Refusal::Revoked);
     }
     let request = Request::now(Service::clone(service)).bound_to(peer);
@@ -397,17 +407,30 @@ fn admit_authority_bound(
         // slip evaluation is never reported as a refusal of an authority nothing ruled on.
         Err(error) => Checked::from(Err(error)),
     };
-    checked.decide(revocations, slip)
+    // The second read, on both tokens as the first was: a root disabled while the pair was being evaluated
+    // is refused now rather than on the next connection.
+    match checked.decide(revocations, slip) {
+        Decision::Admit if revocations.is_revoked(badge) => Decision::Refuse(Refusal::Revoked),
+        decision => decision,
+    }
 }
 
-/// A granted cap that is revoked is still refused; else admit. The revocation store governs the SLIP (rooted
-/// at `root`); an authority-bound slip's foreign badge (rooted at `X`) is out of this node's revocation
-/// authority. A foreign authority is the party that revokes a lost DEVICE in its own set; this node's only
-/// lever over a foreign member is revoking the whole SLIP (all-or-nothing), inherent to cross-authority
-/// trust.
+/// A granted cap that is revoked is still refused; else admit.
+///
+/// On the authority-bound path the store is consulted on BOTH tokens, the foreign badge included. Three
+/// powers over a foreign member stay distinct:
+/// - this node may DISABLE THE FOREIGN ROOT: a store keyed on root keys (see [`Latch`](crate::Latch))
+///   refuses every badge `X` signed, so every one of `X`'s devices at once;
+/// - this node may REVOKE THE WHOLE SLIP it issued, cutting every device of `X` off from that grant;
+/// - a lost DEVICE of `X` stays `X`'s to revoke, in `X`'s own set: its badge carries `X`'s revocation
+///   ids, which this node never recorded, and `X` can re-badge the device under new ones.
+///
+/// Asking about the badge is deny-only: an id this node never recorded never matches, and a store that
+/// refuses a foreign badge for its own reasons can only over-deny.
 ///
 /// The SECOND of the two revocation reads, and the one that catches a token recalled while its own
-/// evaluation was running; the admit paths ask first, before they pay for the verify.
+/// evaluation was running; the admit paths ask first, before they pay for the verify. The authority-bound
+/// path asks this about its slip and then asks the same of its badge.
 fn revoked_or_admit(revocations: &dyn Revocations, cap: &Cap) -> Decision {
     if revocations.is_revoked(cap) {
         return Decision::Refuse(Refusal::Revoked);
