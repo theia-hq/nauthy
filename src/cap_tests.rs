@@ -723,6 +723,190 @@ fn a_narrowed_cap_reports_the_authority_expiry() {
 }
 
 #[test]
+fn every_minted_kind_is_valid_until_its_expiry() {
+    let authority = identity(1);
+    let other = identity(2).verifying_key();
+    let kinds = [
+        authority.mint(&service("ssh"), at(60)).expect("plain slip"),
+        authority
+            .mint_bound(&service("ssh"), other, at(60))
+            .expect("device-bound slip"),
+        authority.mint_member(other, at(60)).expect("badge"),
+        authority
+            .mint_authority_slip(&service("ssh"), other, at(60))
+            .expect("authority-bound slip"),
+        authority
+            .mint_member_without_expires_at(other, at(60))
+            .expect("pre-fact badge"),
+    ];
+    for cap in &kinds {
+        assert_eq!(
+            cap.valid_until().expect("read the chain's expiry"),
+            Some(at(60)),
+            "every minted kind is valid until the expiry its check enforces"
+        );
+    }
+}
+
+#[test]
+fn a_narrowed_expiry_wins_over_the_authority_one() {
+    // The reason `valid_until` exists beside `expiry`: a holder that narrows a grant and passes it on
+    // must see it end at the narrower instant, and the gate agrees at that exact second.
+    let authority = identity(1);
+    let slip = authority
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    let narrowed = slip
+        .attenuate(None, Some(at(60)))
+        .expect("narrow the expiry");
+    let until = narrowed
+        .valid_until()
+        .expect("read the chain's expiry")
+        .expect("a narrowed slip has one");
+    assert_eq!(
+        until,
+        at(60),
+        "the holder's narrower instant, not the authority's"
+    );
+    assert!(authority.verify(&narrowed, &request("ssh", 60)).is_ok());
+    assert!(
+        matches!(
+            authority.verify(&narrowed, &request("ssh", 61)),
+            Err(CapError::Denied(_))
+        ),
+        "one second past it the gate denies too"
+    );
+
+    // A block that asks for LONGER changes nothing: the earliest bound in the chain holds.
+    let widened = narrowed
+        .attenuate(None, Some(at(7200)))
+        .expect("append a later expiry");
+    assert_eq!(
+        widened.valid_until().expect("read the chain's expiry"),
+        Some(at(60)),
+        "a later bound appended after an earlier one cannot extend the grant"
+    );
+}
+
+#[test]
+fn a_cap_with_no_clock_check_is_valid_forever_and_says_so() {
+    // Told apart from an unreadable expiry by type: `Ok(None)` means no check in any block reads the
+    // clock, which is a fact about the token, not a failure to read it.
+    let authority = identity(1);
+    let timeless = authority
+        .mint_without_expiry(&service("ssh"))
+        .expect("mint a slip with no expiry");
+    assert_eq!(
+        timeless
+            .valid_until()
+            .expect("a timeless cap reads cleanly"),
+        None
+    );
+    // And a clock check appended by a holder bounds it from then on.
+    let narrowed = timeless
+        .attenuate(None, Some(at(60)))
+        .expect("narrow the expiry");
+    assert_eq!(
+        narrowed.valid_until().expect("read the chain's expiry"),
+        Some(at(60))
+    );
+}
+
+#[test]
+fn a_clock_check_in_a_shape_never_minted_is_unreadable() {
+    // 1_700_003_600 is at(3600). Each block reads the clock in a way no mint or attenuation writes, so
+    // the instant it ends cannot be read, and the answer is an error a caller treats as expired.
+    let slip = identity(1)
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    for source in [
+        "check if time($t), $t < 2023-11-14T23:13:20Z;",
+        "check if time($t), service($s), $t <= 2023-11-14T23:13:20Z;",
+        "check if time($t), $u <= 2023-11-14T23:13:20Z;",
+        "check if time($t), $t <= 2023-11-14T23:13:20Z or service(\"ssh\");",
+        "check all time($t), $t <= 2023-11-14T23:13:20Z;",
+        "reject if time($t), $t > 2023-11-14T23:13:20Z;",
+    ] {
+        let odd = slip
+            .attenuate_with_raw_datalog(source)
+            .expect("append the block");
+        assert!(
+            matches!(odd.valid_until(), Err(CapError::UnreadableExpiry)),
+            "{source} must read as unreadable"
+        );
+    }
+}
+
+#[test]
+fn a_clock_bound_past_the_clocks_range_is_unreadable_not_a_panic() {
+    // A holder appends the one clock shape nauthy writes, at `Date(u64::MAX)`. The gate admits it (the
+    // root's own check still holds, and this one always passes), so reading its expiry must not panic
+    // on a date `SystemTime` cannot hold: it reads as unreadable, and a caller refuses the stream.
+    let authority = identity(1);
+    let slip = authority
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    let far = slip
+        .attenuate_with_raw_clock_bound(u64::MAX)
+        .expect("append the block");
+    // Round-tripped through its link, the way it arrives off the wire.
+    let far =
+        Cap::parse(&far.link().expect("link").to_string()).expect("the appended cap verifies");
+    assert!(
+        authority.verify(&far, &request("ssh", 0)).is_ok(),
+        "the fixture is a cap the gate admits"
+    );
+    assert!(
+        matches!(far.valid_until(), Err(CapError::UnreadableExpiry)),
+        "a date past the clock's range must read as unreadable"
+    );
+}
+
+#[test]
+fn a_root_signed_date_past_the_clocks_range_is_unreadable_not_a_panic() {
+    // A hostile root signs `expires_at` and its clock check at `Date(u64::MAX)` into a link it hands
+    // out. Displaying that link's expiry, or reading its chain's, must fail closed rather than panic.
+    let far = identity(1)
+        .mint_with_raw_expiry(&service("ssh"), u64::MAX)
+        .expect("mint the hand-signed slip");
+    assert!(
+        matches!(far.expiry(), Err(CapError::UnreadableExpiry)),
+        "a signed expiry past the clock's range must read as unreadable"
+    );
+    assert!(
+        matches!(far.valid_until(), Err(CapError::UnreadableExpiry)),
+        "a root's clock bound past the clock's range must read as unreadable"
+    );
+    // The same hand-signed shape at a date the clock holds reads cleanly both ways, so only the range
+    // made it unreadable.
+    let near = identity(1)
+        .mint_with_raw_expiry(&service("ssh"), 1_700_003_600)
+        .expect("mint the hand-signed slip");
+    assert_eq!(near.expiry().expect("read the expiry"), Some(at(3600)));
+    assert_eq!(
+        near.valid_until().expect("read the chain's expiry"),
+        Some(at(3600))
+    );
+}
+
+#[test]
+fn a_check_of_several_clock_alternatives_ends_at_the_latest() {
+    // A check passes when any of its queries does, so of two clock bounds the later one is the check's.
+    let slip = identity(1)
+        .mint(&service("ssh"), at(3600))
+        .expect("mint a slip");
+    let either = slip
+        .attenuate_with_raw_datalog(
+            "check if time($t), $t <= 2023-11-14T22:14:20Z or time($t), $t <= 2023-11-14T22:30:00Z;",
+        )
+        .expect("append the block");
+    assert_eq!(
+        either.valid_until().expect("read the chain's expiry"),
+        Some(at(1000))
+    );
+}
+
+#[test]
 fn an_expired_badge_still_reports_when_it_died() {
     // The display path must work precisely when the cap is dead, which is when its holder needs the date
     // and the remedy. Reading a fact evaluates no check, so expiry never becomes unreadable by passing.
