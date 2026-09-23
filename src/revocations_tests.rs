@@ -403,3 +403,51 @@ async fn a_deleted_denylist_is_lost_at_load() {
     let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }
+
+#[tokio::test]
+async fn the_id_query_matches_a_kept_chain_after_the_cap_is_gone() {
+    // A reader that kept a cap's ids and dropped the cap asks the same question `is_revoked` does. Zero
+    // ids, an unrevoked chain, and a chain holding the revoked leaf, from the ids alone.
+    let issuer = identity(1);
+    let parent = issuer.mint(&service("ssh"), far_expiry()).expect("mint");
+    let child = parent
+        .attenuate(None, Some(far_expiry()))
+        .expect("holder narrows");
+    let (parent_ids, child_ids) = (parent.revocation_ids(), child.revocation_ids());
+    drop((parent, child));
+
+    let mut denylist = denylist("id-query");
+    denylist
+        .revoke_id(child_ids.last().expect("a chain has a block").clone())
+        .await
+        .expect("revoke the leaf");
+
+    assert!(!denylist.is_revoked_any(&[]), "no ids, nothing revoked");
+    assert!(
+        !denylist.is_revoked_any(&parent_ids),
+        "the parent's chain does not carry the leaf"
+    );
+    assert!(
+        denylist.is_revoked_any(&child_ids),
+        "the child's kept chain carries the revoked leaf"
+    );
+}
+
+#[tokio::test]
+async fn a_shared_store_answers_as_the_store_it_shares() {
+    // One instance behind an `Arc` backs a gate and a second reader; a revoke through it is seen by both.
+    let issuer = identity(1);
+    let cap = issuer.mint(&service("ssh"), far_expiry()).expect("mint");
+    let mut denylist = denylist("shared");
+    denylist.revoke(&cap).await.expect("revoke");
+    let shared = std::sync::Arc::new(denylist);
+    let oracle: &dyn crate::revocations::Revocations = &shared;
+    assert!(
+        oracle.is_revoked(&cap),
+        "the shared store refuses what it holds"
+    );
+    assert!(
+        !oracle.is_revoked(&issuer.mint(&service("web"), far_expiry()).expect("mint")),
+        "and nothing else"
+    );
+}

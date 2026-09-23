@@ -38,6 +38,7 @@ use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "tokio-fs")]
 use std::process;
+use std::sync::Arc;
 #[cfg(feature = "tokio-fs")]
 use std::sync::{Mutex, PoisonError};
 #[cfg(feature = "tokio-fs")]
@@ -65,6 +66,14 @@ pub trait Revocations {
     /// inherited from the grant it was attenuated from) is recalled, or anything else the store keys on,
     /// such as the cap's [`root`](Cap::root). See [`Cap::revocation_ids`].
     fn is_revoked(&self, cap: &Cap) -> bool;
+}
+
+/// A shared store answers as the store it shares, so one instance can back a gate and any other reader
+/// that must agree with it, rather than two instances over one file drifting by a refresh.
+impl<R: Revocations + ?Sized> Revocations for Arc<R> {
+    fn is_revoked(&self, cap: &Cap) -> bool {
+        R::is_revoked(self, cap)
+    }
 }
 
 /// A biscuit revocation identifier: the opaque, per-block id whose presence in a revocation set (see
@@ -181,10 +190,18 @@ impl FileDenylist {
     /// another process is honored by a long-running issuer without a restart. The stat is debounced (see
     /// `STAT_DEBOUNCE`); the file is re-read only when it actually changed.
     pub fn is_revoked(&self, cap: &Cap) -> bool {
-        let chain = cap.revocation_ids();
+        self.is_revoked_any(&cap.revocation_ids())
+    }
+
+    /// Whether any of `ids` is on the denylist: the membership query [`is_revoked`](Self::is_revoked)
+    /// runs over one cap's chain, for a caller that kept the ids and let the cap go. Holding a parsed cap
+    /// for as long as the thing it admitted stays open pins the whole token in memory and re-derives its
+    /// chain on every check; the ids are all a revocation ever matches, so they are all such a caller
+    /// needs to keep. One lock and one refresh however many ids are asked about.
+    pub fn is_revoked_any<'a>(&self, ids: impl IntoIterator<Item = &'a RevocationId>) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         self.refresh(&mut state);
-        chain.iter().any(|id| state.ids.contains(id))
+        ids.into_iter().any(|id| state.ids.contains(id))
     }
 
     /// Reload the ids in place if the backing file's `(mtime, len)` stamp differs from what we last read.

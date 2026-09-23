@@ -594,5 +594,11 @@ async fn the_latch_lends_its_one_instance_to_a_reader_that_kept_roots() {
         latch.is_revoked(&cap_rooted_at(1)),
         "and so does the gate's oracle"
     );
+    assert!(
+        !latch
+            .inner()
+            .is_revoked_any(&cap_rooted_at(1).revocation_ids()),
+        "the inner store is the denylist, untouched by a root disable"
+    );
     cleanup(&path);
 }
