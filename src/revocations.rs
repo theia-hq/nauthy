@@ -13,10 +13,10 @@
 //! feature), a persisted set of ids on disk.
 //!
 //! Revocation through [`FileDenylist`] is LIVE: [`is_revoked`](FileDenylist::is_revoked) re-reads the file
-//! when its `(mtime, len)` stamp changes, so a revocation written by a separate process takes effect on
-//! the next connection to a long-running issuer; it does not wait for a restart. The length rides with
-//! the mtime on purpose: a revoke only ever grows the file, so a change within one coarse mtime tick is
-//! still seen. The reload is a small, rare read (only when the file actually changed), guarded by
+//! when its [`FileStamp`](crate::FileStamp) changes, so a revocation written by a separate process takes effect on
+//! the next connection to a long-running issuer; it does not wait for a restart. The stamp carries the
+//! length with the mtime on purpose: a revoke only ever grows the file, so a change within one coarse
+//! mtime tick is still seen. The reload is a small, rare read (only when the file actually changed), guarded by
 //! interior mutability so the gate's synchronous admit path stays synchronous.
 //!
 //! Revocation WRITES are SERIALIZED: [`revoke`](FileDenylist::revoke) takes an exclusive advisory lock on a
@@ -123,7 +123,7 @@ pub struct RevocationIdParseError;
 ///
 /// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
 /// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the
-/// `(mtime, len)` stamp it was read at, so a check can refresh it in place when the file changed
+/// [`FileStamp`](crate::FileStamp) it was read at, so a check can refresh it in place when the file changed
 /// underneath a running process.
 ///
 /// CONCURRENT REVOCATIONS SURVIVE. A write locks a sibling `<path>.lock` file, re-reads the on-disk set
@@ -141,8 +141,8 @@ pub struct FileDenylist {
     state: Mutex<State>,
 }
 
-/// The loaded ids, the `(mtime, len)` stamp of the file they were read at (`None` = the file was absent
-/// when loaded), and the last moment we stat'd the file. The length pairs with mtime so a change within one
+/// The loaded ids, the [`FileStamp`](crate::FileStamp) of the file they were read at (`None` = the file was absent or
+/// reported no stamp), and the last moment we stat'd the file. The length pairs with mtime so a change within one
 /// coarse mtime tick is still seen: a revoke only ever GROWS the file, so a differing length is a reliable
 /// "changed" signal on its own.
 #[cfg(feature = "tokio-fs")]
@@ -196,7 +196,7 @@ impl FileDenylist {
         ids.into_iter().any(|id| state.ids.contains(id))
     }
 
-    /// Reload the ids in place if the backing file's `(mtime, len)` stamp differs from what we last read.
+    /// Reload the ids in place if the backing file's [`FileStamp`](crate::FileStamp) differs from what we last read.
     /// Synchronous and on the admit hot path, so it debounces the stat to at most once per
     /// [`STAT_DEBOUNCE`] and re-reads only on change.
     ///

@@ -57,7 +57,8 @@ fn an_untouched_file_is_unchanged() {
 
 /// A same-length replacement renamed into place, carrying the old file's mtime, is still a new generation.
 /// Every writer in this crate replaces by rename, so a stamp of length and mtime alone would miss a
-/// rewrite that kept both.
+/// rewrite that kept both, and inside one coarse ctime tick (HFS+ records whole seconds) only the inode
+/// sees it.
 #[cfg(unix)]
 #[test]
 fn a_same_length_replacement_with_the_old_mtime_changes_the_stamp() {
@@ -78,10 +79,18 @@ fn a_same_length_replacement_with_the_old_mtime_changes_the_stamp() {
         .expect("carry the old mtime onto the second generation");
     std::fs::rename(&sibling, &path).expect("rename the second generation into place");
 
+    let after = stamp(&path);
     assert_ne!(
-        before,
-        stamp(&path),
-        "a replacement is seen however the length and mtime line up"
+        before.ino(),
+        after.ino(),
+        "a replacement renamed into place is a different inode"
+    );
+    // The replacement's ctime differs here too, but on a filesystem with a coarse clock it need not. Blank
+    // it on both sides so the inode alone has to tell the two generations apart.
+    assert_ne!(
+        before.without_ctime(),
+        after.without_ctime(),
+        "a replacement is seen through its inode however the length, mtime and ctime line up"
     );
 
     let _ = std::fs::remove_file(&path);

@@ -128,7 +128,7 @@ async fn a_persisted_denylist_is_owner_only() {
 
 /// The M2 race at its smallest: a writer replaces the path between the loader's open and its read. The
 /// loaded ids and the freshness stamp must both come from the one opened handle, so the loader reports the
-/// handle's bytes with the handle's `(mtime, len)`, never the old ids wearing the replacement's stamp
+/// handle's bytes with the handle's stamp, never the old ids wearing the replacement's stamp
 /// (which would make every later refresh skip and freeze a revocation until the next edit).
 #[tokio::test]
 async fn load_pairs_ids_and_stamp_from_one_handle() {
@@ -181,7 +181,7 @@ async fn load_pairs_ids_and_stamp_from_one_handle() {
 }
 
 /// The M2 race at its smallest on the WRITE side: a revoke must adopt the stamp of the bytes it wrote, taken
-/// from the handle that wrote them, never the `(mtime, len)` of a path a second writer can replace.
+/// from the handle that wrote them, never the stamp of a path a second writer can replace.
 /// `persist` funnels every write and every stamp through `write_and_stamp`, so this drives that path with
 /// the replacement landing between the open and the write: a stamp read from the path would describe the
 /// replacement and make the next refresh skip the replacement's revocation until the next edit.

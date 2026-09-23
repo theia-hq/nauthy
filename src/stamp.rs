@@ -5,7 +5,7 @@
 //! roots, a pin) cannot re-read it on every check, and cannot wait for a restart either. It stats the
 //! file at most once per [`STAT_DEBOUNCE`], and re-reads only when the stamp differs from the one it read
 //! at. Both [`FileDenylist`](crate::FileDenylist) and [`DisabledRoots`](crate::DisabledRoots) work this
-//! way, and a store of its own can use the same two pieces.
+//! way, and a store of its own can use the same pieces, deciding by [`FileStamp::unchanged`].
 //!
 //! The stamp decides only WHETHER to re-read. What a missing, unreadable or shorter file means is the
 //! reader's own policy, and it differs between stores: a denylist keeps the last set it read, because a
@@ -87,9 +87,43 @@ impl FileStamp {
 
     /// Whether a reader that read its file at `held` may skip reading it again now that a stat says
     /// `seen`. Only two equal stamps may skip: a missing stamp on either side re-reads.
-    #[cfg(any(feature = "tokio-fs", test))]
-    pub(crate) fn unchanged(held: Option<Self>, seen: Option<Self>) -> bool {
+    ///
+    /// A store of its own should decide by this rather than comparing the two `Option`s itself: `None ==
+    /// None` would call a file with no mtime unchanged forever, and the reader would never see a change.
+    ///
+    /// ```
+    /// # fn main() -> std::io::Result<()> {
+    /// use nauthy::FileStamp;
+    ///
+    /// let path = std::env::temp_dir().join(format!("nauthy-unchanged-doc-{}", std::process::id()));
+    /// std::fs::write(&path, "one\n")?;
+    /// let held = FileStamp::of(&std::fs::metadata(&path)?);
+    /// let seen = FileStamp::of(&std::fs::metadata(&path)?);
+    /// assert!(FileStamp::unchanged(held, seen));
+    /// assert!(!FileStamp::unchanged(None, None));
+    /// # std::fs::remove_file(&path)?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn unchanged(held: Option<Self>, seen: Option<Self>) -> bool {
         matches!((held, seen), (Some(held), Some(seen)) if held == seen)
+    }
+
+    /// This stamp with its ctime blanked, so a test can show the other fields tell two generations apart
+    /// on their own.
+    #[cfg(all(test, unix))]
+    pub(crate) fn without_ctime(self) -> Self {
+        Self {
+            ctime: (0, 0),
+            ..self
+        }
+    }
+
+    /// The inode this stamp recorded.
+    #[cfg(all(test, unix))]
+    pub(crate) fn ino(self) -> u64 {
+        self.ino
     }
 }
 
