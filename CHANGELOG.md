@@ -2,6 +2,22 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.6.0
+
+### Added
+- **`Cap::valid_until` returns the instant a cap's whole chain stops granting.** `Cap::expiry` reads
+  only the expiry the authority signed, and a holder who narrows a cap before passing it on can set an
+  earlier one that `expiry` never sees. `valid_until` reads the clock checks of every block and returns
+  the earliest. `Ok(None)` means nothing in the chain reads the clock. The new
+  `CapError::UnreadableExpiry` means a clock check has a shape nauthy never writes; treat that cap as
+  expired. The gate denies such a cap.
+
+### Fixed
+- **A date past the clock's range no longer panics.** A biscuit date can be any `u64`. A holder could
+  append a check dated `u64::MAX` to a slip, and reading its expiry panicked, which in a server ends the
+  process. `expiry` and `valid_until` now convert through one checked addition, and a date out of range
+  reads as `UnreadableExpiry`.
+
 ## v0.5.0
 
 ### Breaking
