@@ -51,7 +51,8 @@ use crate::cap::Cap;
 #[cfg(feature = "tokio-fs")]
 use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 
-/// The revocation oracle a [`Gate::Rooted`](crate::Gate::Rooted) consults on the admit hot path.
+/// The revocation oracle a [`Gate::Rooted`](crate::Gate::Rooted) or [`Gate::Anchored`](crate::Gate::Anchored)
+/// consults on the admit hot path.
 ///
 /// Synchronous by design: admission is synchronous policy, so a revocation check must never require an
 /// async runtime. A consumer whose distributed system keeps revocations in Redis, a database, or a gossip
@@ -69,8 +70,9 @@ pub trait Revocations {
     fn is_revoked(&self, cap: &Cap) -> bool;
 
     /// Whether the proven peer's own key is revoked: a device key recalled as a key, not through any cap
-    /// it carries. A [`Gate::Rooted`](crate::Gate::Rooted) asks this about the transport-proven dialer
-    /// first, before it reads or verifies any presented cap, and refuses a `true` as
+    /// it carries. A [`Gate::Rooted`](crate::Gate::Rooted) and a [`Gate::Anchored`](crate::Gate::Anchored)
+    /// ask this about the transport-proven dialer first, before they read or verify any presented cap, and
+    /// refuse a `true` as
     /// [`Revoked`](crate::Refusal::Revoked), so a revoked device is refused whatever token it presents,
     /// including one minted for it after the revocation.
     ///

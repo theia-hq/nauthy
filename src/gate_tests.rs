@@ -2,12 +2,21 @@
 
 use core::time::Duration;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
+
+use biscuit_auth::builder::Algorithm;
+use biscuit_auth::macros::biscuit;
+use biscuit_auth::{KeyPair, PrivateKey};
+use data_encoding::BASE32_NOPAD;
 
 use crate::cap::{Cap, CapError, Identity, Request};
 use crate::disabled_roots::{DisabledRoots, Latch};
-use crate::gate::{Admission, Checked, Decision, Gate, Origin, ProvenPeer, Refusal};
-use crate::revocations::FileDenylist;
+use crate::gate::{
+    Admission, Checked, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
+    is_recorded,
+};
+use crate::revocations::{FileDenylist, RevocationId};
 use crate::service::Service;
 use crate::{STAT_DEBOUNCE, VerifyKey};
 
@@ -825,6 +834,751 @@ fn a_store_that_keeps_no_keys_revokes_no_peer() {
         gate.admit(
             proven(device),
             Some(&bound_badge(1, device)),
+            &service("ssh")
+        ),
+        Decision::Admit
+    );
+}
+
+// The anchored gate: this machine's own key is `identity(OWN)`, its pin (when it has one) is `identity(PIN)`.
+// A device of a foreign fleet is `identity(4)` under the fleet authority `identity(2)`.
+
+const OWN: u8 = 3;
+const PIN: u8 = 1;
+
+fn own_key() -> VerifyKey {
+    identity(OWN).verifying_key()
+}
+
+/// A pin that never changes.
+struct FixedPin(Option<VerifyKey>);
+
+impl PinSource for FixedPin {
+    fn current(&self) -> Option<VerifyKey> {
+        self.0
+    }
+}
+
+/// A pin a test can move while a gate holds it, as another process rewrites a pin file under a serving
+/// gate. The lock is shared by every clone, so the test and the gate see one value.
+#[derive(Clone)]
+struct MovablePin(Arc<RwLock<Option<VerifyKey>>>);
+
+impl MovablePin {
+    fn new(pin: Option<VerifyKey>) -> Self {
+        Self(Arc::new(RwLock::new(pin)))
+    }
+
+    fn set(&self, pin: Option<VerifyKey>) {
+        *self.0.write().expect("pin lock") = pin;
+    }
+}
+
+impl PinSource for MovablePin {
+    fn current(&self) -> Option<VerifyKey> {
+        *self.0.read().expect("pin lock")
+    }
+}
+
+/// The record of slips the own key issued, by root revocation id.
+struct Ledger(Vec<RevocationId>);
+
+impl Ledger {
+    fn of(caps: &[&Cap]) -> Self {
+        Self(
+            caps.iter()
+                .filter_map(|cap| cap.root_revocation_id())
+                .collect(),
+        )
+    }
+}
+
+impl IssuedIds for Ledger {
+    fn is_issued(&self, id: &RevocationId) -> bool {
+        self.0.contains(id)
+    }
+}
+
+/// A store that recalls every id of the caps it was given.
+struct RecalledIds(Vec<RevocationId>);
+
+impl crate::revocations::Revocations for RecalledIds {
+    fn is_revoked(&self, cap: &Cap) -> bool {
+        cap.revocation_ids().iter().any(|id| self.0.contains(id))
+    }
+}
+
+/// An anchored gate at `OWN` with the pin `pin`, an empty denylist, and `issued` recorded as issued.
+fn anchored_gate(pin: Option<u8>, issued: &[&Cap]) -> Gate {
+    Gate::anchored(
+        FixedPin(pin.map(|seed| identity(seed).verifying_key())),
+        own_key(),
+        FileDenylist::empty(PathBuf::new()),
+        Ledger::of(issued),
+    )
+}
+
+/// The own key's fleet slip for `svc`: any device `authority_seed` badges may reach it.
+fn own_fleet_slip(authority_seed: u8, svc: &str) -> Cap {
+    identity(OWN)
+        .mint_authority_slip(
+            &service(svc),
+            identity(authority_seed).verifying_key(),
+            hour(),
+        )
+        .expect("mint own fleet slip")
+}
+
+/// A token no mint in this crate writes, signed by `signer_seed`: a membership fact AND an authority-bound
+/// fact naming `authority_seed`, with no service check, so it passes both the membership question and the
+/// authority-bound slip check. Anyone holding the key can sign one.
+fn member_fleet_slip(signer_seed: u8, authority_seed: u8) -> Cap {
+    let private =
+        PrivateKey::from_bytes(&[signer_seed; 32], Algorithm::Ed25519).expect("valid secret");
+    let token = biscuit!(
+        r#"
+        member(true);
+        authority_bound({x});
+        check if time($t), $t <= {expiry};
+        "#,
+        x = identity(authority_seed).verifying_key().to_string(),
+        expiry = hour(),
+    )
+    .build(&KeyPair::from(&private))
+    .expect("sign");
+    let bytes = token.to_vec().expect("encode");
+    Cap::parse(&format!(
+        "{}{}.{}",
+        crate::SCHEME,
+        identity(signer_seed).verifying_key(),
+        BASE32_NOPAD.encode(&bytes).to_lowercase()
+    ))
+    .expect("parse")
+}
+
+#[test]
+fn a_member_cap_rooted_at_own_is_refused() {
+    // The own key never makes a member. Its badge is refused even when recorded as issued, and never
+    // collapsed to a slip, though a badge has no service check and so would pass as one.
+    let device = identity(4).verifying_key();
+    let badge = bound_badge(OWN, device);
+    let gate = anchored_gate(Some(PIN), &[&badge]);
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&badge), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_witnessed(proven(device), Some(&badge), &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+
+    // On the two-token path: a recorded token that is both a member cap and a fleet slip, with a valid
+    // badge from that fleet. Every other check passes, so only the membership refusal stops it.
+    let slip = member_fleet_slip(OWN, 2);
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+    let fleet_badge = foreign_badge(2, device);
+    assert_eq!(
+        gate.admit_foreign(proven(device), &slip, &fleet_badge, &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_foreign_witnessed(proven(device), &slip, &fleet_badge, &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+}
+
+#[test]
+fn a_narrowed_member_cap_rooted_at_own_is_refused() {
+    // Narrowing a badge to one service adds a service check the membership question cannot satisfy, since
+    // it supplies no service fact, while the service question still passes it. The badge is still a badge:
+    // refused on both paths, whatever service its holder picked.
+    let device = identity(4).verifying_key();
+    let badge = bound_badge(OWN, device);
+    let narrowed = badge
+        .attenuate(Some(&service("ssh")), None)
+        .expect("a holder narrows an unsealed badge");
+    let gate = anchored_gate(Some(PIN), &[&badge]);
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&narrowed), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_witnessed(proven(device), Some(&narrowed), &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+    // With no pin, the own key is the only authority, and it still makes no member.
+    let pinless = anchored_gate(None, &[&badge]);
+    assert_eq!(
+        pinless.admit(proven(device), Some(&narrowed), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+
+    // On the two-token path: the recorded member fleet slip, narrowed to the service it is presented for.
+    let slip = member_fleet_slip(OWN, 2);
+    let narrowed = slip
+        .attenuate(Some(&service("ssh")), None)
+        .expect("a holder narrows the slip");
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+    let fleet_badge = foreign_badge(2, device);
+    assert_eq!(
+        gate.admit_foreign(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert!(matches!(
+        gate.admit_foreign_witnessed(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        Err(Refusal::NotGranted)
+    ));
+}
+
+#[test]
+fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
+    // The badge read sees the authority block only, so a slip a holder appends `member(true)` to is still
+    // a slip, and an own slip that is recorded still admits its service.
+    let slip = slip(OWN, "ssh");
+    let appended = slip
+        .attenuate_with_raw_datalog("member(true);")
+        .expect("append a fact");
+    assert!(!appended.is_member_badge().expect("read"));
+    assert!(
+        bound_badge(OWN, some_peer())
+            .is_member_badge()
+            .expect("read")
+    );
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&appended), &service("ssh")),
+        Decision::Admit
+    );
+}
+
+#[test]
+fn an_undecided_membership_refuses_the_own_key_path_as_undecided() {
+    // The own-key path refuses a member cap, so a membership question that never finished cannot let the
+    // cap through to the slip check: it may be a member. It is refused, and as `Undecided`, since nothing
+    // was decided about the holder.
+    assert_eq!(Checked::Granted.refuse_member(), Err(Refusal::NotGranted));
+    assert_eq!(Checked::Undecided.refuse_member(), Err(Refusal::Undecided));
+    assert_eq!(Checked::NotGranted.refuse_member(), Ok(()));
+}
+
+#[test]
+fn a_self_anchor_admission_is_never_a_member() {
+    let slip = slip(OWN, "ssh");
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+
+    let admitted = gate
+        .admit_witnessed(proven(some_peer()), Some(&slip), &service("ssh"))
+        .expect("a recorded own slip admits its service");
+    assert!(!admitted.is_member());
+    assert_eq!(admitted.kind(), Admission::Slip);
+}
+
+#[test]
+fn a_self_slip_absent_from_the_ledger_is_refused() {
+    // A copy of the own key mints a slip for the same service and lifetime. Its id is fresh, so it is not
+    // the one recorded, and it is refused; the recorded slip is admitted.
+    let expiry = hour();
+    let issued = identity(OWN)
+        .mint(&service("ssh"), expiry)
+        .expect("mint issued");
+    let copied = identity(OWN)
+        .mint(&service("ssh"), expiry)
+        .expect("mint copied");
+    let gate = anchored_gate(Some(PIN), &[&issued]);
+
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&copied), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&issued), &service("ssh")),
+        Decision::Admit
+    );
+}
+
+/// A record that holds every id.
+struct EveryId;
+
+impl IssuedIds for EveryId {
+    fn is_issued(&self, _id: &RevocationId) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_self_slip_with_no_root_id_is_refused() {
+    // A well-formed token always has a root id, so no presented cap reaches this; the rule is asked
+    // directly. With nothing to look up, the token was never recorded, even by a record that holds all.
+    assert!(!is_recorded(&EveryId, None));
+    assert!(is_recorded(&EveryId, slip(OWN, "ssh").root_revocation_id()));
+}
+
+#[test]
+fn a_revoked_self_slip_is_refused() {
+    let issued = slip(OWN, "ssh");
+    let gate = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        RecalledIds(issued.revocation_ids()),
+        Ledger::of(&[&issued]),
+    );
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&issued), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+
+    // Asked before the verify: a recalled slip for `web` asked for `ssh` reports the recall, not the miss.
+    let web = slip(OWN, "web");
+    let gate = Gate::anchored(
+        FixedPin(None),
+        own_key(),
+        RecalledIds(web.revocation_ids()),
+        Ledger::of(&[&web]),
+    );
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&web), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+
+    // And asked again after it: a recall that lands while the slip verifies is refused now.
+    let gate = Gate::anchored(
+        FixedPin(None),
+        own_key(),
+        DisabledMidEvaluation {
+            root: own_key(),
+            asked: core::sync::atomic::AtomicU32::new(0),
+        },
+        Ledger::of(&[&issued]),
+    );
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&issued), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+}
+
+/// An anchored gate at `OWN` pinned to `PIN`, whose oracle disables `disabled_seed`'s root key, and the
+/// latch file backing it (the caller removes it).
+async fn anchored_gate_disabling(disabled_seed: u8, issued: &[&Cap], tag: &str) -> (Gate, PathBuf) {
+    let path = std::env::temp_dir().join(format!(
+        "nauthy-anchored-disabled-{tag}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    let mut disabled = DisabledRoots::load(path.clone()).await.expect("load");
+    disabled
+        .disable(identity(disabled_seed).verifying_key())
+        .await
+        .expect("disable");
+    let gate = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        Latch::new(disabled, FileDenylist::empty(PathBuf::new())),
+        Ledger::of(issued),
+    );
+    (gate, path)
+}
+
+#[tokio::test]
+async fn a_latched_own_key_refuses_every_self_slip() {
+    let ssh = slip(OWN, "ssh");
+    let web = slip(OWN, "web");
+    let (gate, path) = anchored_gate_disabling(OWN, &[&ssh, &web], "own").await;
+
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&ssh), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+    assert_eq!(
+        gate.admit(proven(some_peer()), Some(&web), &service("web")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_pinless_gate_admits_no_member() {
+    // With no pin, the own key is the only authority, and it makes no members: its badge is refused, and a
+    // badge from any other key roots at nothing this gate trusts.
+    let device = identity(4).verifying_key();
+    let own_badge = bound_badge(OWN, device);
+    let other_badge = bound_badge(PIN, device);
+    let gate = anchored_gate(None, &[&own_badge, &other_badge]);
+
+    for badge in [&own_badge, &other_badge] {
+        assert_eq!(
+            gate.admit(proven(device), Some(badge), &service("ssh")),
+            Decision::Refuse(Refusal::NotGranted)
+        );
+        assert!(
+            gate.admit_witnessed(proven(device), Some(badge), &service("ssh"))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn a_pin_equal_to_own_anchors_nothing() {
+    // A source that reports this machine's own key does not make the own key a root: its badge is still
+    // refused, and its recorded slip is still admitted only as a slip.
+    let device = identity(4).verifying_key();
+    let badge = bound_badge(OWN, device);
+    let ssh = slip(OWN, "ssh");
+    let gate = Gate::anchored(
+        FixedPin(Some(own_key())),
+        own_key(),
+        FileDenylist::empty(PathBuf::new()),
+        Ledger::of(&[&badge, &ssh]),
+    );
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&badge), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    let admitted = gate
+        .admit_witnessed(proven(device), Some(&ssh), &service("ssh"))
+        .expect("a recorded own slip admits its service");
+    assert!(!admitted.is_member());
+}
+
+#[test]
+fn a_pin_written_later_is_trusted_at_the_next_admission() {
+    // The pin is read on every admission, so a pin written while the gate serves is trusted at the next
+    // connection, and one removed stops being trusted at the next.
+    let device = identity(4).verifying_key();
+    let badge = bound_badge(PIN, device);
+    let pin = MovablePin::new(None);
+    let gate = Gate::anchored(
+        pin.clone(),
+        own_key(),
+        FileDenylist::empty(PathBuf::new()),
+        Ledger(Vec::new()),
+    );
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&badge), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted),
+        "no pin yet"
+    );
+    pin.set(Some(identity(PIN).verifying_key()));
+    let admitted = gate
+        .admit_witnessed(proven(device), Some(&badge), &service("ssh"))
+        .expect("the new pin's badge admits");
+    assert!(admitted.is_member());
+    pin.set(None);
+    assert_eq!(
+        gate.admit(proven(device), Some(&badge), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted),
+        "the pin is gone"
+    );
+}
+
+#[test]
+fn a_token_rooted_at_the_pin_is_ruled_as_a_rooted_gate_rules_it() {
+    // A badge is a member, a slip admits its service only, a fleet slip admits its fleet's device, and a
+    // recalled token is refused, none of it needing the own key's record.
+    let device = identity(4).verifying_key();
+    let gate = anchored_gate(Some(PIN), &[]);
+
+    let member = gate
+        .admit_witnessed(
+            proven(device),
+            Some(&bound_badge(PIN, device)),
+            &service("ssh"),
+        )
+        .expect("the pin's badge admits");
+    assert!(member.is_member());
+    assert_eq!(member.origin(), Origin::Rooted);
+
+    let slipped = gate
+        .admit_witnessed(proven(device), Some(&slip(PIN, "ssh")), &service("ssh"))
+        .expect("the pin's slip admits its service");
+    assert_eq!(slipped.kind(), Admission::Slip);
+    assert_eq!(
+        gate.admit(proven(device), Some(&slip(PIN, "ssh")), &service("web")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &authority_slip(2, "ssh"),
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Admit
+    );
+
+    let recalled = slip(PIN, "ssh");
+    let gate = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        RecalledIds(recalled.revocation_ids()),
+        Ledger(Vec::new()),
+    );
+    assert_eq!(
+        gate.admit(proven(device), Some(&recalled), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+}
+
+#[test]
+fn a_node_signed_fleet_slip_admits_a_device_of_that_fleet() {
+    let device = identity(4).verifying_key();
+    let slip = own_fleet_slip(2, "ssh");
+    let badge = foreign_badge(2, device);
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+
+    assert_eq!(
+        gate.admit_foreign(proven(device), &slip, &badge, &service("ssh")),
+        Decision::Admit
+    );
+    let admitted = gate
+        .admit_foreign_witnessed(proven(device), &slip, &badge, &service("ssh"))
+        .expect("a recorded fleet slip admits the fleet's device");
+    assert_eq!(admitted.kind(), Admission::Slip);
+
+    // With no pin at all: the own key's slips do not depend on a root.
+    let gate = anchored_gate(None, &[&slip]);
+    assert_eq!(
+        gate.admit_foreign(proven(device), &slip, &badge, &service("ssh")),
+        Decision::Admit
+    );
+}
+
+#[test]
+fn a_node_signed_fleet_slip_absent_from_the_ledger_is_refused() {
+    let device = identity(4).verifying_key();
+    let gate = anchored_gate(Some(PIN), &[]);
+
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &own_fleet_slip(2, "ssh"),
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+}
+
+#[test]
+fn a_foreign_slip_naming_own_as_authority_is_refused() {
+    // A recorded fleet slip naming the own key as its fleet. Anyone holding a copy of the own key can
+    // badge a key of their choosing under it, so the slip is refused before any badge is read.
+    let thief = identity(7).verifying_key();
+    let slip = own_fleet_slip(OWN, "ssh");
+    let badge = bound_badge(OWN, thief);
+    let gate = anchored_gate(Some(PIN), &[&slip]);
+
+    assert_eq!(
+        gate.admit_foreign(proven(thief), &slip, &badge, &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+}
+
+#[tokio::test]
+async fn a_latched_fleet_refuses_a_node_signed_fleet_slip() {
+    // A disabled fleet authority refuses its devices on the own key's fleet slip, asked before the pair
+    // verifies (this slip is for `web`, asked for `ssh`, so a late read would report the miss) and again
+    // after it.
+    let device = identity(4).verifying_key();
+    let web = own_fleet_slip(2, "web");
+    let ssh = own_fleet_slip(2, "ssh");
+    let (gate, path) = anchored_gate_disabling(2, &[&web, &ssh], "fleet").await;
+
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &web,
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked)
+    );
+    let _ = std::fs::remove_file(&path);
+
+    let gate = Gate::anchored(
+        FixedPin(None),
+        own_key(),
+        DisabledMidEvaluation {
+            root: identity(2).verifying_key(),
+            asked: core::sync::atomic::AtomicU32::new(0),
+        },
+        Ledger::of(&[&ssh]),
+    );
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &ssh,
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::Revoked)
+    );
+}
+
+#[test]
+fn a_cap_rooted_elsewhere_never_takes_the_self_anchor_path() {
+    // A stranger's slip roots at neither the pin nor the own key. Its id is in the record, so only the
+    // choice of path can refuse it.
+    let stranger = slip(5, "ssh");
+    let stranger_fleet = identity(5)
+        .mint_authority_slip(&service("ssh"), identity(2).verifying_key(), hour())
+        .expect("mint stranger fleet slip");
+    let gate = anchored_gate(Some(PIN), &[&stranger, &stranger_fleet]);
+    let device = identity(4).verifying_key();
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&stranger), &service("ssh")),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert_eq!(
+        gate.admit_foreign(
+            proven(device),
+            &stranger_fleet,
+            &foreign_badge(2, device),
+            &service("ssh")
+        ),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+}
+
+#[test]
+fn an_anchored_gate_wants_a_capability() {
+    let gate = anchored_gate(Some(PIN), &[]);
+    assert!(gate.wants_capability());
+    assert_eq!(
+        gate.admit(proven(some_peer()), None, &service("ssh")),
+        Decision::Refuse(Refusal::Missing)
+    );
+}
+
+#[test]
+fn a_self_anchored_admission_is_origin_rooted() {
+    // A handler that serves only verified peers reads the origin. The own key is one of the gate's
+    // authorities, so its admissions are `Rooted`, on both paths.
+    let device = identity(4).verifying_key();
+    let ssh = slip(OWN, "ssh");
+    let fleet = own_fleet_slip(2, "ssh");
+    let gate = anchored_gate(Some(PIN), &[&ssh, &fleet]);
+
+    let plain = gate
+        .admit_witnessed(proven(device), Some(&ssh), &service("ssh"))
+        .expect("a recorded own slip admits");
+    assert_eq!(plain.origin(), Origin::Rooted);
+    let foreign = gate
+        .admit_foreign_witnessed(
+            proven(device),
+            &fleet,
+            &foreign_badge(2, device),
+            &service("ssh"),
+        )
+        .expect("a recorded fleet slip admits");
+    assert_eq!(foreign.origin(), Origin::Rooted);
+}
+
+#[test]
+fn an_anchored_gate_refuses_a_revoked_peer_key_before_any_cap() {
+    // On every entry point and on both authorities, the device's own key is asked before any token.
+    let device = identity(4).verifying_key();
+    let own_slip = slip(OWN, "ssh");
+    let fleet = own_fleet_slip(2, "ssh");
+    let store = Arc::new(RevokedKey::new(device));
+    let gate = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        Arc::clone(&store),
+        Ledger::of(&[&own_slip, &fleet]),
+    );
+
+    for presented in [Some(&own_slip), Some(&bound_badge(PIN, device)), None] {
+        assert_eq!(
+            gate.admit(proven(device), presented, &service("ssh")),
+            Decision::Refuse(Refusal::Revoked)
+        );
+        assert!(matches!(
+            gate.admit_witnessed(proven(device), presented, &service("ssh")),
+            Err(Refusal::Revoked)
+        ));
+    }
+    for slip in [&fleet, &authority_slip(2, "ssh")] {
+        assert_eq!(
+            gate.admit_foreign(
+                proven(device),
+                slip,
+                &foreign_badge(2, device),
+                &service("ssh")
+            ),
+            Decision::Refuse(Refusal::Revoked)
+        );
+        assert!(matches!(
+            gate.admit_foreign_witnessed(
+                proven(device),
+                slip,
+                &foreign_badge(2, device),
+                &service("ssh")
+            ),
+            Err(Refusal::Revoked)
+        ));
+    }
+    assert_eq!(store.caps_asked(), 0, "no presented token was read");
+
+    let sibling = identity(5).verifying_key();
+    assert_eq!(
+        gate.admit(proven(sibling), Some(&own_slip), &service("ssh")),
+        Decision::Admit,
+        "a device whose key is not revoked is admitted"
+    );
+}
+
+#[tokio::test]
+async fn a_latch_forwards_is_revoked_peer_on_an_anchored_gate() {
+    let path =
+        std::env::temp_dir().join(format!("nauthy-anchored-latch-peer-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    let disabled = DisabledRoots::load(path.clone()).await.expect("load");
+    let device = identity(4).verifying_key();
+    let own_slip = slip(OWN, "ssh");
+    let gate = Gate::anchored(
+        FixedPin(None),
+        own_key(),
+        Latch::new(disabled, RevokedKey::new(device)),
+        Ledger::of(&[&own_slip]),
+    );
+
+    assert_eq!(
+        gate.admit(proven(device), Some(&own_slip), &service("ssh")),
+        Decision::Refuse(Refusal::Revoked)
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn pin_source_for_arc_reads_through() {
+    // One source shared behind an `Arc` answers as the source does now, so a gate and any other reader
+    // holding the same `Arc` agree on the pin.
+    let pin = Arc::new(MovablePin::new(None));
+    let shared: Arc<MovablePin> = Arc::clone(&pin);
+    assert_eq!(PinSource::current(&shared), None);
+    pin.set(Some(own_key()));
+    assert_eq!(PinSource::current(&shared), Some(own_key()));
+
+    let device = identity(4).verifying_key();
+    let gate = Gate::anchored(
+        Arc::clone(&pin),
+        own_key(),
+        FileDenylist::empty(PathBuf::new()),
+        Ledger(Vec::new()),
+    );
+    pin.set(Some(identity(PIN).verifying_key()));
+    assert_eq!(
+        gate.admit(
+            proven(device),
+            Some(&bound_badge(PIN, device)),
             &service("ssh")
         ),
         Decision::Admit

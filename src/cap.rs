@@ -639,6 +639,23 @@ impl Cap {
         Ok(rows.into_iter().next().map(|(x,)| x))
     }
 
+    /// Whether this cap is a MEMBERSHIP badge by what its issuer signed: its AUTHORITY block carries
+    /// `member(true)`. Reads origin-0 facts only, the same wall as `authority_bound_text`, and asks nothing
+    /// about the peer, the time, or any added block.
+    ///
+    /// This is the question a path that must never admit a member asks, and it is deliberately not
+    /// [`verify_member_at_root_without_revocation`](Self::verify_member_at_root_without_revocation): that
+    /// one supplies no `service` fact, so a holder who narrows a badge to one service with
+    /// [`attenuate`](Self::attenuate) makes it fail there while it still passes the service question. The
+    /// badge is still a badge, and this read still sees it.
+    pub(crate) fn is_member_badge(&self) -> Result<bool, CapError> {
+        let mut authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
+        let rows: Vec<(bool,)> = authorizer
+            .query("badge(true) <- member(true)")
+            .map_err(CapError::from_evaluation)?;
+        Ok(!rows.is_empty())
+    }
+
     /// Evaluate `program` against this token under [`AUTHORIZER_LIMITS`] and rule on its policies.
     ///
     /// The only place a cap RULES on datalog (the others run it to READ one authority fact:

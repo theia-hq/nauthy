@@ -126,6 +126,27 @@ witness carries the proven peer, the admission kind, and its origin (`Origin::Ro
 so a handler can refuse an open-gate admission even when its route reached it. A handler that takes an
 `Admitted` cannot be reached without a gate having permitted the peer.
 
+## A machine that signs its own grants
+
+`Gate::rooted` trusts one key for good. `Gate::anchored` is for a machine that holds a key of its own
+beside the root it trusts:
+
+```rust
+let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued);
+```
+
+- `pin` is a `PinSource`, asked on every admission, so a root written while the gate serves is trusted at
+  the next connection. A token rooted at it is ruled exactly as `Gate::rooted` rules. With no pin, no
+  token admits a member.
+- A token rooted at `own` is admitted only as a service slip, and only when `issued` (an `IssuedIds`)
+  holds its `root_revocation_id`. Record that id when you mint. A copy of the key mints slips with fresh
+  ids, so it cannot mint access. A membership badge `own` signed is refused, and so is a fleet slip that
+  names `own` as its authority.
+- A pin equal to `own` is no pin.
+
+Its admissions carry `Origin::Rooted`; one made under `own` is never a member. `PinSource` is implemented
+for `Arc<P>`, so the gate and any other reader can share one source.
+
 A link is `sheer:<key>.<token>`: it carries the authority's public key beside the token, so a holder can
 decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone. The
 `Link` type owns that text; parsing validates the signature chain at the wire edge.
