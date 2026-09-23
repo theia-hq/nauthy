@@ -2,10 +2,10 @@
 
 All notable changes to nauthy, newest first.
 
-## Unreleased
+## v0.5.0
 
 ### Breaking
-- **This release is 0.5.0, and it breaks.** `DenylistError` has a new `Lost` variant, and
+- **Two error enums changed.** `DenylistError` has a new `Lost` variant, and
   `DenylistError` and `DisabledRootsError` are now `#[non_exhaustive]`. A `match` on either needs a
   wildcard arm. Code that only passes the error on with `?` is unaffected. Future variants will not
   break it again.
@@ -21,6 +21,12 @@ All notable changes to nauthy, newest first.
   `malformed_line` reports it. Nothing in the API removes a key. The limit: a process that starts after
   both the file and its `.written` witness are gone trusts those roots again. Keep them in a directory
   only the node's user can write.
+
+- **`FileDenylist::is_revoked_any`** answers whether any of a set of revocation ids is revoked, in one
+  read. A server that remembers the ids of the caps it admitted can ask, while a session is live, whether
+  any of them has since been revoked.
+- **`Revocations` is implemented for `Arc<R>`**, so one store can be shared by the gate and by code
+  that checks live sessions.
 
 ### Fixed
 - **A revocation could vanish in a power cut after `revoke` returned.** The file is now flushed to
