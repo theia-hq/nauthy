@@ -12,7 +12,7 @@
 //! never removes a key it has already read, and there is no method that removes one. Nothing on this
 //! surface re-enables a root; recovery is a new root.
 //!
-//! The file is one key per line in the [`VerifyKey`] string form (`bf01...`), the same text a consumer
+//! The file is one key per line in the [`VerifyKey`] string form (`ed01...`), the same text a consumer
 //! compares it against, so the latch and the authority it names speak one encoding. Its location is the
 //! consuming process's to choose, as with the denylist.
 
