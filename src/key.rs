@@ -55,12 +55,22 @@ impl FromStr for VerifyKey {
         if !tag.eq_ignore_ascii_case(TAG) {
             return Err(KeyParseError::UnknownSuite);
         }
-        let raw = BASE32_NOPAD
-            .decode(encoded.to_uppercase().as_bytes())
-            .map_err(|_| KeyParseError::BadEncoding)?;
+        let raw = decode_base32(encoded).ok_or(KeyParseError::BadEncoding)?;
         let bytes = <[u8; Self::LEN]>::try_from(raw).map_err(|_| KeyParseError::WrongLength)?;
         Ok(Self(bytes))
     }
+}
+
+/// Decode unpadded base32 text in either case. Case folding is ASCII-only and any non-ASCII input is
+/// refused first: a Unicode fold maps some non-ASCII letters onto ASCII ones (`ſ` to `S`, `ı` to `I`),
+/// which would let text that is not the key's text decode to the same bytes.
+pub(crate) fn decode_base32(encoded: &str) -> Option<Vec<u8>> {
+    if !encoded.is_ascii() {
+        return None;
+    }
+    BASE32_NOPAD
+        .decode(encoded.to_ascii_uppercase().as_bytes())
+        .ok()
 }
 
 /// Why a string could not be parsed into a [`VerifyKey`].

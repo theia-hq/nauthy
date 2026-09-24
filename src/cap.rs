@@ -723,9 +723,7 @@ impl Cap {
             return Err(CapError::TooLarge);
         }
         let root = root.parse::<VerifyKey>().map_err(|_| CapError::Malformed)?;
-        let bytes = BASE32_NOPAD
-            .decode(encoded.to_uppercase().as_bytes())
-            .map_err(|_| CapError::Encoding)?;
+        let bytes = crate::key::decode_base32(encoded).ok_or(CapError::Encoding)?;
         let public = root_key(root)?;
         // Decoding with the embedded root verifies the signature chain back to it; a token that does not
         // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
