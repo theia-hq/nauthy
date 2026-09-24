@@ -420,6 +420,47 @@ fn a_prefixed_link_is_malformed() {
 }
 
 #[test]
+fn a_second_separator_is_malformed() {
+    // A key and a token each hold no separator, so text with two is the wrong shape: it is refused as
+    // malformed before the token is decoded, not reported as bad base32.
+    let issuer = identity(1);
+    let link = issuer
+        .mint(&service("ssh"), at(3600))
+        .expect("mint")
+        .link()
+        .expect("encode");
+    let (root, token) = link.as_str().split_once('.').expect("key.token");
+    let (head, tail) = token.split_at(token.len() / 2);
+    for text in [
+        format!("{root}.{head}.{tail}"),
+        format!("{root}.{token}."),
+        format!("{root}..{token}"),
+    ] {
+        assert!(
+            matches!(Cap::parse(&text), Err(CapError::Malformed)),
+            "{text:?} has two separators"
+        );
+    }
+}
+
+#[test]
+fn a_key_prints_with_no_separator_and_no_colon() {
+    // A link is split at its one `.`, and a caller tells a key from a link, or a link from text written
+    // around it, by those two characters. That holds only while a key's text carries neither.
+    for seed in 0..=u8::MAX {
+        let key = identity(seed).verifying_key().to_string();
+        assert!(
+            !key.contains('.') && !key.contains(':'),
+            "key text {key:?} carries a separator or a colon"
+        );
+        assert!(
+            key.chars().all(|c| c.is_ascii_alphanumeric()),
+            "key text {key:?} is not plain alphanumerics"
+        );
+    }
+}
+
+#[test]
 fn an_oversized_link_is_refused_before_decoding() {
     // A body past the size bound is rejected before the base32 decode + signature verification, so an
     // untrusted peer cannot force that work with a huge link (the availability DoS the red-team found).
@@ -473,6 +514,31 @@ fn authority_bound_root_reads_the_pinned_authority_offline() {
             .expect("reads no pinned authority"),
         None,
         "a plain slip pins no authority, so the dialer attaches no foreign badge"
+    );
+}
+
+#[test]
+fn a_pinned_authority_that_is_no_key_is_its_own_error() {
+    // The slip parses and verifies, but the authority it pins is not a key. That is a fault in a signed
+    // token, not in link text, so it reads as its own cause and never as a malformed link.
+    let work = identity(1);
+    let slip = work
+        .mint_authority_slip_pinning(&service("ssh"), "not-a-key", at(3600))
+        .expect("mint a slip pinning a broken authority");
+    let reparsed =
+        Cap::parse(slip.link().expect("encode").as_str()).expect("the link itself is sound");
+    assert!(matches!(
+        reparsed.authority_bound_root(),
+        Err(CapError::MalformedAuthority)
+    ));
+    let at_gate = reparsed.verify_authority_bound_at_root_without_revocation(
+        &request("ssh", 0),
+        work.verifying_key(),
+    );
+    assert!(matches!(at_gate, Err(CapError::MalformedAuthority)));
+    assert_eq!(
+        CapError::MalformedAuthority.to_string(),
+        "capability pins a malformed authority key"
     );
 }
 

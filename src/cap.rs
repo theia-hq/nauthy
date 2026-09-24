@@ -490,7 +490,7 @@ impl Cap {
             .ok_or(CapError::NotAuthorityBound)?;
         let x = x_text
             .parse::<VerifyKey>()
-            .map_err(|_| CapError::Malformed)?;
+            .map_err(|_| CapError::MalformedAuthority)?;
         // Authorize the slip's service + expiry checks AND satisfy its `foreign_member($x)` check by
         // injecting the authority it named. This is what makes it authorize HERE and NOWHERE else; the gate
         // still ANDs an independent badge check under `x` before it admits, so this method never admits on
@@ -616,7 +616,10 @@ impl Cap {
     /// of the pinned authority.
     pub fn authority_bound_root(&self) -> Result<Option<VerifyKey>, CapError> {
         self.authority_bound_text()?
-            .map(|x| x.parse::<VerifyKey>().map_err(|_| CapError::Malformed))
+            .map(|x| {
+                x.parse::<VerifyKey>()
+                    .map_err(|_| CapError::MalformedAuthority)
+            })
             .transpose()
     }
 
@@ -708,6 +711,10 @@ impl Cap {
     /// caveats (service, expiry); that is [`Identity::verify`]'s job at connect time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
         let (root, encoded) = link.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
+        // A key and a token each hold no separator, so a second one is a broken shape, not bad base32.
+        if encoded.contains(SEPARATOR) {
+            return Err(CapError::Malformed);
+        }
         // Bound the token size BEFORE the expensive work: base32-decoding a huge body, and then the
         // O(blocks) signature-chain verification, both run before any trust check, so an untrusted peer
         // could otherwise burn CPU with an oversized or many-block link (a foreign token is parsed here,
@@ -854,6 +861,35 @@ impl Identity {
         let token = token
             .append(block!(r#"member(true);"#))
             .map_err(CapError::Attenuate)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: an authority slip whose `authority_bound` fact pins `pinned` verbatim, so a test can
+    /// sign a pinned authority that is not a well-formed key, which [`Identity::mint_authority_slip`]
+    /// cannot express because it takes a typed [`VerifyKey`].
+    pub(crate) fn mint_authority_slip_pinning(
+        &self,
+        service: &Service,
+        pinned: &str,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            authority_bound({pinned});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if authority_bound($x), foreign_member($x);
+            "#,
+            pinned = pinned,
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
         Ok(Cap {
             root: self.verifying_key(),
             token,
@@ -1331,12 +1367,17 @@ pub enum CapError {
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
-    /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing
-    /// separator, or anything written before the key), or a node-id /
-    /// authority-fact key that is not a well-formed [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified),
-    /// a signature-chain failure, because a structural break is a malformed input, not a security event.
+    /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing or
+    /// second separator, or anything written before the key), or a key that is not a well-formed
+    /// [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified), a signature-chain failure, because a
+    /// structural break is a malformed input, not a security event.
     #[error("not a link: expected <key>.<token>")]
     Malformed,
+    /// The cap parsed and verified, but the authority key its `authority_bound` fact pins is not a
+    /// well-formed [`VerifyKey`]. A property of a signed token, not of link text, so it is kept apart from
+    /// [`Malformed`](Self::Malformed): the input was a link, and the issuer signed a key nobody can hold.
+    #[error("capability pins a malformed authority key")]
+    MalformedAuthority,
     /// The token decoded but its signature chain did not verify against the embedded root: tampered,
     /// truncated mid-chain, or never signed by the key it claims. A security-relevant failure, kept distinct
     /// from [`Malformed`](Self::Malformed).

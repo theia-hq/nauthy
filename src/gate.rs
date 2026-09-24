@@ -968,6 +968,7 @@ impl From<Result<VerifyKey, CapError>> for Checked {
                 | CapError::TooComplex
                 | CapError::Encoding
                 | CapError::Malformed
+                | CapError::MalformedAuthority
                 | CapError::Unverified
                 | CapError::Key(_)
                 | CapError::Mint(_)
