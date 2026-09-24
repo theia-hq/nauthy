@@ -74,6 +74,8 @@ mod disabled_roots_tests;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
+mod key_tests;
+#[cfg(test)]
 mod link_tests;
 #[cfg(test)]
 mod revocations_tests;

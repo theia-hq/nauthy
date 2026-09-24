@@ -9,18 +9,15 @@ use core::str::FromStr;
 
 use data_encoding::BASE32_NOPAD;
 
-/// The four-character wire tag prefixing a key's string form.
-///
-/// SHARED BY CONVENTION with `bifrost_core::id` (its `CryptoKind::Ed25519` tag). A [`VerifyKey`] and a
-/// `bifrost_core::NodeId` for the same ed25519 key MUST render to the same string, because a link
-/// embeds that string and both sides parse it: if this tag ever diverges from bifrost's, minted links stop
-/// round-tripping across the boundary silently. Change one, change both.
-const TAG: &str = "bf01";
+/// The suite tag at the front of a key's text: `ed01` is Ed25519. The key text format is the tag, then the
+/// 32 key bytes in RFC 4648 base32, lowercase, unpadded. Any library that prints an Ed25519 key in this
+/// format prints exactly this text; `the_key_text_is_the_shared_vector` pins it.
+const TAG: &str = "ed01";
 
 /// A peer identity nauthy authorizes: a raw 32-byte ed25519 public (verifying) key.
 ///
-/// This is the key a cap roots at and a transport handshake proves the peer holds. Its string form is a
-/// four-character suite tag `bf01` then the base32-lowercase key body. The bytes are a plain ed25519 public
+/// This is the key a cap roots at and a transport handshake proves the peer holds. Its string form is the
+/// suite tag `ed01`, then the base32-lowercase key body. The bytes are a plain ed25519 public
 /// key, so a `VerifyKey` is interchangeable with any transport that identifies a peer by its ed25519 key:
 /// a link embeds this string form and round-trips across that boundary with no conversion at the
 /// wire.
@@ -55,7 +52,7 @@ impl FromStr for VerifyKey {
         let (tag, encoded) = text
             .split_at_checked(TAG.len())
             .ok_or(KeyParseError::TooShort)?;
-        if tag != TAG {
+        if !tag.eq_ignore_ascii_case(TAG) {
             return Err(KeyParseError::UnknownSuite);
         }
         let raw = BASE32_NOPAD
@@ -69,7 +66,7 @@ impl FromStr for VerifyKey {
 /// Why a string could not be parsed into a [`VerifyKey`].
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KeyParseError {
-    /// The input was shorter than the four-character suite tag.
+    /// The input was shorter than the suite tag.
     #[error("identity string too short")]
     TooShort,
     /// The suite tag was not recognized.
