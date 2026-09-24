@@ -14,7 +14,7 @@
 #
 # WHAT IT CHECKS, per crate found under ROOT:
 #
-#   1. CRATE-NAME check -- the crate's files reference, AS A CRATE, a theia crate that is
+#   1. CRATE-NAME check -- the crate's files reference, AS A CRATE, a sibling crate that is
 #      NOT its foundation. A crate's foundation is: a declared DEPENDENCY (a downward
 #      reference, always legal -- an app names the library it depends on), or a co-located
 #      sibling LIBRARY in its own tree (the substrate crates in a workspace document each
@@ -30,6 +30,9 @@
 #
 #   4. CONSUMER-WORD check -- any tracked file but a CHANGELOG names a layer that depends on
 #      this repo. The layers and their order are the one table in check 4.
+#
+#   5. OWN-WORDS check -- any tracked file but a CHANGELOG, in a library, uses the org's name
+#      as its own word. Only the org's address may carry it.
 #
 # NOTHING IS HARDCODED about WHICH crates exist. The crate SET is DERIVED (see below) from
 # the Cargo.toml manifests in the tree, so a new crate is covered the day it lands. Each
@@ -56,19 +59,19 @@ ALLOW_MARK="layering-gate:allow"
 FLAG_TOKENS="--for --public --peer --authkey --to"
 
 # ---------------------------------------------------------------------------------------
-# DERIVE the crate SET (the "universe" of theia crate names) from the manifests under ROOT.
+# DERIVE the crate SET (the "universe" of sibling crate names) from the manifests under ROOT.
 #
-# A theia crate name enters the universe two ways:
-#   (a) it is a package DEFINED in this tree     -- `name = "..."` under `[package]`.
-#   (b) it is a theia crate this tree DEPENDS ON  -- a dependency whose source is a theia
+# A sibling crate name enters the universe two ways:
+#   (a) it is a package DEFINED in this tree      -- `name = "..."` under `[package]`.
+#   (b) it is a sibling crate this tree DEPENDS ON -- a dependency whose source is a sibling
 #       one: `git = "...github.com/theia-hq/..."` or a local `path = "..."`. The dependency
 #       KEY is the crate name. (A `.workspace = true` dep resolves to such a line in the
 #       workspace root's [workspace.dependencies], which IS scanned, so it is covered.)
-# Third-party deps (`tokio = "1"`, a non-theia git) never match (a) or (b), so they never
+# Third-party deps (`tokio = "1"`, a non-sibling git) never match (a) or (b), so they never
 # enter the universe and never trip the check.
 #
 # Scanning is over EVERY Cargo.toml under ROOT. This gate is meant to run PER REPO (as CI and
-# the umbrella `just gate` both do): the universe is that repo's own crates plus the theia
+# the umbrella `just gate` both do): the universe is that repo's own crates plus the sibling
 # crates it depends on. A dependency crate from another repo enters the universe as an
 # EXTERNAL name, which is what makes a sibling that does not depend on it naming it a
 # detectable leak.
@@ -86,7 +89,7 @@ universe_pkgs=$(printf '%s\n' "$manifests" | while read -r m; do
   sed -n 's/^name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$m" | head -n1
 done)
 
-# (b) theia dependency keys: a dep line pointing at a theia git or a local path. The key is
+# (b) sibling dependency keys: a dep line pointing at a sibling git or a local path. The key is
 # the leading token before `=`/`.`/whitespace. `[workspace.dependencies]` lines are included.
 universe_deps=$(printf '%s\n' "$manifests" | while read -r m; do
   [ -n "$m" ] || continue
@@ -251,7 +254,7 @@ $(find "$dir/docs" -name '*.md' -not -path '*/target/*' -not -path '*/_archived/
   for doc in $docs; do
     [ -f "$doc" ] || continue
 
-    # 3b. Derive the consumer names to police FROM THE DOC ITSELF: any theia crate the doc
+    # 3b. Derive the consumer names to police FROM THE DOC ITSELF: any sibling crate the doc
     # LINKS to (`github.com/theia-hq/N`). Nothing is hardcoded, so a doc that links no
     # consumer polices none, and a bare name that shares a word with prose never trips. From
     # that link set, drop this crate's OWN foundation: its own name, a co-located sibling
@@ -304,10 +307,10 @@ done
 # 4. CONSUMER-WORD check: a repo names no layer that depends on it, anywhere but a CHANGELOG
 # (LAYERS.md placement test 3). Downstream may name upstream, never the reverse.
 #
-# LAYERS is the family's one table, lowest first. Each row is a layer, the DISTINCTIVE words
-# that name it (never a common English word that prose would trip on), and the layers it
-# depends on directly, as its Cargo.toml declares them (a layer with no manifest lists what it
-# runs). This repo finds its own row by the package its root Cargo.toml defines, or for a
+# LAYERS is the family's one table, lowest first. Each row is a kind (`lib` for a library, `app`
+# for a program built on the libraries), a layer, the DISTINCTIVE words that name it (never a
+# common English word that prose would trip on), and the layers it depends on directly, as its
+# Cargo.toml declares them (a layer with no manifest lists what it runs). This repo finds its own row by the package its root Cargo.toml defines, or for a
 # virtual workspace a package among its members, and forbids the words of every layer that
 # depends on it, directly or through another layer. A layer it depends on is never forbidden.
 #
@@ -318,22 +321,36 @@ done
 # lines exempt, and only in this file: every other line here, comments included, is checked
 # like any file. The same-line allow marker is NOT honored. A new layer is one row in every copy.
 LAYERS='
-layer nauthy    | nauthy       |
-layer quirk     | quirk        |
-layer bifrost   | bifrost      | quirk
-layer tightbeam | tightbeam    | bifrost nauthy
-layer services  | sshh         | bifrost nauthy tightbeam
-layer swoosh    | swoosh sheer | bifrost nauthy services tightbeam
-layer qat       | qat          | swoosh
+lib nauthy    | nauthy       |
+lib quirk     | quirk        |
+lib bifrost   | bifrost      | quirk
+lib tightbeam | tightbeam    | bifrost nauthy
+lib services  | sshh         | bifrost nauthy tightbeam
+app swoosh    | swoosh sheer | bifrost nauthy services tightbeam
+app qat       | qat          | swoosh
 '
-LAYER_ROW='^layer [a-z]+ +\| [a-z ]+\|[a-z ]*$'
+LAYER_ROW='^(lib|app) [a-z]+ +\| [a-z ]+\|[a-z ]*$'
 
-# layer_field NAME COL -- column COL (2 words, 3 deps) of layer NAME's row.
+# layer_field NAME COL -- column COL (1 kind, 2 words, 3 deps) of layer NAME's row.
 layer_field() {
-  printf '%s\n' "$LAYERS" | awk -F'|' -v n="$1" -v c="$2" \
-    '{ split($1, a, " "); if (a[1] == "layer" && a[2] == n) print $c }'
+  printf '%s\n' "$LAYERS" | awk -F'|' -v n="$1" -v c="$2" '{
+    split($1, a, " ")
+    if ((a[1] == "lib" || a[1] == "app") && a[2] == n) print (c == 1 ? a[1] : $c)
+  }'
 }
-layer_names=$(printf '%s\n' "$LAYERS" | awk '$1 == "layer" { print $2 }')
+layer_names=$(printf '%s\n' "$LAYERS" | awk '$1 == "lib" || $1 == "app" { print $2 }')
+
+scratch=$(mktemp -d)
+trap 'rm -rf "$scratch"' EXIT
+# git_ok WHAT STATUS MAX_OK -- a git read that exited above MAX_OK or wrote to stderr fails the
+# gate.
+git_ok() {
+  if [ "$2" -gt "$3" ] || [ -s "$scratch/err" ]; then
+    printf 'LEAK  %s failed (exit %s), so the scan is incomplete:\n' "$1" "$2"
+    sed 's/^/        /' "$scratch/err"
+    fail=1
+  fi
+}
 
 # The packages the root manifest defines: its own `[package]`, or its workspace members'.
 root_pkgs=""
@@ -415,18 +432,6 @@ else
       done
       humped=${humped#|}
 
-      scratch=$(mktemp -d)
-      trap 'rm -rf "$scratch"' EXIT
-      # git_ok WHAT STATUS MAX_OK -- a git read that exited above MAX_OK or wrote to stderr fails
-      # the gate.
-      git_ok() {
-        if [ "$2" -gt "$3" ] || [ -s "$scratch/err" ]; then
-          printf 'LEAK  check 4: %s failed (exit %s), so the scan is incomplete:\n' "$1" "$2"
-          sed 's/^/        /' "$scratch/err"
-          fail=1
-        fi
-      }
-
       # Lines. git grep reads tracked paths itself, so a name with a space or a newline is never
       # split. It exits 0 on a match, 1 on none, and above 1 on an error.
       # grep_lines CASE PATTERN -- add the tracked lines, CHANGELOGs aside, that match to hits.
@@ -435,7 +440,7 @@ else
         st=0
         out=$(git -C "$ROOT" grep -I -n "$1" -E -e "$2" \
           -- . ':(exclude,glob)**/CHANGELOG.md' 2>"$scratch/err") || st=$?
-        git_ok "git grep" "$st" 1
+        git_ok "check 4: git grep" "$st" 1
         hits="$hits
 $out"
       }
@@ -454,7 +459,7 @@ $out"
       st=0
       git -C "$ROOT" ls-files -z -- . ':(exclude,glob)**/CHANGELOG.md' \
         >"$scratch/paths" 2>"$scratch/err" || st=$?
-      git_ok "git ls-files" "$st" 0
+      git_ok "check 4: git ls-files" "$st" 0
       tr '\0' '\n' <"$scratch/paths" >"$scratch/lines"
       paths=$( { grep -i -E -e "$bounded" "$scratch/lines"; grep -E -e "$humped" "$scratch/lines"; } \
         | sort -u || true)
@@ -464,6 +469,58 @@ $out"
         fail=1
       fi
     fi
+  fi
+fi
+
+# 5. OWN-WORDS check: a library speaks its own words (LAYERS.md placement test 3). The org's
+# name, ORG below, is the org's word, never a library's: a library's wire, key, file and env
+# names and its prose use its own crate's name. It matches as a substring in any case, so
+# `_org`, `ORGKEY` and `ORG_HOME` are all caught, after the org's address (ORG then `-hq`) is
+# removed from each line. Every tracked file is scanned but a CHANGELOG, its lines and its path.
+# The ORG line is the only line exempt, and only in this file. An `app` row is skipped: a program
+# built on the libraries may use any word. A repo no row names is scanned.
+ORG='theia'
+ORG_LINE="^ORG='[a-z]+'\$"
+
+# own_org_hits -- read lines on stdin, print each whose text (after any `path:line:` prefix)
+# still holds ORG once every ORG-hq is removed.
+own_org_hits() {
+  awk -v w="$ORG" -v p="$1" '{
+    l = tolower($0)
+    if (p) sub(/^[^:]*:[0-9]+:/, "", l)
+    gsub(w "-hq", "", l)
+    if (index(l, w)) print
+  }'
+}
+
+if [ -n "$own_layer" ] && [ "$(layer_field "$own_layer" 1)" = app ]; then
+  printf 'layering-gate: check 5: layer %s is an app, skipped\n' "$own_layer"
+elif ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  printf 'LEAK  check 5: %s is not a git checkout, so its tracked files cannot be read\n' "$ROOT"
+  fail=1
+else
+  st=0
+  out=$(git -C "$ROOT" grep -I -n --ignore-case -F -e "$ORG" \
+    -- . ':(exclude,glob)**/CHANGELOG.md' 2>"$scratch/err") || st=$?
+  git_ok "check 5: git grep" "$st" 1
+  hits=$(printf '%s\n' "$out" | grep . \
+    | grep -v -E "^scripts/layering-gate\.sh:[0-9]+:${ORG_LINE#^}" \
+    | own_org_hits 1 || true)
+  if [ -n "$hits" ]; then
+    printf 'LEAK  this repo uses the org name as its own word (only %s-hq is allowed):\n' "$ORG"
+    printf '%s\n' "$hits" | sed 's/^/        /'
+    fail=1
+  fi
+
+  st=0
+  git -C "$ROOT" ls-files -z -- . ':(exclude,glob)**/CHANGELOG.md' \
+    >"$scratch/paths" 2>"$scratch/err" || st=$?
+  git_ok "check 5: git ls-files" "$st" 0
+  paths=$(tr '\0' '\n' <"$scratch/paths" | own_org_hits "" || true)
+  if [ -n "$paths" ]; then
+    printf 'LEAK  a tracked path uses the org name (only %s-hq is allowed):\n' "$ORG"
+    printf '%s\n' "$paths" | sed 's/^/        /'
+    fail=1
   fi
 fi
 

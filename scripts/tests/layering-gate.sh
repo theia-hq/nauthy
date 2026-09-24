@@ -1,10 +1,11 @@
 #!/bin/sh
-# layering-gate fixture: exercise check 4 of scripts/layering-gate.sh on throwaway git trees, so a
-# regression in the layer table, the dependent walk, the word boundary, the path handling or the
-# self-exemption fails HERE instead of passing silently in CI. Each case builds a temp repo whose
-# root manifest names one layer of the table, carries a copy of the gate, plants one file, and
-# asserts the exit code plus a substring of the output. The layers are read from the gate's own
-# table by row number, so this file names none of them.
+# layering-gate fixture: exercise checks 4 and 5 of scripts/layering-gate.sh on throwaway git trees,
+# so a regression in the layer table, the dependent walk, the word boundary, the org-name match,
+# the path handling or the self-exemption fails HERE instead of passing silently in CI. Each case
+# builds a temp repo whose root manifest names one layer of the table, carries a copy of the gate,
+# plants one file, and asserts the exit code plus a substring of the output. The layers are read
+# from the gate's own table by row number and the org's name from its ORG line, so this file names
+# none of them.
 # Dependency-free: POSIX sh + git + awk + grep + sed.
 
 set -eu
@@ -31,12 +32,22 @@ expected_above() {
   esac
 }
 
-rows=$(grep -E '^layer [a-z]+ +\| [a-z ]+\|[a-z ]*$' "$gate")
+# The kind of each row: the libraries sit below the apps built on them.
+expected_kind() {
+  case "$1" in
+    6 | 7) echo app ;;
+    *) echo lib ;;
+  esac
+}
+
+rows=$(grep -E '^(lib|app) [a-z]+ +\| [a-z ]+\|[a-z ]*$' "$gate" || true)
 row_count=$(printf '%s\n' "$rows" | grep -c . || true)
 
 # words_of ROW -- every word of that row; first_word_of ROW -- the one a manifest names.
 words_of() { printf '%s\n' "$rows" | sed -n "${1}p" | awk -F'|' '{ print $2 }' | xargs; }
 first_word_of() { words_of "$1" | awk '{ print $1 }'; }
+kind_of() { printf '%s\n' "$rows" | sed -n "${1}p" | awk '{ print $1 }'; }
+org=$(sed -n "s/^ORG='\([a-z]*\)'\$/\1/p" "$gate")
 
 # mkrepo CASE ROW [ws] -- a git repo whose root manifest identifies as ROW: a root [package]
 # named for it, or with `ws`, a virtual workspace whose member carries that name.
@@ -81,6 +92,10 @@ expect() {
 
 if [ "$row_count" -ne 7 ]; then
   printf 'FAIL  the gate has %s layer rows; this fixture encodes 7. Update expected_above.\n' "$row_count"
+  exit 1
+fi
+if [ -z "$org" ]; then
+  printf 'FAIL  the gate has no ORG line\n'
   exit 1
 fi
 
@@ -183,6 +198,78 @@ mkrepo unknown 1
 sed 's/^name = .*/name = "unlisted"/' "$tmp/unknown/Cargo.toml" > "$tmp/unknown/Cargo.toml.new"
 mv "$tmp/unknown/Cargo.toml.new" "$tmp/unknown/Cargo.toml"
 expect unknown 1 "no LAYERS row" "an unlisted root package fails"
+
+# Check 5. Every library refuses the org's name as its own word, and every app is skipped.
+r=1
+while [ "$r" -le 7 ]; do
+  kind=""
+  [ "$r" -eq 5 ] && kind=ws
+  if [ "$(kind_of "$r")" != "$(expected_kind "$r")" ]; then
+    fail=$((fail + 1))
+    printf 'FAIL  row %s is a %s, want a %s\n' "$r" "$(kind_of "$r")" "$(expected_kind "$r")"
+  fi
+  mkrepo "org-$r" "$r" "$kind"
+  plant "org-$r" src/lib.rs "//! part of $org"
+  if [ "$(expected_kind "$r")" = lib ]; then
+    expect "org-$r" 1 "src/lib.rs:2:" "row $r, a library, refuses the org's name"
+  else
+    expect "org-$r" 0 "is an app, skipped" "row $r, an app, may use the org's name"
+  fi
+  r=$((r + 1))
+done
+
+# The org's name is a substring in any case: a word boundary would miss a run-together constant.
+n=0
+for text in "const SIG: [u8; 8] = *b\"$(upper "$org")KEY\";" "const S: &str = \"_${org}._udp\";" \
+    "const V: &str = \"$(upper "$org")_HOME\";" "struct $(capital "$org")Link;" "//! the ${org}ish way"; do
+  n=$((n + 1))
+  mkrepo "org-sub-$n" 1
+  plant "org-sub-$n" src/lib.rs "$text"
+  expect "org-sub-$n" 1 "src/lib.rs:2:" "the org's name is caught in: $text"
+done
+
+# The org's address is allowed, in any case, and only the address: a bare name beside it is caught.
+mkrepo org-addr 1
+plant org-addr README.md "see https://github.com/${org}-hq/x and git+https://github.com/$(upper "$org")-HQ/y"
+expect org-addr 0 "OK" "the org's address is allowed"
+mkrepo org-addr-bare 1
+plant org-addr-bare README.md "see https://github.com/${org}-hq/x, the $org way"
+expect org-addr-bare 1 "README.md:1:" "a bare name beside the address is caught"
+
+# A tracked path is checked like a line, with the same address exception.
+mkrepo org-path 1
+plant org-path "docs/$(capital "$org")-notes.md" "notes"
+expect org-path 1 "docs/$(capital "$org")-notes.md" "a path with the org's name is caught"
+mkrepo org-path-addr 1
+plant org-path-addr "docs/${org}-hq.md" "notes"
+expect org-path-addr 0 "OK" "a path with the org's address is allowed"
+
+# A CHANGELOG at any depth may keep history.
+mkrepo org-changelog 1
+plant org-changelog CHANGELOG.md "- dropped the $org prefix"
+plant org-changelog crates/x/CHANGELOG.md "- dropped the $org prefix"
+expect org-changelog 0 "OK" "a CHANGELOG may use the org's name"
+
+# Only the ORG line is exempt, and only in the gate.
+mkrepo org-self 1
+plant org-self scripts/layering-gate.sh "# as $org does it"
+expect org-self 1 "scripts/layering-gate.sh:" "a comment in the gate itself is checked for the org's name"
+mkrepo org-linecopy 1
+grep -E "^ORG='" "$gate" > "$tmp/org-linecopy/notes.md"
+expect org-linecopy 1 "notes.md:1:" "the ORG line outside the gate is not exempt"
+
+# A repo the table does not know is still scanned.
+mkrepo org-unknown 1
+sed 's/^name = .*/name = "unlisted"/' "$tmp/org-unknown/Cargo.toml" > "$tmp/org-unknown/Cargo.toml.new"
+mv "$tmp/org-unknown/Cargo.toml.new" "$tmp/org-unknown/Cargo.toml"
+plant org-unknown src/lib.rs "//! part of $org"
+expect org-unknown 1 "uses the org name" "an unlisted repo is scanned for the org's name"
+
+# A git read that fails fails check 5 too.
+mkrepo org-broken 1
+git -C "$tmp/org-broken" add -A
+printf 'junk' > "$tmp/org-broken/.git/index"
+expect org-broken 1 "check 5: git grep failed" "a failed git grep fails check 5" untracked
 
 printf 'layering-gate fixture: %s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
