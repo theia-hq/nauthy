@@ -1651,7 +1651,7 @@ fn gate_proven_refuses_a_revoked_peer_key_on_an_anchored_gate() {
 fn sign_twin(key: VerifyKey) -> VerifyKey {
     let mut bytes = *key.bytes();
     bytes[31] ^= 0x80;
-    VerifyKey::new(bytes)
+    VerifyKey::try_new(bytes).expect("the sign twin of a real key is a real key")
 }
 
 #[test]

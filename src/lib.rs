@@ -90,7 +90,7 @@ pub use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
 pub use crate::gate::{
     Admission, Admitted, Anchor, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
 };
-pub use crate::key::{KeyParseError, VerifyKey};
+pub use crate::key::{KeyError, KeyParseError, VerifyKey};
 pub use crate::link::Link;
 #[cfg(feature = "tokio-fs")]
 pub use crate::revocations::{DenylistError, FileDenylist};

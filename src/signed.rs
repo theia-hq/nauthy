@@ -11,6 +11,7 @@ use ed25519_dalek::{Signature, VerifyingKey};
 
 use crate::VerifyKey;
 use crate::cap::SIGNED_DOCUMENT_CONTEXT;
+use crate::key::KeyError;
 
 /// The detached signature length (ed25519).
 const SIG_LEN: usize = 64;
@@ -60,6 +61,8 @@ impl Signed {
         if self.signer != authority {
             return Err(SignError::ForeignSigner);
         }
+        // Cannot fail: a `VerifyKey` is a checked curve point. Mapped rather than unwrapped so a verify
+        // never panics.
         let verifying =
             VerifyingKey::from_bytes(authority.bytes()).map_err(|_| SignError::BadSignature)?;
         let signature = Signature::from_bytes(&self.signature);
@@ -87,7 +90,8 @@ impl Signed {
 
     /// Parse a wire blob into an UNVERIFIED `Signed` (parse-don't-validate: NO trust check here, call
     /// [`verify`](Signed::verify) against the key you trust). The 32-byte signer and 64-byte signature are
-    /// fixed-width at the front; everything after is the payload. A blob too short to hold both is refused.
+    /// fixed-width at the front; everything after is the payload. A blob too short to hold both is refused,
+    /// and so is one whose signer is not a usable key ([`SignError::Signer`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, SignError> {
         let header = VerifyKey::LEN + SIG_LEN;
         let head = bytes.get(..header).ok_or(SignError::Truncated)?;
@@ -97,7 +101,7 @@ impl Signed {
         signature.copy_from_slice(&head[VerifyKey::LEN..]);
         Ok(Self {
             payload: bytes[header..].to_vec(),
-            signer: VerifyKey::new(signer),
+            signer: VerifyKey::try_new(signer).map_err(SignError::Signer)?,
             signature,
         })
     }
@@ -115,4 +119,7 @@ pub enum SignError {
     /// The signature did not verify against the trusted key.
     #[error("signature is invalid")]
     BadSignature,
+    /// The blob's signer is not a usable ed25519 key.
+    #[error("signer is not a usable identity")]
+    Signer(#[source] KeyError),
 }

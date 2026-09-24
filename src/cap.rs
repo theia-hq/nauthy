@@ -193,7 +193,7 @@ impl Identity {
 
     /// This identity's [`VerifyKey`]: the public key a cap roots at and peers dial.
     pub fn verifying_key(&self) -> VerifyKey {
-        verifying_key_of(&self.root)
+        VerifyKey::from_signing_key(&self.signing)
     }
 
     /// Sign an opaque document with this identity's ed25519 key, producing a self-verifying blob. The signer
@@ -1136,14 +1136,6 @@ impl Request {
 /// A hundred years, the saturating ceiling for [`Request::expires_in`]. Far enough out to be "does not
 /// expire" in practice, near enough that `SystemTime` arithmetic never overflows.
 const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
-
-/// The [`VerifyKey`] that is this keypair's public half.
-fn verifying_key_of(root: &KeyPair) -> VerifyKey {
-    let mut bytes = [0u8; VerifyKey::LEN];
-    // biscuit's PublicKey serializes to exactly 32 ed25519 bytes; the copy pins that into a VerifyKey.
-    bytes.copy_from_slice(&root.public().to_bytes());
-    VerifyKey::new(bytes)
-}
 
 /// The biscuit root public key for a [`VerifyKey`]: the same ed25519 key, read as a verifier root.
 fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {

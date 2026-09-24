@@ -2,6 +2,25 @@
 
 All notable changes to nauthy, newest first.
 
+## Unreleased
+
+### Breaking
+- **A key that is not a usable ed25519 key is refused wherever it enters:** key text (and so a link, a
+  pinned authority, or a line of a `DisabledRoots` file) and the signer of a signed blob. A usable key is
+  the canonical encoding of a prime-order point. A point off the curve, a non-canonical encoding, a
+  small-order point, or a point with a torsion component is refused, and `KeyError` names which.
+  `[1u8; 32]` has a torsion component and is refused; the key the seed `[7; 32]` binds prints as
+  `ed015jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa`.
+- **`VerifyKey::new` is gone.** `VerifyKey::try_new(bytes)` checks the bytes and returns
+  `Result<VerifyKey, KeyError>`.
+- **`KeyParseError` is `#[non_exhaustive]` and gains `Key`.** A `match` on it needs a wildcard arm.
+- **`SignError` gains `Signer`:** `Signed::decode` refuses a blob whose signer is not a usable key.
+  `SignError` is not `#[non_exhaustive]`, so a `match` on it without a wildcard arm no longer compiles.
+
+### Added
+- **`KeyError` names the check a key failed:** `NotOnCurve`, `NotCanonical`, `SmallOrder`, or
+  `HasTorsion`. It is `#[non_exhaustive]`.
+
 ## v0.9.0
 
 ### Breaking
