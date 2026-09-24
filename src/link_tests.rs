@@ -1,4 +1,4 @@
-//! The `sheer:` link as a typed value: parse/display round trip, seal, narrow, and revoke.
+//! The `swoosh:` link as a typed value: parse/display round trip, seal, narrow, and revoke.
 
 use core::time::Duration;
 use std::time::SystemTime;
@@ -115,6 +115,24 @@ fn a_malformed_link_is_rejected() {
             Err(CapError::Unverified | CapError::Encoding)
         ),
         "a flipped token character must fail the signature chain at parse"
+    );
+}
+
+/// A minted link is `swoosh:` text, and the same key and token under the old `sheer:` prefix do not parse.
+#[test]
+fn a_link_is_swoosh_text_and_the_old_sheer_prefix_does_not_parse() {
+    let issuer = identity(1);
+    let link = Link::mint(&issuer, &service("ssh"), Duration::from_secs(3600)).expect("mint");
+    let body = link
+        .as_str()
+        .strip_prefix("swoosh:")
+        .expect("a minted link starts with swoosh:");
+    assert!(
+        matches!(
+            format!("sheer:{body}").parse::<Link>(),
+            Err(CapError::Scheme)
+        ),
+        "the old prefix is refused, not read as an alias"
     );
 }
 

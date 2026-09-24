@@ -247,7 +247,7 @@ fn a_link_round_trips_and_carries_the_root() {
     let issuer = identity(1);
     let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
     let link = cap.link().expect("encode");
-    assert!(link.as_str().starts_with("sheer:"));
+    assert!(link.as_str().starts_with("swoosh:"));
     let parsed = Cap::parse(link.as_str()).expect("parse");
     assert_eq!(parsed.root(), issuer.verifying_key());
     assert!(issuer.verify(&parsed, &request("ssh", 0)).is_ok());
@@ -375,9 +375,45 @@ fn a_sealed_cap_verifies_but_cannot_be_attenuated() {
 }
 
 #[test]
-fn a_non_sheer_link_is_rejected() {
+fn a_non_swoosh_link_is_rejected() {
     assert!(matches!(
         Cap::parse("https://example.com"),
+        Err(CapError::Scheme)
+    ));
+}
+
+#[test]
+fn a_link_is_written_and_read_under_the_swoosh_scheme() {
+    let issuer = identity(1);
+    let link = issuer
+        .mint(&service("ssh"), at(3600))
+        .expect("mint")
+        .link()
+        .expect("encode");
+    let body = link
+        .as_str()
+        .strip_prefix("swoosh:")
+        .expect("a minted link starts with swoosh:");
+    let parsed = Cap::parse(&format!("swoosh:{body}")).expect("a swoosh: link parses");
+    assert_eq!(parsed.root(), issuer.verifying_key());
+}
+
+#[test]
+fn a_valid_token_under_the_old_sheer_scheme_is_refused() {
+    // The same key and token that parse under `swoosh:` are refused under `sheer:`: the prefix alone
+    // decides, and the old one is not read.
+    let issuer = identity(1);
+    let link = issuer
+        .mint(&service("ssh"), at(3600))
+        .expect("mint")
+        .link()
+        .expect("encode");
+    let body = link
+        .as_str()
+        .strip_prefix("swoosh:")
+        .expect("a minted link starts with swoosh:");
+    assert!(matches!(
+        Cap::parse(&format!("sheer:{body}")),
         Err(CapError::Scheme)
     ));
 }
@@ -387,7 +423,7 @@ fn an_oversized_link_is_refused_before_decoding() {
     // A body past the size bound is rejected before the base32 decode + signature verification, so an
     // untrusted peer cannot force that work with a huge link (the availability DoS the red-team found).
     let root = identity(1).verifying_key();
-    let huge = format!("sheer:{root}.{}", "a".repeat(20_000));
+    let huge = format!("swoosh:{root}.{}", "a".repeat(20_000));
     assert!(matches!(Cap::parse(&huge), Err(CapError::TooLarge)));
 }
 

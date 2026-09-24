@@ -1,4 +1,4 @@
-//! A `sheer:` capability link: the shareable wire form of a [`Cap`], parsed and verified at construction.
+//! A `swoosh:` capability link: the shareable wire form of a [`Cap`], parsed and verified at construction.
 
 use core::fmt;
 use core::str::FromStr;
@@ -10,7 +10,7 @@ use crate::cap::{Cap, CapError, Identity, Request};
 use crate::revocations::{DenylistError, FileDenylist};
 use crate::service::Service;
 
-/// A `sheer:` capability link: the shareable text form of a [`Cap`], validated at construction.
+/// A `swoosh:` capability link: the shareable text form of a [`Cap`], validated at construction.
 ///
 /// [`FromStr`] runs [`Cap::parse`], the same check the far gate runs, so holding a `Link` proves the bytes
 /// decoded and the signature chain verified against the embedded root; [`Display`](fmt::Display) renders the
@@ -28,7 +28,7 @@ pub struct Link {
 }
 
 impl Link {
-    /// Mint a `sheer:` link granting `service`, valid for `lifetime` from now.
+    /// Mint a `swoosh:` link granting `service`, valid for `lifetime` from now.
     ///
     /// Left attenuable: any holder may narrow it with [`narrow`](Self::narrow) and hand the narrower result
     /// on, and can never broaden it (the crypto enforces monotonicity). Call [`seal`](Self::seal) to mint a
@@ -41,7 +41,7 @@ impl Link {
         Self::of(identity.mint(service, Request::expires_in(lifetime))?)
     }
 
-    /// Mint a device-bound `sheer:` link granting `service` to the proven device `bound_to`, valid for
+    /// Mint a device-bound `swoosh:` link granting `service` to the proven device `bound_to`, valid for
     /// `lifetime` from now.
     ///
     /// The standing per-service grant for one device ([`Identity::mint_bound`]): the link is inert unless
@@ -61,7 +61,7 @@ impl Link {
         )
     }
 
-    /// Mint a signet-bound `sheer:` link granting `service` to any device of the fleet `foreign_root`,
+    /// Mint a signet-bound `swoosh:` link granting `service` to any device of the fleet `foreign_root`,
     /// valid for `lifetime` from now.
     ///
     /// The work-sim primitive ([`Identity::mint_authority_slip`]): issue ONCE to a person's signet
@@ -128,7 +128,7 @@ impl Link {
         &self.cap
     }
 
-    /// The exact `sheer:` text, as parsed or minted: what [`Display`](fmt::Display) renders and a caller
+    /// The exact `swoosh:` text, as parsed or minted: what [`Display`](fmt::Display) renders and a caller
     /// presents on the wire.
     pub fn as_str(&self) -> &str {
         &self.text
@@ -167,7 +167,7 @@ impl fmt::Display for Link {
 }
 
 impl fmt::Debug for Link {
-    /// Print the link text: a `sheer:` link is public share material, not a secret, and its whole identity
+    /// Print the link text: a `swoosh:` link is public share material, not a secret, and its whole identity
     /// is the bytes a holder pastes.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Link").field(&self.text).finish()

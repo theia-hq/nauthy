@@ -1,4 +1,4 @@
-//! The capability primitive: a `sheer` bearer token, offline-verifiable, rooted at an issuer's own
+//! The capability primitive: a `swoosh:` bearer token, offline-verifiable, rooted at an issuer's own
 //! identity, with no central authority.
 //!
 //! A [`Cap`] is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable token. Its root key is
@@ -17,7 +17,7 @@
 //! pre-dial refusal ([`Cap::expiry`]); the CHECK remains the sole enforcement and no authorization path
 //! here reads the fact.
 //!
-//! A `sheer` link is `sheer:<node-id>.<base32-biscuit>`: it carries the issuer's [`VerifyKey`] (its public
+//! A `swoosh:` link is `swoosh:<node-id>.<base32-biscuit>`: it carries the issuer's [`VerifyKey`] (its public
 //! identity, never a secret) alongside the token, so any holder can decode, attenuate, and hand it off
 //! entirely offline, and a dialer learns which node to dial from the link alone.
 //!
@@ -54,8 +54,8 @@ use crate::revocations::RevocationId;
 use crate::service::Service;
 use crate::signed::Signed;
 
-/// The `sheer:` link scheme prefixing an encoded [`Cap`]. A share-link is `sheer:<node-id>.<base32>`.
-pub const SCHEME: &str = "sheer:";
+/// The `swoosh:` link scheme prefixing an encoded [`Cap`]. A share-link is `swoosh:<node-id>.<base32>`.
+pub const SCHEME: &str = "swoosh:";
 
 /// The separator between the embedded root [`VerifyKey`] and the token body inside a link.
 const SEPARATOR: char = '.';
@@ -704,7 +704,7 @@ pub struct Cap {
 }
 
 impl Cap {
-    /// Decode a cap from a `sheer:<node-id>.<base32>` link.
+    /// Decode a cap from a `swoosh:<node-id>.<base32>` link.
     ///
     /// parse-don't-validate at the wire edge: rejects a bad scheme, a malformed [`VerifyKey`], bad base32,
     /// or bytes whose signature chain does not check against the embedded root. It does NOT evaluate the
@@ -762,12 +762,12 @@ impl Cap {
         self.revocation_ids().into_iter().next()
     }
 
-    /// Encode this cap as a [`Link`]: the shareable `sheer:<node-id>.<base32>` form.
+    /// Encode this cap as a [`Link`]: the shareable `swoosh:<node-id>.<base32>` form.
     pub fn link(&self) -> Result<Link, CapError> {
         Link::of(self.clone())
     }
 
-    /// The encoded `sheer:<node-id>.<base32>` text. The one raw-form encoder ([`Link::of`] calls it), so
+    /// The encoded `swoosh:<node-id>.<base32>` text. The one raw-form encoder ([`Link::of`] calls it), so
     /// the text and the token can never drift apart.
     pub(crate) fn link_text(&self) -> Result<String, CapError> {
         let bytes = self.token.to_vec().map_err(CapError::Encode)?;
@@ -1320,8 +1320,8 @@ impl TryFrom<Term> for DateSecs {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CapError {
-    /// The link did not start with the `sheer:` scheme.
-    #[error("not a sheer link")]
+    /// The link did not start with the `swoosh:` scheme.
+    #[error("not a swoosh link")]
     Scheme,
     /// The token exceeded the size or block-count bound; refused before verification to cap the work an
     /// untrusted peer can force.
