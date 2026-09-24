@@ -153,7 +153,7 @@ let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued);
 Its admissions carry `Origin::Rooted`; one made under `own` is never a member. `PinSource` is implemented
 for `Arc<P>`, so the gate and any other reader can share one source.
 
-A link is `swoosh:<key>.<token>`: it carries the authority's public key beside the token, so a holder can
+A link is `<key>.<token>`: it carries the authority's public key beside the token, so a holder can
 decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone. The
 `Link` type owns that text; parsing validates the signature chain at the wire edge.
 

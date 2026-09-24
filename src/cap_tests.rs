@@ -247,7 +247,9 @@ fn a_link_round_trips_and_carries_the_root() {
     let issuer = identity(1);
     let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
     let link = cap.link().expect("encode");
-    assert!(link.as_str().starts_with("swoosh:"));
+    let root = issuer.verifying_key().to_string();
+    assert!(link.as_str().starts_with(&root));
+    assert!(!link.as_str().contains(':'));
     let parsed = Cap::parse(link.as_str()).expect("parse");
     assert_eq!(parsed.root(), issuer.verifying_key());
     assert!(issuer.verify(&parsed, &request("ssh", 0)).is_ok());
@@ -375,46 +377,45 @@ fn a_sealed_cap_verifies_but_cannot_be_attenuated() {
 }
 
 #[test]
-fn a_non_swoosh_link_is_rejected() {
-    assert!(matches!(
-        Cap::parse("https://example.com"),
-        Err(CapError::Scheme)
-    ));
-}
-
-#[test]
-fn a_link_is_written_and_read_under_the_swoosh_scheme() {
+fn a_link_is_its_key_and_token() {
+    // The text is exactly the root key, the separator, then the token: nothing written before the key.
     let issuer = identity(1);
     let link = issuer
         .mint(&service("ssh"), at(3600))
         .expect("mint")
         .link()
         .expect("encode");
-    let body = link
+    let root = issuer.verifying_key().to_string();
+    let token = link
         .as_str()
-        .strip_prefix("swoosh:")
-        .expect("a minted link starts with swoosh:");
-    let parsed = Cap::parse(&format!("swoosh:{body}")).expect("a swoosh: link parses");
+        .strip_prefix(&format!("{root}."))
+        .expect("a link starts with its key and the separator");
+    assert!(!token.is_empty() && !token.contains('.'));
+    assert!(!link.as_str().contains(':'));
+    assert_eq!(link.as_str(), format!("{root}.{token}"));
+    let parsed = Cap::parse(&format!("{root}.{token}")).expect("the bare form parses");
     assert_eq!(parsed.root(), issuer.verifying_key());
 }
 
 #[test]
-fn a_valid_token_under_the_old_sheer_scheme_is_refused() {
-    // The same key and token that parse under `swoosh:` are refused under `sheer:`: the prefix alone
-    // decides, and the old one is not read.
+fn a_prefixed_link_is_malformed() {
+    // Anything written before the key is not part of a link: a valid key and token behind a prefix are
+    // refused as malformed, not read.
     let issuer = identity(1);
     let link = issuer
         .mint(&service("ssh"), at(3600))
         .expect("mint")
         .link()
         .expect("encode");
-    let body = link
-        .as_str()
-        .strip_prefix("swoosh:")
-        .expect("a minted link starts with swoosh:");
+    let (_, token) = link.as_str().split_once('.').expect("key.token");
+    let root = issuer.verifying_key();
     assert!(matches!(
-        Cap::parse(&format!("sheer:{body}")),
-        Err(CapError::Scheme)
+        Cap::parse(&format!("app:{root}.{token}")),
+        Err(CapError::Malformed)
+    ));
+    assert!(matches!(
+        Cap::parse("https://example.com"),
+        Err(CapError::Malformed)
     ));
 }
 
@@ -423,7 +424,7 @@ fn an_oversized_link_is_refused_before_decoding() {
     // A body past the size bound is rejected before the base32 decode + signature verification, so an
     // untrusted peer cannot force that work with a huge link (the availability DoS the red-team found).
     let root = identity(1).verifying_key();
-    let huge = format!("swoosh:{root}.{}", "a".repeat(20_000));
+    let huge = format!("{root}.{}", "a".repeat(20_000));
     assert!(matches!(Cap::parse(&huge), Err(CapError::TooLarge)));
 }
 

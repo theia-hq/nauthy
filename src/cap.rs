@@ -1,4 +1,4 @@
-//! The capability primitive: a `swoosh:` bearer token, offline-verifiable, rooted at an issuer's own
+//! The capability primitive: a bearer token, offline-verifiable, rooted at an issuer's own
 //! identity, with no central authority.
 //!
 //! A [`Cap`] is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable token. Its root key is
@@ -17,8 +17,8 @@
 //! pre-dial refusal ([`Cap::expiry`]); the CHECK remains the sole enforcement and no authorization path
 //! here reads the fact.
 //!
-//! A `swoosh:` link is `swoosh:<node-id>.<base32-biscuit>`: it carries the issuer's [`VerifyKey`] (its public
-//! identity, never a secret) alongside the token, so any holder can decode, attenuate, and hand it off
+//! A link is `<key>.<token>`: it carries the issuer's [`VerifyKey`] (its public identity, never a
+//! secret) beside the base32 token, so any holder can decode, attenuate, and hand it off
 //! entirely offline, and a dialer learns which node to dial from the link alone.
 //!
 //! The lifecycle, all offline except the initial mint (which needs only the issuer's own secret, still
@@ -53,9 +53,6 @@ use crate::link::Link;
 use crate::revocations::RevocationId;
 use crate::service::Service;
 use crate::signed::Signed;
-
-/// The `swoosh:` link scheme prefixing an encoded [`Cap`]. A share-link is `swoosh:<node-id>.<base32>`.
-pub const SCHEME: &str = "swoosh:";
 
 /// The separator between the embedded root [`VerifyKey`] and the token body inside a link.
 const SEPARATOR: char = '.';
@@ -704,14 +701,13 @@ pub struct Cap {
 }
 
 impl Cap {
-    /// Decode a cap from a `swoosh:<node-id>.<base32>` link.
+    /// Decode a cap from its `<key>.<token>` link text.
     ///
-    /// parse-don't-validate at the wire edge: rejects a bad scheme, a malformed [`VerifyKey`], bad base32,
+    /// parse-don't-validate at the wire edge: rejects text that is not `<key>.<token>`, a malformed [`VerifyKey`], bad base32,
     /// or bytes whose signature chain does not check against the embedded root. It does NOT evaluate the
     /// caveats (service, expiry); that is [`Identity::verify`]'s job at connect time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
-        let body = link.strip_prefix(SCHEME).ok_or(CapError::Scheme)?;
-        let (root, encoded) = body.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
+        let (root, encoded) = link.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
         // Bound the token size BEFORE the expensive work: base32-decoding a huge body, and then the
         // O(blocks) signature-chain verification, both run before any trust check, so an untrusted peer
         // could otherwise burn CPU with an oversized or many-block link (a foreign token is parsed here,
@@ -762,17 +758,17 @@ impl Cap {
         self.revocation_ids().into_iter().next()
     }
 
-    /// Encode this cap as a [`Link`]: the shareable `swoosh:<node-id>.<base32>` form.
+    /// Encode this cap as a [`Link`]: the shareable `<key>.<token>` form.
     pub fn link(&self) -> Result<Link, CapError> {
         Link::of(self.clone())
     }
 
-    /// The encoded `swoosh:<node-id>.<base32>` text. The one raw-form encoder ([`Link::of`] calls it), so
+    /// The encoded `<key>.<token>` text. The one raw-form encoder ([`Link::of`] calls it), so
     /// the text and the token can never drift apart.
     pub(crate) fn link_text(&self) -> Result<String, CapError> {
         let bytes = self.token.to_vec().map_err(CapError::Encode)?;
         Ok(format!(
-            "{SCHEME}{}{SEPARATOR}{}",
+            "{}{SEPARATOR}{}",
             self.root,
             BASE32_NOPAD.encode(&bytes).to_lowercase()
         ))
@@ -1320,9 +1316,6 @@ impl TryFrom<Term> for DateSecs {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CapError {
-    /// The link did not start with the `swoosh:` scheme.
-    #[error("not a swoosh link")]
-    Scheme,
     /// The token exceeded the size or block-count bound; refused before verification to cap the work an
     /// untrusted peer can force.
     #[error("capability is too large")]
@@ -1338,10 +1331,11 @@ pub enum CapError {
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
-    /// The link was structurally broken before any signature check: a missing separator, or a node-id /
+    /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing
+    /// separator, or anything written before the key), or a node-id /
     /// authority-fact key that is not a well-formed [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified),
     /// a signature-chain failure, because a structural break is a malformed input, not a security event.
-    #[error("malformed capability")]
+    #[error("not a link: expected <key>.<token>")]
     Malformed,
     /// The token decoded but its signature chain did not verify against the embedded root: tampered,
     /// truncated mid-chain, or never signed by the key it claims. A security-relevant failure, kept distinct

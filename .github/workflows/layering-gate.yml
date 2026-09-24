@@ -1,7 +1,7 @@
 # Fails CI on a layering leak so a future leak is caught by the machine, not by review.
-# A crate must not NAME a consumer-tier theia crate it does not depend on (`tightbeam`,
-# `swoosh`, `sshh`), and a prime library must not allude to a consumer CLI flag
-# (`--for`/`--public`/`--peer`/`--authkey`/`--to`). Pure sh + grep, no toolchain.
+# A crate must not NAME a consumer-tier crate it does not depend on, and a prime library must not
+# allude to a consumer CLI flag (`--for`/`--public`/`--peer`/`--authkey`/`--to`). Pure sh + grep,
+# no toolchain.
 # The check lives in scripts/layering-gate.sh; see notes/reviews/layering-leak-audit.md.
 # The same job carries the other source-level gates that need no toolchain: process leaks in shipped
 # prose, and the datalog budget (every biscuit Authorizer built by Cap::budgeted_authorizer, never a

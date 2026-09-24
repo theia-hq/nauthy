@@ -948,8 +948,7 @@ fn member_fleet_slip(signer_seed: u8, authority_seed: u8) -> Cap {
     .expect("sign");
     let bytes = token.to_vec().expect("encode");
     Cap::parse(&format!(
-        "{}{}.{}",
-        crate::SCHEME,
+        "{}.{}",
         identity(signer_seed).verifying_key(),
         BASE32_NOPAD.encode(&bytes).to_lowercase()
     ))
