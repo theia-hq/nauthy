@@ -2,7 +2,7 @@
 # lock-guard.sh -- fail if a repo's COMMITTED/STAGED Cargo.lock drifted from shipping-form.
 #
 # THE RULE (notes/design/release-robustness-spec.md; decision (A) in notes/02-DECISIONS.md). A
-# committed Cargo.lock must record the SHIPPING form of every theia sibling: each sibling
+# committed Cargo.lock must record the SHIPPING form of every sibling: each sibling
 # resolved from its `github.com/theia-hq/<repo>` git source at the exact rev its Cargo.toml
 # pins, and every in-repo crate's lock version matching its own manifest. Five drifts break
 # that, and this gate FAILS on any of them:
@@ -123,7 +123,7 @@ lock_blocks() {
 # Derive siblings as "name repo rev" (space-separated; names/revs never contain spaces) from
 # every theia-hq git dep across the manifests. The `|| true` on the grep is necessary: under
 # `set -e` a no-match (exit 1) in this pipeline kills the `list_manifests | while` subshell at
-# the first manifest that declares no theia dep, so a git dep declared outside the ROOT manifest
+# the first manifest that declares no sibling dep, so a git dep declared outside the ROOT manifest
 # was never enumerated (three repos reported 0 siblings and their drift went unchecked).
 # sed with a real space avoids the BSD-sed `\t` gotcha (BSD sed emits a literal `t` for `\t`).
 siblings=$(list_manifests | while IFS= read -r m; do
@@ -235,14 +235,14 @@ done <<EOF
 $sourceless
 EOF
 
-# BELT (spec §6): a theia [patch] belongs ONLY in the local umbrella .cargo/config.toml, never
+# BELT (spec §6): a sibling [patch] belongs ONLY in the local umbrella .cargo/config.toml, never
 # committed inside a repo (a committed patch would re-introduce the ancestor-walk footgun in CI,
 # where the single-repo checkout must resolve git sources like an outsider). Check the committed
 # config, not the working tree.
 if [ "$in_git" -eq 1 ]; then
   if git -C "$ROOT" ls-files --error-unmatch .cargo/config.toml >/dev/null 2>&1; then
     if read_indexed .cargo/config.toml | grep -q '^\[patch\."https://github.com/theia-hq/'; then
-      echo "PATCH committed .cargo/config.toml carries a theia [patch] (must live only in the umbrella root)"
+      echo "PATCH committed .cargo/config.toml carries a sibling [patch] (must live only in the umbrella root)"
       fail=1
     fi
   fi
