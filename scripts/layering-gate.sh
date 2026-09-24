@@ -311,10 +311,12 @@ done
 # virtual workspace a package among its members, and forbids the words of every layer that
 # depends on it, directly or through another layer. A layer it depends on is never forbidden.
 #
-# Every tracked file is scanned but a CHANGELOG, case-insensitive, with any non-alphanumeric
-# character (`-` and `_` included) as a word boundary. The rows below are the only lines
-# exempt, and only in this file: every other line here, comments included, is checked like any
-# file. The same-line allow marker is NOT honored. A new layer is one row in every copy.
+# Every tracked file is scanned but a CHANGELOG, its lines and its path. A word matches in any
+# case with any non-alphanumeric character (`-` and `_` included) as a boundary, and also as
+# one hump of an identifier: for a word `word`, `WordLink`, `myWord`, `wordX` and `WORD2`. A
+# git failure fails the gate, since the scan would be incomplete. The rows below are the only
+# lines exempt, and only in this file: every other line here, comments included, is checked
+# like any file. The same-line allow marker is NOT honored. A new layer is one row in every copy.
 LAYERS='
 layer nauthy    | nauthy       |
 layer quirk     | quirk        |
@@ -401,14 +403,64 @@ else
       printf 'LEAK  check 4: %s is not a git checkout, so its tracked files cannot be read\n' "$ROOT"
       fail=1
     else
-      words=$(printf '%s' "$forbidden" | tr ' ' '|')
-      # git grep reads tracked paths itself, so a name with a space or a newline is never split.
-      hits=$(git -C "$ROOT" grep -I -n -i -E -e "(^|[^A-Za-z0-9])(${words})([^A-Za-z0-9]|$)" \
-          -- . ':(exclude,glob)**/CHANGELOG.md' \
-        | grep -v -E "^scripts/layering-gate\.sh:[0-9]+:${LAYER_ROW#^}" || true)
+      # A word on its own, in any case: `word`, `Word-x`, `WORD_HOME`.
+      bounded="(^|[^A-Za-z0-9])($(printf '%s' "$forbidden" | tr ' ' '|'))([^A-Za-z0-9]|\$)"
+      # A word as one hump of an identifier, case-sensitive: `WordLink`, `myWord`, `wordX`,
+      # `WORD2`.
+      humped=""
+      for w in $forbidden; do
+        cap=$(printf '%s' "$w" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$w" | cut -c2-)
+        up=$(printf '%s' "$w" | tr '[:lower:]' '[:upper:]')
+        humped="$humped|${cap}[A-Z0-9]|[a-z0-9]${cap}|${w}[A-Z0-9]|${up}[A-Z0-9]"
+      done
+      humped=${humped#|}
+
+      scratch=$(mktemp -d)
+      trap 'rm -rf "$scratch"' EXIT
+      # git_ok WHAT STATUS MAX_OK -- a git read that exited above MAX_OK or wrote to stderr fails
+      # the gate.
+      git_ok() {
+        if [ "$2" -gt "$3" ] || [ -s "$scratch/err" ]; then
+          printf 'LEAK  check 4: %s failed (exit %s), so the scan is incomplete:\n' "$1" "$2"
+          sed 's/^/        /' "$scratch/err"
+          fail=1
+        fi
+      }
+
+      # Lines. git grep reads tracked paths itself, so a name with a space or a newline is never
+      # split. It exits 0 on a match, 1 on none, and above 1 on an error.
+      # grep_lines CASE PATTERN -- add the tracked lines, CHANGELOGs aside, that match to hits.
+      hits=""
+      grep_lines() {
+        st=0
+        out=$(git -C "$ROOT" grep -I -n "$1" -E -e "$2" \
+          -- . ':(exclude,glob)**/CHANGELOG.md' 2>"$scratch/err") || st=$?
+        git_ok "git grep" "$st" 1
+        hits="$hits
+$out"
+      }
+      grep_lines --ignore-case "$bounded"
+      grep_lines --no-ignore-case "$humped"
+      hits=$(printf '%s\n' "$hits" | grep . \
+        | grep -v -E "^scripts/layering-gate\.sh:[0-9]+:${LAYER_ROW#^}" \
+        | sort -t: -k1,1 -k2,2n -u || true)
       if [ -n "$hits" ]; then
         printf 'LEAK  this repo names a layer that depends on it (%s):\n' "$forbidden"
         printf '%s\n' "$hits" | sed 's/^/        /'
+        fail=1
+      fi
+
+      # Paths. NUL-separated, so a newline in a name splits it into pieces that are each checked.
+      st=0
+      git -C "$ROOT" ls-files -z -- . ':(exclude,glob)**/CHANGELOG.md' \
+        >"$scratch/paths" 2>"$scratch/err" || st=$?
+      git_ok "git ls-files" "$st" 0
+      tr '\0' '\n' <"$scratch/paths" >"$scratch/lines"
+      paths=$( { grep -i -E -e "$bounded" "$scratch/lines"; grep -E -e "$humped" "$scratch/lines"; } \
+        | sort -u || true)
+      if [ -n "$paths" ]; then
+        printf 'LEAK  a tracked path names a layer that depends on this repo (%s):\n' "$forbidden"
+        printf '%s\n' "$paths" | sed 's/^/        /'
         fail=1
       fi
     fi

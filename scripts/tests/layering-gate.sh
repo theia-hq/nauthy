@@ -63,9 +63,10 @@ plant() {
   printf '%s\n' "$3" >> "$tmp/$1/$2"
 }
 
-# expect CASE WANT_EXIT NEEDLE LABEL -- run the gate on the case's repo and check it.
+# expect CASE WANT_EXIT NEEDLE LABEL [untracked] -- track the case's files (unless told not to),
+# run the gate on its repo and check it.
 expect() {
-  git -C "$tmp/$1" add -A
+  [ "${5:-}" = untracked ] || git -C "$tmp/$1" add -A
   set +e
   out=$(cd "$tmp/$1" && sh scripts/layering-gate.sh . 2>&1)
   code=$?
@@ -110,6 +111,9 @@ while [ "$r" -le 7 ]; do
 done
 
 top=$(first_word_of 6)
+last=$(first_word_of 7)
+upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
+capital() { printf '%s%s' "$(upper "$(printf '%s' "$1" | cut -c1)")" "$(printf '%s' "$1" | cut -c2-)"; }
 
 # A tracked path with a space is read, not split.
 mkrepo space 1
@@ -123,6 +127,42 @@ expect underscore 1 "src/lib.rs:2:" "an uppercase word before an underscore is c
 mkrepo hyphen 1
 plant hyphen src/lib.rs "//! a $(first_word_of 4)-handler crate"
 expect hyphen 1 "src/lib.rs:2:" "a word before a hyphen is caught"
+
+# A word is caught as one hump of an identifier, in every casing a name takes.
+for ident in "$(capital "$top")Link" "my$(capital "$top")" "$(capital "$last")Client" "$(upper "$top")2" \
+    "${top}Link"; do
+  mkrepo "hump-$ident" 1
+  plant "hump-$ident" src/lib.rs "struct $ident;"
+  expect "hump-$ident" 1 "src/lib.rs:2:" "a word inside the identifier $ident is caught"
+done
+# A word run into lowercase letters is prose, not a name.
+mkrepo prose 1
+plant prose src/lib.rs "//! a ${top}ing sound"
+expect prose 0 "OK" "a word run into lowercase letters is allowed"
+
+# A tracked path is checked like a line: a file named for a dependent fails with no hit inside it.
+mkrepo path 1
+plant path "src/$top.rs" "//! fixture"
+expect path 1 "src/$top.rs" "a file named for a dependent is caught"
+mkrepo pathcap 1
+plant pathcap "docs/$(capital "$last")-notes.md" "notes"
+expect pathcap 1 "docs/$(capital "$last")-notes.md" "a capitalised word in a path is caught"
+
+# A git read that fails fails the gate instead of reporting a clean scan.
+mkrepo broken 1
+git -C "$tmp/broken" add -A
+printf 'junk' > "$tmp/broken/.git/index"
+expect broken 1 "git grep failed" "a failed git grep fails the gate" untracked
+mkrepo unreadable 1
+plant unreadable notes.md "notes"
+git -C "$tmp/unreadable" add -A
+chmod 000 "$tmp/unreadable/notes.md"
+if [ -r "$tmp/unreadable/notes.md" ]; then
+  printf 'skip  an unreadable file cannot be made here (running as root)\n'
+else
+  expect unreadable 1 "git grep failed" "a file git grep cannot read fails the gate" untracked
+fi
+chmod 644 "$tmp/unreadable/notes.md"
 
 # The gate checks its own comments: only a table row is exempt, and only in the gate.
 mkrepo self 1
