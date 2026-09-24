@@ -68,15 +68,8 @@ FLAG_TOKENS="--for --public --peer --authkey --to"
 # repo) enters the universe as an EXTERNAL name, which is what makes `measure` naming it a
 # detectable leak.
 #
-# RESIDUAL LIMITATION (stated honestly; it cannot be derived away under per-repo isolation).
-# A lower repo naming a crate that lives ABOVE it in a DIFFERENT repo it does not depend on
-# -- the classic being `tightbeam` (or `nauthy`, `bifrost`, `quirk`) naming the top app
-# `swoosh` -- is NOT caught, because nothing in the lower repo's manifests references that
-# consumer, so its name is not derivable there. The swoosh repo DOES depend on tightbeam and
-# owns swoosh, so every leak AMONG swoosh-repo crates (`measure`/`fetch`/`beam`/`sshh` naming
-# `tightbeam` or `swoosh`) IS caught. Recovering the lower->higher cross-repo case would
-# require either hardcoding the consumer names (the brittleness this rework removes) or giving
-# the check the sibling repos, which per-repo CI deliberately does not have.
+# RESIDUAL LIMITATION. A lower repo naming a consumer that lives ABOVE it, in a repo it does
+# not depend on, is not derivable from its manifests; check 4 closes it with an explicit list.
 # ---------------------------------------------------------------------------------------
 
 manifests=$(find "$ROOT" -name Cargo.toml -not -path '*/target/*' -not -path '*/_archived/*' | sort)
@@ -302,6 +295,29 @@ $(find "$dir/docs" -name '*.md' -not -path '*/target/*' -not -path '*/_archived/
     done
   done
 done
+
+# 4. CONSUMER-WORD check: a lower repo names no consumer, anywhere but its CHANGELOG (LAYERS.md
+# placement test 3; delib 85 erratum 2026-09-24). This list is the one place those words may sit,
+# so this script is the one file exempt. The same-line allow marker is NOT honored here: the
+# audit found no legitimate use, so there is no allowlist. A repo that DEFINES one of these
+# packages is that consumer, and the check skips it (the swoosh repo).
+CONSUMER_WORDS="swoosh sheer qat"
+is_consumer=0
+for w in $CONSUMER_WORDS; do
+  case "$LOCAL_PKGS" in *" $w "*) is_consumer=1 ;; esac
+done
+if [ "$is_consumer" -eq 0 ]; then
+  words=$(printf '%s' "$CONSUMER_WORDS" | tr ' ' '|')
+  hits=$(cd "$ROOT" && git ls-files \
+    | grep -v -E '(^|/)CHANGELOG\.md$' | grep -v -x 'scripts/layering-gate.sh' \
+    | while read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done \
+    | xargs grep -IHniE "(^|[^A-Za-z0-9_])(${words})([^A-Za-z0-9_]|$)" 2>/dev/null || true)
+  if [ -n "$hits" ]; then
+    printf 'LEAK  this repo names a consumer (%s):\n' "$CONSUMER_WORDS"
+    printf '%s\n' "$hits" | sed 's/^/        /'
+    fail=1
+  fi
+fi
 
 if [ "$fail" -ne 0 ]; then
   printf '\nlayering-gate: FAIL -- a crate reached outside its layer (see LEAK lines above).\n' >&2
