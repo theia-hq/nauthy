@@ -82,7 +82,7 @@ mod signed_tests;
 #[cfg(test)]
 mod stamp_tests;
 
-pub use crate::cap::{Cap, CapError, Identity, Request, SCHEME};
+pub use crate::cap::{Cap, CapError, Identity, Request};
 #[cfg(feature = "tokio-fs")]
 pub use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
 pub use crate::gate::{

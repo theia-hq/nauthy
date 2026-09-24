@@ -964,11 +964,11 @@ impl From<Result<VerifyKey, CapError>> for Checked {
             Err(CapError::Undecided) => Checked::Undecided,
             // Answers about the token or the holder, every one of which is a genuine "no".
             Err(
-                CapError::Scheme
-                | CapError::TooLarge
+                CapError::TooLarge
                 | CapError::TooComplex
                 | CapError::Encoding
                 | CapError::Malformed
+                | CapError::MalformedAuthority
                 | CapError::Unverified
                 | CapError::Key(_)
                 | CapError::Mint(_)
