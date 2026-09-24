@@ -25,6 +25,9 @@ use crate::{Service, VerifyKey};
 /// - [`Gate::Anchored`] trusts two authorities: a pin it reads afresh on every admission, ruled exactly as
 ///   a rooted gate rules on its authority, and this machine's own key, which admits only the service slips
 ///   this machine recorded issuing and never a member. A machine with no pin admits no member at all.
+///
+/// A rooted or anchored gate can also witness a proven key that presents nothing ([`Gate::proven`]); the
+/// witness carries no authority and reaches only a handler built for it.
 pub enum Gate {
     /// Admit any peer.
     Open,
@@ -253,6 +256,35 @@ impl Gate {
         }
     }
 
+    /// Witness a transport-proven key that presents no token: an [`Origin::Proven`] admission, which carries
+    /// no authority at all.
+    ///
+    /// For a service that answers a peer by its key alone and grants it nothing, such as one that tells a
+    /// device what this node already holds for that same key. The witness proves only that the transport
+    /// proved the key and that the revocation store does not revoke it, so a consumer serves it only to a
+    /// handler that accepts [`Proven`](Origin::Proven), and every rooted-only reader refuses it (see
+    /// [`Admitted::peer_verified`]). Its kind is [`Slip`](Admission::Slip), so it is never a member.
+    ///
+    /// An [`Open`](Gate::Open) gate refuses as [`NotGranted`](Refusal::NotGranted): it is the profile a peer
+    /// that only announced its key is admitted under, so its caller proved nothing a `Proven` witness could
+    /// stand on. A rooted or anchored gate refuses a key its store revokes as [`Revoked`](Refusal::Revoked),
+    /// the read every other admission makes first, so revoking a device's key closes this path too.
+    pub fn proven(&self, peer: ProvenPeer) -> Result<Admitted, Refusal> {
+        let revocations = match self {
+            Gate::Open => return Err(Refusal::NotGranted),
+            Gate::Rooted(_, revocations) => revocations.as_ref(),
+            Gate::Anchored(anchor) => anchor.revocations.as_ref(),
+        };
+        if revocations.is_revoked_peer(&peer.key()) {
+            return Err(Refusal::Revoked);
+        }
+        Ok(Admitted {
+            peer: peer.key(),
+            kind: Admission::Slip,
+            origin: Origin::Proven,
+        })
+    }
+
     /// Like [`admit_foreign`](Gate::admit_foreign) but yields an [`Admitted`] witness on success. The
     /// admission is always [`Admission::Slip`], NEVER [`Member`](Admission::Member): a foreign-authority
     /// member deliberately collapses to `Slip` (fail-closed), because a member of a FOREIGN authority is not
@@ -471,11 +503,14 @@ impl ProvenPeer {
 
 /// Proof that a [`Gate`] admitted a connection, naming WHO was admitted and by WHAT KIND of authority.
 ///
-/// An opaque witness with no public constructor: the only way to obtain one is [`Gate::admit_witnessed`]
-/// (or [`Gate::admit_foreign_witnessed`]) returning `Ok`. A service handler that takes an `Admitted`
-/// therefore cannot be called without a gate having permitted the peer, so "authorize before serve" is
-/// enforced by the type system, not by the order of statements. The gate mints exactly one per ruling;
-/// there is no other way to make one, so a handler that receives it can trust it without re-checking.
+/// An opaque witness with no public constructor: the only ways to obtain one are [`Gate::admit_witnessed`]
+/// or [`Gate::admit_foreign_witnessed`] returning `Ok` (a token ruling), and [`Gate::proven`] returning
+/// `Ok` (a proven key, no token ruled on). A service handler that takes an `Admitted` therefore cannot be
+/// called without a gate having run, so "authorize before serve" is enforced by the type system, not by the
+/// order of statements. The gate mints exactly one per ruling or proven-key witness; there is no other way
+/// to make one. A handler that receives it can trust that a gate ran, and nothing more: it MUST read
+/// [`origin`](Admitted::origin) (or [`peer_verified`](Admitted::peer_verified)) before resting anything on
+/// the peer's standing, because a [`Proven`](Origin::Proven) witness carries none.
 ///
 /// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
 /// SINGLE-USE, per-stream proof. A consumer takes it BY VALUE, so minting one witness
@@ -493,17 +528,48 @@ impl ProvenPeer {
 pub struct Admitted {
     peer: VerifyKey,
     kind: Admission,
-    /// How this witness was minted: a rooted token ruling or an open-gate admit. Module-private: the
-    /// mints in this file are the only writers, and [`admitted`](Admitted::origin) is the only reader.
+    /// How this witness was minted: a rooted token ruling, an open-gate admit, or a proven key with no
+    /// token. Module-private: the mints in this file are the only writers, and
+    /// [`origin`](Admitted::origin) is the only reader.
     origin: Origin,
 }
 
 impl Admitted {
-    /// The identity the gate admitted: on a [`Rooted`](Origin::Rooted) admission the transport proved this
-    /// key before the gate ruled; on an [`Open`](Origin::Open) admission it is the key the peer announced.
-    /// A caller that needs the verified reading checks [`origin`](Self::origin).
+    /// The identity the gate admitted: on a [`Rooted`](Origin::Rooted) or [`Proven`](Origin::Proven)
+    /// admission the transport proved this key before the gate ruled; on an [`Open`](Origin::Open)
+    /// admission it is the key the peer announced. A caller that needs a token-verified peer reads
+    /// [`peer_verified`](Self::peer_verified).
     pub fn peer(&self) -> VerifyKey {
         self.peer
+    }
+
+    /// The peer, only when a token rooted at the gate's authority admitted it: `Some` on a
+    /// [`Rooted`](Origin::Rooted) admission, `None` on an [`Open`](Origin::Open) or a
+    /// [`Proven`](Origin::Proven) one.
+    ///
+    /// The rooted-only reading. A proven key is a real key but holds no standing here, so a reader that
+    /// rests anything on the peer's authority must see nothing rather than a key it could mistake for one.
+    pub fn peer_verified(&self) -> Option<VerifyKey> {
+        // Exhaustive, with no wildcard: a new origin must be ruled on here, never read as rooted.
+        match self.origin {
+            Origin::Rooted => Some(self.peer),
+            Origin::Open | Origin::Proven => None,
+        }
+    }
+
+    /// The key a later revocation of this admission is checked against: `Some` on a
+    /// [`Rooted`](Origin::Rooted) or [`Proven`](Origin::Proven) admission, whose key the transport proved,
+    /// `None` on an [`Open`](Origin::Open) one, whose key was only announced.
+    ///
+    /// A caller that cuts a live session when its peer's key is revoked records this key when it admits
+    /// the stream. A proven admission ruled on no token, so this key is the only thing a cut can find it
+    /// by: a caller that records only the tokens it ruled on keeps nothing for it.
+    pub fn revocable_peer(&self) -> Option<VerifyKey> {
+        // Exhaustive, with no wildcard: a new origin must decide whether its key can be revoked.
+        match self.origin {
+            Origin::Rooted | Origin::Proven => Some(self.peer),
+            Origin::Open => None,
+        }
     }
 
     /// By WHAT authority this peer was admitted: a whole-node [`Member`](Admission::Member) badge or a
@@ -512,11 +578,12 @@ impl Admitted {
         self.kind
     }
 
-    /// How this peer was admitted: under a ROOTED token ruling or an [`Open`](Origin::Open) gate. Exposed as
-    /// the enum, never a bool, so a future origin breaks every match site and forces a decision there
-    /// instead of silently reading as one of these two. An anchored gate's own-key admissions are `Rooted`;
-    /// the authority that signed a slip is not an origin. A downstream `Never`
-    /// ceiling reads this and refuses everything that is not [`Rooted`](Origin::Rooted) (fail-closed).
+    /// How this peer was admitted: under a ROOTED token ruling, an [`Open`](Origin::Open) gate, or as a
+    /// [`Proven`](Origin::Proven) key with no token. Exposed as the enum, never a bool, so a future origin
+    /// breaks every match site and forces a decision there instead of silently reading as one of these.
+    /// An anchored gate's own-key admissions are `Rooted`; the authority that signed a slip is not an
+    /// origin. A downstream ceiling that needs a verified peer refuses everything that is not
+    /// [`Rooted`](Origin::Rooted) (fail-closed).
     pub fn origin(&self) -> Origin {
         self.origin
     }
@@ -531,18 +598,28 @@ impl Admitted {
     }
 }
 
-/// How a [`Gate`] minted an [`Admitted`] witness: by ruling on a rooted token, or by an open gate that ruled
-/// on nothing.
+/// How a [`Gate`] minted an [`Admitted`] witness: by ruling on a rooted token, by an open gate that ruled
+/// on nothing, or by witnessing a proven key that presented nothing.
 ///
 /// The distinction is a downstream handler's safety precondition, not an admission decision: an engine whose
 /// safety rests on a root-verified peer (a keyless shell) must refuse an open-minted witness even when its
 /// route reached the engine, so the origin travels ON the witness rather than in a side channel. It is a
-/// plain tag (no data), and it is exposed as the enum so a future variant (a paired-device origin) forces
-/// every match site to decide rather than defaulting into one of these two. An anchored gate's own-key
-/// admissions are `Rooted`; the authority that signed a slip is not an origin.
+/// plain tag (no data), and it is exposed as the enum so a future variant forces every match site to decide
+/// rather than defaulting into one of these. An anchored gate's own-key admissions are `Rooted`; the
+/// authority that signed a slip is not an origin.
 ///
 /// [`Open`](Origin::Open) is the fail-closed read for anything keyless: nothing about the peer was verified,
 /// so only a handler that would serve an unauthenticated stranger may accept it.
+///
+/// The three origins are three disjoint classes of handler, and a consumer that sorts its handlers by what
+/// they accept keeps them disjoint:
+/// - a handler that needs a verified peer accepts [`Rooted`](Origin::Rooted) only;
+/// - a handler that would serve a stranger accepts [`Open`](Origin::Open) and `Rooted`;
+/// - a handler built for a proven key with no standing accepts [`Proven`](Origin::Proven) only, and no other
+///   class accepts `Proven`.
+///
+/// So a `Proven` witness never reaches a handler that trusts its peer, and never one that trusts nothing
+/// about it either, since the second would then serve the proven key everything it serves a stranger.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Origin {
     /// Admitted after a token rooted at the gate's authority verified (a membership badge or a delegated
@@ -552,6 +629,10 @@ pub enum Origin {
     /// Admitted by an [`Open`](Gate::Open) gate: no token was presented or verified, so nothing about the
     /// peer is proven.
     Open,
+    /// Witnessed by [`Gate::proven`]: the transport proved the key and the revocation store does not revoke
+    /// it, and no token was presented. It carries no authority, and only a handler built for a proven key
+    /// accepts it.
+    Proven,
 }
 
 /// The AUTHORITY a [`Gate`] admitted a peer under: the two meanings a rooted token can carry.

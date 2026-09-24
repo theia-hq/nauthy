@@ -122,9 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For a compile-time proof that a service handler cannot run without a ruling, use `admit_witnessed`, which
 returns an `Admitted` witness (single-use, no public constructor) instead of a plain `Decision`. The
-witness carries the proven peer, the admission kind, and its origin (`Origin::Rooted` or `Origin::Open`),
-so a handler can refuse an open-gate admission even when its route reached it. A handler that takes an
-`Admitted` cannot be reached without a gate having permitted the peer.
+witness carries the proven peer, the admission kind, and its origin (`Origin::Rooted`, `Origin::Open` or
+`Origin::Proven`), so a handler can refuse an open-gate admission even when its route reached it. A
+handler that takes an `Admitted` cannot be reached without a gate having permitted the peer.
+
+`gate.proven(peer)` witnesses a proven key that presents nothing, for a service that answers a device by
+its key alone. The witness is `Origin::Proven` and carries no authority: its kind is `Slip`,
+`peer_verified()` is `None`, and only a handler built for proven keys should accept it. A key the store
+revokes is refused, and so is every peer of an open gate, which proved nothing. `revocable_peer()` names
+the key to record if you cut live sessions on a later revocation.
 
 ## A machine that signs its own grants
 

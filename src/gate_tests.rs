@@ -1584,3 +1584,113 @@ fn pin_source_for_arc_reads_through() {
         Decision::Admit
     );
 }
+
+#[test]
+fn gate_proven_refuses_an_announced_peer() {
+    // An open gate is where a peer that only announced its key is admitted. It proved nothing, so it has no
+    // key to witness, and a `Proven` witness minted there would give an announced key a proven one's reach.
+    assert!(matches!(
+        Gate::Open.proven(proven(some_peer())),
+        Err(Refusal::NotGranted)
+    ));
+}
+
+#[test]
+fn a_proven_witness_carries_its_own_origin_on_every_gate_that_mints_one() {
+    // No token was presented, so the origin is never `Rooted`: a `Rooted` witness would reach every
+    // handler that needs a verified peer, a keyless shell among them.
+    for gate in [rooted_gate(1), anchored_gate(Some(PIN), &[])] {
+        let witness = gate
+            .proven(proven(some_peer()))
+            .expect("an unrevoked proven key is witnessed");
+        assert_eq!(witness.origin(), Origin::Proven);
+        assert_eq!(witness.peer(), some_peer());
+    }
+}
+
+#[test]
+fn a_proven_witness_is_never_a_member() {
+    // The kind stays infallible, and fail-closed: a key with no token is no owner device.
+    let witness = rooted_gate(1)
+        .proven(proven(some_peer()))
+        .expect("an unrevoked proven key is witnessed");
+    assert_eq!(witness.kind(), Admission::Slip);
+    assert!(!witness.is_member());
+}
+
+#[test]
+fn gate_proven_refuses_a_revoked_peer_key_on_a_rooted_gate() {
+    let device = identity(4).verifying_key();
+    let gate = Gate::rooted(identity(1).verifying_key(), RevokedKey::new(device));
+    assert!(matches!(gate.proven(proven(device)), Err(Refusal::Revoked)));
+    let sibling = identity(5).verifying_key();
+    assert!(
+        gate.proven(proven(sibling)).is_ok(),
+        "an unrevoked key is witnessed"
+    );
+}
+
+#[test]
+fn gate_proven_refuses_a_revoked_peer_key_on_an_anchored_gate() {
+    let device = identity(4).verifying_key();
+    let gate = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        RevokedKey::new(device),
+        Ledger(Vec::new()),
+    );
+    assert!(matches!(gate.proven(proven(device)), Err(Refusal::Revoked)));
+    let sibling = identity(5).verifying_key();
+    assert!(
+        gate.proven(proven(sibling)).is_ok(),
+        "an unrevoked key is witnessed"
+    );
+}
+
+#[test]
+fn only_a_rooted_witness_has_a_verified_peer() {
+    let gate = rooted_gate(1);
+    let rooted = gate
+        .admit_witnessed(proven(some_peer()), Some(&slip(1, "ssh")), &service("ssh"))
+        .expect("a delegated slip admits its service");
+    assert_eq!(rooted.peer_verified(), Some(some_peer()));
+
+    let proven_only = gate
+        .proven(proven(some_peer()))
+        .expect("an unrevoked proven key is witnessed");
+    assert_eq!(
+        proven_only.peer_verified(),
+        None,
+        "a proven key holds no standing"
+    );
+
+    let opened = Gate::Open
+        .admit_witnessed(proven(some_peer()), None, &service("ssh"))
+        .expect("an open gate admits anyone");
+    assert_eq!(
+        opened.peer_verified(),
+        None,
+        "an announced key is not verified"
+    );
+}
+
+#[test]
+fn a_proven_witness_names_the_key_a_revocation_cuts() {
+    // A proven admission ruled on no token, so its key is all a live cut can find it by. A rooted one is
+    // cut by its key too; an open one's key was only announced, so there is nothing to revoke.
+    let gate = rooted_gate(1);
+    let proven_only = gate
+        .proven(proven(some_peer()))
+        .expect("an unrevoked proven key is witnessed");
+    assert_eq!(proven_only.revocable_peer(), Some(some_peer()));
+
+    let rooted = gate
+        .admit_witnessed(proven(some_peer()), Some(&slip(1, "ssh")), &service("ssh"))
+        .expect("a delegated slip admits its service");
+    assert_eq!(rooted.revocable_peer(), Some(some_peer()));
+
+    let opened = Gate::Open
+        .admit_witnessed(proven(some_peer()), None, &service("ssh"))
+        .expect("an open gate admits anyone");
+    assert_eq!(opened.revocable_peer(), None);
+}

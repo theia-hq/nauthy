@@ -74,7 +74,8 @@ pub trait Revocations {
     /// ask this about the transport-proven dialer first, before they read or verify any presented cap, and
     /// refuse a `true` as
     /// [`Revoked`](crate::Refusal::Revoked), so a revoked device is refused whatever token it presents,
-    /// including one minted for it after the revocation.
+    /// including one minted for it after the revocation. [`Gate::proven`](crate::Gate::proven) asks it too,
+    /// so a revoked key gets no witness that presents nothing.
     ///
     /// Provided, answering `false`: a store that keeps no keys keeps the default. A wrapper that holds a
     /// store must forward this as well as [`is_revoked`](Self::is_revoked), because a provided method a
