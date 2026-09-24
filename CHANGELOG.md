@@ -2,6 +2,27 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.8.0
+
+### Breaking
+- **A link is `swoosh:<key>.<token>`.** `SCHEME` is `"swoosh:"`, and a `sheer:` link no longer parses,
+  even with a valid token. Re-mint or re-print any stored link.
+- **`Origin` has a new variant, `Proven`.** `Origin` is not `#[non_exhaustive]`, so a `match` on it
+  without a wildcard arm no longer compiles. Decide at each match site whether that handler accepts a
+  proven key with no standing (most should not).
+
+### Added
+- **A gate can witness a proven key that presents nothing.** `Gate::proven(peer)` returns an `Admitted`
+  whose origin is `Origin::Proven`, for a service that answers a device by its key alone and grants it
+  nothing.
+  - The witness carries no authority: its kind is `Slip`, so it is never a member, and
+    `Admitted::peer_verified` returns `None`.
+  - An open gate refuses as `NotGranted`, since its peers proved nothing. A rooted or anchored gate
+    refuses a key its store revokes as `Revoked`.
+- **`Admitted::revocable_peer`** names the key a later revocation is checked against: the peer's key on
+  a `Rooted` or `Proven` admission, `None` on an `Open` one. Record it when you admit a stream if you cut
+  live sessions on revocation; a proven admission ruled on no token, so this key is the only handle.
+
 ## v0.7.0
 
 ### Breaking
