@@ -2,6 +2,27 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.9.0
+
+### Breaking
+- **A link is `<key>.<token>`, with no scheme.** `SCHEME` and `CapError::Scheme` are gone. A link
+  carries the authority's key, one `.`, and the token; anything before the key fails to parse as
+  `Malformed`, whose message is now "not a link: expected <key>.<token>". An application that shows
+  links to people adds and strips its own prefix at its edge.
+- **Key text starts with `ed01`**, named for the ed25519 suite. The tag is read in any case. `[1u8; 32]`
+  prints as `ed01aeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaqcaibaeaq`.
+- **Key and token text is ASCII.** Non-ASCII input is refused before decoding, and case is folded with
+  ASCII rules only, so no text has a second spelling.
+
+### Added
+- **`CapError::MalformedAuthority`**: a capability that pins an authority key that is not a key. Before,
+  this reported as a malformed link.
+
+### Fixed
+- **`Gate::proven` also refuses a revoked key's sign twin.** Revoking key A closes A and -A; the rustdoc
+  now says what a revocation does and does not close.
+- **A link with a second `.` is refused as `Malformed`** before any decoding.
+
 ## v0.8.0
 
 ### Breaking
