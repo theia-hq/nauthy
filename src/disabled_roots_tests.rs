@@ -308,7 +308,7 @@ async fn disable_still_writes_past_a_bad_line_and_keeps_it() {
     // rather than dropping what might be a disabled root.
     let path = latch_path("poison-write");
     let mut latch = DisabledRoots::load(path.clone()).await.expect("load");
-    std::fs::write(&path, format!("{}bf02future\n", body(&[root(1)]))).expect("poison the latch");
+    std::fs::write(&path, format!("{}ed02future\n", body(&[root(1)]))).expect("poison the latch");
 
     latch.disable(root(2)).await.expect("disable writes anyway");
 
@@ -318,7 +318,7 @@ async fn disable_still_writes_past_a_bad_line_and_keeps_it() {
         "the key already there stays"
     );
     assert!(text.contains(&root(2).to_string()), "the new key lands");
-    assert!(text.contains("bf02future"), "the unreadable line is kept");
+    assert!(text.contains("ed02future"), "the unreadable line is kept");
     cleanup(&path);
 }
 
