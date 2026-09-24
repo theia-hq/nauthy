@@ -12,7 +12,7 @@ use data_encoding::BASE32_NOPAD;
 /// The four-character wire tag prefixing a key's string form.
 ///
 /// SHARED BY CONVENTION with `bifrost_core::id` (its `CryptoKind::Ed25519` tag). A [`VerifyKey`] and a
-/// `bifrost_core::NodeId` for the same ed25519 key MUST render to the same string, because a `sheer:` link
+/// `bifrost_core::NodeId` for the same ed25519 key MUST render to the same string, because a `swoosh:` link
 /// embeds that string and both sides parse it: if this tag ever diverges from bifrost's, minted links stop
 /// round-tripping across the boundary silently. Change one, change both.
 const TAG: &str = "bf01";
@@ -21,8 +21,9 @@ const TAG: &str = "bf01";
 ///
 /// This is the key a cap roots at and a transport handshake proves the peer holds. Its string form is a
 /// four-character suite tag `bf01` then the base32-lowercase key body. The bytes are a plain ed25519 public
-/// key, so a `VerifyKey` is interchangeable with any transport that identifies a peer by its ed25519 key: a
-/// `sheer:` link embeds this string form and round-trips across that boundary with no conversion at the wire.
+/// key, so a `VerifyKey` is interchangeable with any transport that identifies a peer by its ed25519 key:
+/// a `swoosh:` link embeds this string form and round-trips across that boundary with no conversion at the
+/// wire.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
 pub struct VerifyKey([u8; Self::LEN]);
 

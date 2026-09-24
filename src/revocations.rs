@@ -1,4 +1,4 @@
-//! Offline revocation for `sheer:` bearer caps: the [`Revocations`] oracle the gate consults, and a
+//! Offline revocation for `swoosh:` bearer caps: the [`Revocations`] oracle the gate consults, and a
 //! file-backed [`FileDenylist`] that implements it.
 //!
 //! A cap is offline-verifiable, so there is no server to ask "is this revoked?". Instead the issuer keeps
