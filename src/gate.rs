@@ -267,19 +267,27 @@ impl Gate {
     ///
     /// An [`Open`](Gate::Open) gate refuses as [`NotGranted`](Refusal::NotGranted): it is the profile a peer
     /// that only announced its key is admitted under, so its caller proved nothing a `Proven` witness could
-    /// stand on. A rooted or anchored gate refuses a key its store revokes as [`Revoked`](Refusal::Revoked),
-    /// the read every other admission makes first, so revoking a device's key closes this path too.
+    /// stand on. A rooted or anchored gate refuses as [`Revoked`](Refusal::Revoked) a key its store revokes,
+    /// and that key's sign twin: the negated point, which anyone holding the revoked secret can prove by
+    /// signing with the negated scalar. That is all revoking a key closes here. A key the store does not
+    /// revoke is witnessed, so a revoked holder can still reach this path under any fresh key, and under a
+    /// torsion twin (the key plus a small-order point) wherever the transport admits one; the store matches
+    /// exact bytes, so refusing that twin is the transport's job. A handler that accepts this witness looks a
+    /// key up by its exact bytes, never through a form that folds the sign, such as its X25519 conversion.
     pub fn proven(&self, peer: ProvenPeer) -> Result<Admitted, Refusal> {
         let revocations = match self {
             Gate::Open => return Err(Refusal::NotGranted),
             Gate::Rooted(_, revocations) => revocations.as_ref(),
             Gate::Anchored(anchor) => anchor.revocations.as_ref(),
         };
-        if revocations.is_revoked_peer(&peer.key()) {
+        let key = peer.key();
+        if revocations.is_revoked_peer(&key)
+            || sign_twin(key).is_some_and(|twin| revocations.is_revoked_peer(&twin))
+        {
             return Err(Refusal::Revoked);
         }
         Ok(Admitted {
-            peer: peer.key(),
+            peer: key,
             kind: Admission::Slip,
             origin: Origin::Proven,
         })
@@ -663,6 +671,20 @@ pub enum Admission {
 // reviewer remembering it. `Admission` (the read-only kind tag) may be `Copy`; only the witness may not.
 #[cfg(test)]
 static_assertions::assert_not_impl_any!(Admitted: Clone, Copy);
+
+/// The sign twin of `key`: the negated point, which the holder of `key`'s secret proves by signing with the
+/// negated scalar. `None` for bytes that are not a curve point, which no transport proves.
+///
+/// Only [`Gate::proven`] asks about it. Every other path admits on a token, and a token either binds the
+/// exact key bytes, which the twin does not match, or binds no key, which any fresh key can carry as well.
+fn sign_twin(key: VerifyKey) -> Option<VerifyKey> {
+    let point = ed25519_dalek::VerifyingKey::from_bytes(key.bytes())
+        .ok()?
+        .to_edwards();
+    Some(VerifyKey::new(
+        ed25519_dalek::VerifyingKey::from(-point).to_bytes(),
+    ))
+}
 
 /// The plain admission path: a peer that presents a token rooted at the authority `root`, unrevoked,
 /// granting membership OR the requested `service`. One signature, two meanings: a device carries a
