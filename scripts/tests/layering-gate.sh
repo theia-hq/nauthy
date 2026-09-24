@@ -168,6 +168,13 @@ mkrepo broken 1
 git -C "$tmp/broken" add -A
 printf 'junk' > "$tmp/broken/.git/index"
 expect broken 1 "git grep failed" "a failed git grep fails the gate" untracked
+# A path marked binary in .gitattributes is still read as text, so the mark cannot hide a hit.
+for mark in -diff binary; do
+  mkrepo "attr$mark" 1
+  plant "attr$mark" src/lib.rs "//! made for $top"
+  plant "attr$mark" .gitattributes "src/lib.rs $mark"
+  expect "attr$mark" 1 "src/lib.rs:2:" "a path marked $mark in .gitattributes is still scanned"
+done
 mkrepo unreadable 1
 plant unreadable notes.md "notes"
 git -C "$tmp/unreadable" add -A
@@ -249,6 +256,14 @@ mkrepo org-changelog 1
 plant org-changelog CHANGELOG.md "- dropped the $org prefix"
 plant org-changelog crates/x/CHANGELOG.md "- dropped the $org prefix"
 expect org-changelog 0 "OK" "a CHANGELOG may use the org's name"
+
+# A path marked binary in .gitattributes is still read as text for the org's name.
+for mark in -diff binary; do
+  mkrepo "org-attr$mark" 1
+  plant "org-attr$mark" src/lib.rs "//! part of $org"
+  plant "org-attr$mark" .gitattributes "src/lib.rs $mark"
+  expect "org-attr$mark" 1 "src/lib.rs:2:" "a path marked $mark in .gitattributes is still scanned for the org's name"
+done
 
 # Only the ORG line is exempt, and only in the gate.
 mkrepo org-self 1

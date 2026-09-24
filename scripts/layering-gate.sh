@@ -433,12 +433,13 @@ else
       humped=${humped#|}
 
       # Lines. git grep reads tracked paths itself, so a name with a space or a newline is never
-      # split. It exits 0 on a match, 1 on none, and above 1 on an error.
+      # split. It exits 0 on a match, 1 on none, and above 1 on an error. --text reads every file
+      # as text, so a path marked binary in .gitattributes is scanned too.
       # grep_lines CASE PATTERN -- add the tracked lines, CHANGELOGs aside, that match to hits.
       hits=""
       grep_lines() {
         st=0
-        out=$(git -C "$ROOT" grep -I -n "$1" -E -e "$2" \
+        out=$(git -C "$ROOT" grep --text -n "$1" -E -e "$2" \
           -- . ':(exclude,glob)**/CHANGELOG.md' 2>"$scratch/err") || st=$?
         git_ok "check 4: git grep" "$st" 1
         hits="$hits
@@ -500,7 +501,7 @@ elif ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   fail=1
 else
   st=0
-  out=$(git -C "$ROOT" grep -I -n --ignore-case -F -e "$ORG" \
+  out=$(git -C "$ROOT" grep --text -n --ignore-case -F -e "$ORG" \
     -- . ':(exclude,glob)**/CHANGELOG.md' 2>"$scratch/err") || st=$?
   git_ok "check 5: git grep" "$st" 1
   hits=$(printf '%s\n' "$out" | grep . \
