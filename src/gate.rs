@@ -503,11 +503,14 @@ impl ProvenPeer {
 
 /// Proof that a [`Gate`] admitted a connection, naming WHO was admitted and by WHAT KIND of authority.
 ///
-/// An opaque witness with no public constructor: the only way to obtain one is [`Gate::admit_witnessed`]
-/// (or [`Gate::admit_foreign_witnessed`]) returning `Ok`. A service handler that takes an `Admitted`
-/// therefore cannot be called without a gate having permitted the peer, so "authorize before serve" is
-/// enforced by the type system, not by the order of statements. The gate mints exactly one per ruling;
-/// there is no other way to make one, so a handler that receives it can trust it without re-checking.
+/// An opaque witness with no public constructor: the only ways to obtain one are [`Gate::admit_witnessed`]
+/// or [`Gate::admit_foreign_witnessed`] returning `Ok` (a token ruling), and [`Gate::proven`] returning
+/// `Ok` (a proven key, no token ruled on). A service handler that takes an `Admitted` therefore cannot be
+/// called without a gate having run, so "authorize before serve" is enforced by the type system, not by the
+/// order of statements. The gate mints exactly one per ruling or proven-key witness; there is no other way
+/// to make one. A handler that receives it can trust that a gate ran, and nothing more: it MUST read
+/// [`origin`](Admitted::origin) (or [`peer_verified`](Admitted::peer_verified)) before resting anything on
+/// the peer's standing, because a [`Proven`](Origin::Proven) witness carries none.
 ///
 /// It is deliberately neither `Copy` nor `Clone` (asserted below, `admitted_is_single_use`): a witness is a
 /// SINGLE-USE, per-stream proof. A consumer takes it BY VALUE, so minting one witness
