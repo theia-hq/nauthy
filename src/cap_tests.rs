@@ -1343,3 +1343,19 @@ fn the_evaluation_bound_admits_every_shape_nauthy_mints() {
         "a chain at MAX_BLOCKS still grants: the bound counts facts and join arity, not blocks"
     );
 }
+
+#[test]
+fn a_token_body_with_a_unicode_lookalike_is_refused() {
+    let issuer = identity(1);
+    let cap = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let link = cap.link().expect("encode");
+    let (root, body) = link.as_str().split_once('.').expect("key.token");
+    // U+017F uppercases to ASCII `S` and U+0131 to ASCII `I` under Unicode rules, so a Unicode fold
+    // would read the swapped body as the real token.
+    let (ascii, lookalike) = [('s', '\u{17F}'), ('i', '\u{131}')]
+        .into_iter()
+        .find(|(ascii, _)| body.contains(*ascii))
+        .expect("a token body of this size holds an s or an i");
+    let swapped = format!("{root}.{}", body.replacen(ascii, &lookalike.to_string(), 1));
+    assert!(matches!(Cap::parse(&swapped), Err(CapError::Encoding)));
+}
