@@ -1647,6 +1647,42 @@ fn gate_proven_refuses_a_revoked_peer_key_on_an_anchored_gate() {
     );
 }
 
+/// The sign twin of `key`, derived from the encoding rather than the curve: negating an ed25519 point
+/// negates its x, which flips only the sign bit its compressed form carries in the top bit of the last byte.
+fn sign_twin(key: VerifyKey) -> VerifyKey {
+    let mut bytes = *key.bytes();
+    bytes[31] ^= 0x80;
+    VerifyKey::new(bytes)
+}
+
+#[test]
+fn gate_proven_refuses_the_sign_twin_of_a_revoked_peer_key() {
+    // The holder of a revoked key's secret proves its negation by signing with the negated scalar, so the
+    // twin is refused as the key is, on both gates that mint a proven witness.
+    let device = identity(4).verifying_key();
+    let twin = sign_twin(device);
+    assert_ne!(twin, device);
+    assert!(
+        ed25519_dalek::VerifyingKey::from_bytes(twin.bytes()).is_ok(),
+        "the twin is a valid key a transport can prove"
+    );
+    let rooted = Gate::rooted(identity(1).verifying_key(), RevokedKey::new(device));
+    let anchored = Gate::anchored(
+        FixedPin(Some(identity(PIN).verifying_key())),
+        own_key(),
+        RevokedKey::new(device),
+        Ledger(Vec::new()),
+    );
+    for gate in [&rooted, &anchored] {
+        assert!(matches!(gate.proven(proven(twin)), Err(Refusal::Revoked)));
+        let sibling = identity(5).verifying_key();
+        assert!(
+            gate.proven(proven(sibling)).is_ok(),
+            "an unrevoked key is witnessed"
+        );
+    }
+}
+
 #[test]
 fn only_a_rooted_witness_has_a_verified_peer() {
     let gate = rooted_gate(1);
