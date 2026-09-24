@@ -6,25 +6,30 @@
 # reaches UP to name a CONSUMER's crate or a consumer's CLI flag, in docs/comments/strings.
 #
 # WHY DOCS, NOT CODE. The compiler already forbids a code-level cross-crate reference: a
-# crate that writes `swoosh::Foo` or `use tightbeam` in real code without declaring that
-# dependency fails to build. So this gate does NOT re-police code -- cargo does. The leaks
-# that compile CLEANLY, and so survive, live in DOC COMMENTS and STRINGS ("/// like swoosh's
-# status", `"... a handler like sshd:"`). That is exactly this gate's job: a crate whose
+# crate that writes `other::Foo` or `use other` in real code without declaring that
+# dependency fails to build. So checks 1-3 do NOT re-police code -- cargo does. The leaks
+# that compile CLEANLY, and so survive, live in DOC COMMENTS and STRINGS ("/// like the app's
+# status", `"... a handler like echo:"`). That is exactly this gate's job: a crate whose
 # docs/comments/strings NAME a sibling or consumer crate it does not depend on.
 #
 # WHAT IT CHECKS, per crate found under ROOT:
 #
 #   1. CRATE-NAME check -- the crate's files reference, AS A CRATE, a theia crate that is
 #      NOT its foundation. A crate's foundation is: a declared DEPENDENCY (a downward
-#      reference, always legal -- swoosh names tightbeam and depends on it), or a co-located
+#      reference, always legal -- an app names the library it depends on), or a co-located
 #      sibling LIBRARY in its own tree (the substrate crates in a workspace document each
-#      other). A leak is naming EITHER an EXTERNAL crate you do not depend on (`measure`
-#      naming the byte-tunnel `tightbeam`) OR an APPLICATION crate (`measure`/`fetch`/`beam`
-#      naming the consumer `swoosh`). See the classification block below.
+#      other). A leak is naming EITHER an EXTERNAL crate you do not depend on (a service
+#      crate naming a transport it does not use) OR an APPLICATION crate (a sibling library
+#      naming the app that consumes it). See the classification block below.
 #
 #   2. FLAG check -- a prime LIBRARY (not a `src/bin/` CLI) alludes to a consumer long-flag
 #      (`--for`/`--public`/`--peer`/`--authkey`/`--to`). A library owns a concept, never the
 #      flag a CLI paints over it.
+#
+#   3. DOC COMMAND check -- a crate's docs spell a consumer's COMMAND (`<consumer> <verb>`).
+#
+#   4. CONSUMER-WORD check -- any tracked file but a CHANGELOG names a layer that depends on
+#      this repo. The layers and their order are the one table in check 4.
 #
 # NOTHING IS HARDCODED about WHICH crates exist. The crate SET is DERIVED (see below) from
 # the Cargo.toml manifests in the tree, so a new crate is covered the day it lands. Each
@@ -64,12 +69,12 @@ FLAG_TOKENS="--for --public --peer --authkey --to"
 #
 # Scanning is over EVERY Cargo.toml under ROOT. This gate is meant to run PER REPO (as CI and
 # the umbrella `just gate` both do): the universe is that repo's own crates plus the theia
-# crates it depends on. A dependency crate from another repo (e.g. `tightbeam` in the swoosh
-# repo) enters the universe as an EXTERNAL name, which is what makes `measure` naming it a
+# crates it depends on. A dependency crate from another repo enters the universe as an
+# EXTERNAL name, which is what makes a sibling that does not depend on it naming it a
 # detectable leak.
 #
 # RESIDUAL LIMITATION. A lower repo naming a consumer that lives ABOVE it, in a repo it does
-# not depend on, is not derivable from its manifests; check 4 closes it with an explicit list.
+# not depend on, is not derivable from its manifests; check 4 closes it with the LAYERS table.
 # ---------------------------------------------------------------------------------------
 
 manifests=$(find "$ROOT" -name Cargo.toml -not -path '*/target/*' -not -path '*/_archived/*' | sort)
@@ -95,12 +100,12 @@ UNIVERSE=$(printf '%s\n%s\n' "$universe_pkgs" "$universe_deps" | grep -v '^$' | 
 # reference to the shared foundation:
 #   * LOCAL   -- a package DEFINED in this tree (a co-located sibling), vs an EXTERNAL crate
 #     known only as a git dependency. A crate may freely name a co-located sibling LIBRARY
-#     (the substrate crates in a workspace document each other: bifrost-core points at where
-#     the `Transport` trait lives, quirk describes its bifrost adapter). Naming an EXTERNAL
-#     crate you do not depend on is the cross-layer leak (`measure` naming `tightbeam`).
+#     (the substrate crates in a workspace document each other: a core crate points at where
+#     a trait lives, an adapter crate describes what it adapts). Naming an EXTERNAL crate you
+#     do not depend on is the cross-layer leak (a service crate naming a transport it skips).
 #   * APP     -- a package whose primary product is a binary (a `src/main.rs`, Cargo's
-#     application convention: `swoosh`). The application IS the consumer; NO other crate may
-#     name it, even a co-located sibling (`measure`/`fetch`/`beam` must not name `swoosh`).
+#     application convention). The application IS the consumer; NO other crate may name it,
+#     even a co-located sibling library.
 LOCAL_PKGS=" "
 APP_PKGS=" "
 for m in $manifests; do
@@ -115,18 +120,18 @@ done
 
 # ---------------------------------------------------------------------------------------
 # Match a crate name only in a CRATE-REFERENCE context, never as a bare English word.
-# Package names include ordinary words (`fetch`, `beam`, `measure`), which collide with
-# prose ("a public download (`fetch`)", "a single measure ping"), so a bare-word or even a
+# Package names can be ordinary English words, which collide with prose ("a crate called
+# `ping`" next to "a single ping"), so a bare-word or even a
 # plain-backtick grep re-introduces the false positives the first version hardcoded around.
 # We match ONLY forms that cannot be innocent prose:
 #   * `N::`                 a module path -- only ever a reference to the crate/module N.
-#   * possessive `N's`      "swoosh's registry" -- naming the crate as an actor.
+#   * possessive `N's`      "the app's registry" -- naming the crate as an actor.
 #   * intra-doc link `[N]`  a rustdoc/markdown link to the crate.
 #   * "N crate"             literally calling N a crate.
-# Names carrying a hyphen/underscore/digit (`bifrost-core`, `bifrost-mem`, ...) are not
-# English words, so for THOSE a bare identifier-boundary mention is matched too. Left/right
-# identifier boundaries treat `-`/`_` as name chars, so `beam` never matches inside
-# `tightbeam` and `bifrost` never inside `bifrost-core`.
+# Names carrying a hyphen/underscore/digit (`name-core`, `name-mem`, ...) are not English
+# words, so for THOSE a bare identifier-boundary mention is matched too. Left/right
+# identifier boundaries treat `-`/`_` as name chars, so `core` never matches inside
+# `name-core` and `name` never inside `name_core`.
 # ---------------------------------------------------------------------------------------
 BL='(^|[^A-Za-z0-9_-])'    # left identifier boundary
 BR='([^A-Za-z0-9_-]|$)'    # right identifier boundary
@@ -134,7 +139,7 @@ BR='([^A-Za-z0-9_-]|$)'    # right identifier boundary
 # extract_code_contexts DOC -- emit only the parts of a Markdown doc where a COMMAND can
 # live, so the doc command-pattern check (3 below) never fires on prose. A `<consumer>
 # <verb>` inside a code fence or an inline `backtick` span is unambiguously a command; the
-# same words in a sentence ("swoosh is a tool") are a description and must pass. Each emitted
+# same words in a sentence ("the app is a tool") are a description and must pass. Each emitted
 # line is `<orig-lineno><TAB><code-text>`, so the caller recovers the true file:line. The
 # lineno is always BEFORE the first tab, and the tab that separates it doubles as a left word
 # boundary, so a name at the very start of a span still binds. Pure awk, no dependencies.
@@ -183,8 +188,8 @@ for manifest in $manifests; do
     esac
 
     # Crate-reference forms (unambiguous for any name); every form carries a left
-    # identifier boundary so `beam` never matches inside `tightbeam::` nor `quirk` inside
-    # `bifrost_quirk::`.
+    # identifier boundary so `core` never matches inside `name-core::` nor inside
+    # `name_core::`.
     re="${BL}${n}::|${BL}${n}'s|\[${n}\]|${BL}${n} crate"
     # Hyphen/underscore/digit names are non-words: also catch a bare mention.
     case "$n" in
@@ -202,9 +207,9 @@ for manifest in $manifests; do
   # 2. FLAG check: a prime LIBRARY must not allude to a consumer CLI flag. Two surfaces name
   # flags legitimately and are derived, not listed:
   #   * An APPLICATION crate (its primary product IS the CLI) -- signalled by a `src/main.rs`
-  #     (Cargo's primary-binary convention). swoosh IS the consumer; its flags are its own.
+  #     (Cargo's primary-binary convention). The app IS the consumer; its flags are its own.
   #     Such a crate is skipped ENTIRELY.
-  #   * A library that also ships an auxiliary demo binary under `src/bin/` (tightbeam) -- the
+  #   * A library that also ships an auxiliary demo binary under `src/bin/` -- the
   #     library is the product and IS policed, but its `src/bin/` files are the CLI surface
   #     ("the bin's OWN flags are fine") and are excluded from THIS check only.
   if [ ! -f "$dir/src/main.rs" ]; then
@@ -226,10 +231,10 @@ for manifest in $manifests; do
 
   # 3. DOC COMMAND-PATTERN check: a library's README/docs may POINT at a real consumer (a
   # link, or the crate name in prose) but must never SPELL its COMMANDS. The distinction is
-  # deliberate: a NAME/LINK is a signpost; a NAME followed by a SUBCOMMAND (`swoosh serve`,
-  # `... | swoosh serve cam=stdin`, `swoosh ssh`) adopts the consumer's command grammar and
+  # deliberate: a NAME/LINK is a signpost; a NAME followed by a SUBCOMMAND (`app serve`,
+  # `... | app serve cam=stdin`, `app ssh`) adopts the consumer's command grammar and
   # rots when a verb is renamed or another consumer arrives. Code (checks 1/2 + the compiler)
-  # is already policed; DOCS were the blind spot that let a `swoosh serve` example sit in a
+  # is already policed; DOCS were the blind spot that let an `app serve` example sit in a
   # README behind a green gate.
   #
   # Scope, per crate (mirroring how checks 1/2 scope to a crate's own files): the crate's own
@@ -251,8 +256,8 @@ $(find "$dir/docs" -name '*.md' -not -path '*/target/*' -not -path '*/_archived/
     # consumer polices none, and a bare name that shares a word with prose never trips. From
     # that link set, drop this crate's OWN foundation: its own name, a co-located sibling
     # LIBRARY (`LOCAL_PKGS`, shared substrate), and any DECLARED DEPENDENCY (a downward link,
-    # always legal -- tightbeam's README links its deps bifrost/nauthy). What survives is a
-    # genuine CONSUMER the doc points UP at (swoosh), the only thing a library must not
+    # always legal -- a library's README links the crates it depends on). What survives is a
+    # genuine CONSUMER the doc points UP at, the only thing a library must not
     # overfit its docs to.
     linknames=$(grep -oE 'github\.com/theia-hq/[A-Za-z0-9_-]+' "$doc" 2>/dev/null \
       | sed 's#.*/theia-hq/##' | sort -u)
@@ -266,8 +271,8 @@ $(find "$dir/docs" -name '*.md' -not -path '*/target/*' -not -path '*/_archived/
       # 3c/3d. Flag `<consumer> <verb>` (a name then one-or-more spaces then a lowercase verb
       # token) ONLY inside a code context (fence or inline span), where it is unambiguously a
       # command. `extract_code_contexts` already stripped prose, so the pointer carve-out
-      # falls out for free -- no stopword list. `ffmpeg | swoosh serve ...` still matches on
-      # its `swoosh serve` tail; the pipeline prefix is irrelevant.
+      # falls out for free -- no stopword list. `ffmpeg | app serve ...` still matches on
+      # its `app serve` tail; the pipeline prefix is irrelevant.
       hits=$(extract_code_contexts "$doc" \
         | grep -E "${BL}${n}[[:space:]]+[a-z][a-z0-9-]*" 2>/dev/null || true)
       [ -n "$hits" ] || continue
@@ -296,26 +301,117 @@ $(find "$dir/docs" -name '*.md' -not -path '*/target/*' -not -path '*/_archived/
   done
 done
 
-# 4. CONSUMER-WORD check: a lower repo names no consumer, anywhere but its CHANGELOG (LAYERS.md
-# placement test 3; delib 85 erratum 2026-09-24). This list is the one place those words may sit,
-# so this script is the one file exempt. The same-line allow marker is NOT honored here: the
-# audit found no legitimate use, so there is no allowlist. A repo that DEFINES one of these
-# packages is that consumer, and the check skips it (the swoosh repo).
-CONSUMER_WORDS="swoosh sheer qat"
-is_consumer=0
-for w in $CONSUMER_WORDS; do
-  case "$LOCAL_PKGS" in *" $w "*) is_consumer=1 ;; esac
+# 4. CONSUMER-WORD check: a repo names no layer that depends on it, anywhere but a CHANGELOG
+# (LAYERS.md placement test 3). Downstream may name upstream, never the reverse.
+#
+# LAYERS is the family's one table, lowest first. Each row is a layer, the DISTINCTIVE words
+# that name it (never a common English word that prose would trip on), and the layers it
+# depends on directly, as its Cargo.toml declares them (a layer with no manifest lists what it
+# runs). This repo finds its own row by the package its root Cargo.toml defines, or for a
+# virtual workspace a package among its members, and forbids the words of every layer that
+# depends on it, directly or through another layer. A layer it depends on is never forbidden.
+#
+# Every tracked file is scanned but a CHANGELOG, case-insensitive, with any non-alphanumeric
+# character (`-` and `_` included) as a word boundary. The rows below are the only lines
+# exempt, and only in this file: every other line here, comments included, is checked like any
+# file. The same-line allow marker is NOT honored. A new layer is one row in every copy.
+LAYERS='
+layer nauthy    | nauthy       |
+layer quirk     | quirk        |
+layer bifrost   | bifrost      | quirk
+layer tightbeam | tightbeam    | bifrost nauthy
+layer services  | sshh         | bifrost nauthy tightbeam
+layer swoosh    | swoosh sheer | bifrost nauthy services tightbeam
+layer qat       | qat          | swoosh
+'
+LAYER_ROW='^layer [a-z]+ +\| [a-z ]+\|[a-z ]*$'
+
+# layer_field NAME COL -- column COL (2 words, 3 deps) of layer NAME's row.
+layer_field() {
+  printf '%s\n' "$LAYERS" | awk -F'|' -v n="$1" -v c="$2" \
+    '{ split($1, a, " "); if (a[1] == "layer" && a[2] == n) print $c }'
+}
+layer_names=$(printf '%s\n' "$LAYERS" | awk '$1 == "layer" { print $2 }')
+
+# The packages the root manifest defines: its own `[package]`, or its workspace members'.
+root_pkgs=""
+if [ -f "$ROOT/Cargo.toml" ]; then
+  root_entries=$(awk '
+    /^\[/ { sec = $0; inm = 0 }
+    sec == "[package]" && /^name[[:space:]]*=/ {
+      s = $0; sub(/^[^"]*"/, "", s); sub(/".*/, "", s); print "pkg " s }
+    sec == "[workspace]" && /^members[[:space:]]*=/ { inm = 1 }
+    inm {
+      s = $0
+      while (match(s, /"[^"]*"/)) { print "dir " substr(s, RSTART + 1, RLENGTH - 2); s = substr(s, RSTART + RLENGTH) }
+      if ($0 ~ /\]/) inm = 0
+    }
+  ' "$ROOT/Cargo.toml")
+  for e in $(printf '%s\n' "$root_entries" | tr ' ' '='); do
+    case "$e" in
+      pkg=*) root_pkgs="$root_pkgs ${e#pkg=}" ;;
+      dir=*)
+        for d in "$ROOT"/${e#dir=}; do
+          [ -f "$d/Cargo.toml" ] || continue
+          root_pkgs="$root_pkgs $(sed -n '/^\[package\]/,/^\[/s/^name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$d/Cargo.toml" | head -n1)"
+        done ;;
+    esac
+  done
+fi
+
+own_layer=""
+for l in $layer_names; do
+  for w in $(layer_field "$l" 2); do
+    case " $root_pkgs " in *" $w "*)
+      if [ -n "$own_layer" ] && [ "$own_layer" != "$l" ]; then
+        printf 'LEAK  check 4: the root manifest matches two layers (%s, %s)\n' "$own_layer" "$l"
+        fail=1
+      fi
+      own_layer=$l ;;
+    esac
+  done
 done
-if [ "$is_consumer" -eq 0 ]; then
-  words=$(printf '%s' "$CONSUMER_WORDS" | tr ' ' '|')
-  hits=$(cd "$ROOT" && git ls-files \
-    | grep -v -E '(^|/)CHANGELOG\.md$' | grep -v -x 'scripts/layering-gate.sh' \
-    | while read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done \
-    | xargs grep -IHniE "(^|[^A-Za-z0-9_])(${words})([^A-Za-z0-9_]|$)" 2>/dev/null || true)
-  if [ -n "$hits" ]; then
-    printf 'LEAK  this repo names a consumer (%s):\n' "$CONSUMER_WORDS"
-    printf '%s\n' "$hits" | sed 's/^/        /'
-    fail=1
+
+if [ -z "$own_layer" ]; then
+  printf 'LEAK  check 4: no LAYERS row names a package of %s/Cargo.toml (%s)\n' "$ROOT" "${root_pkgs# }"
+  fail=1
+else
+  # Every layer that depends on this one, directly or through another: grow the set to a fixpoint.
+  above=" $own_layer "
+  while :; do
+    before=$above
+    for l in $layer_names; do
+      case "$above" in *" $l "*) continue ;; esac
+      for d in $(layer_field "$l" 3); do
+        case "$above" in *" $d "*) above="$above$l "; break ;; esac
+      done
+    done
+    [ "$above" = "$before" ] && break
+  done
+  forbidden=""
+  for l in $above; do
+    [ "$l" = "$own_layer" ] && continue
+    forbidden="$forbidden $(layer_field "$l" 2)"
+  done
+  forbidden=$(printf '%s\n' $forbidden | sort -u | tr '\n' ' ' | sed 's/ $//')
+  printf 'layering-gate: check 4: layer %s forbids: %s\n' "$own_layer" "${forbidden:-(nothing)}"
+
+  if [ -n "$forbidden" ]; then
+    if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+      printf 'LEAK  check 4: %s is not a git checkout, so its tracked files cannot be read\n' "$ROOT"
+      fail=1
+    else
+      words=$(printf '%s' "$forbidden" | tr ' ' '|')
+      # git grep reads tracked paths itself, so a name with a space or a newline is never split.
+      hits=$(git -C "$ROOT" grep -I -n -i -E -e "(^|[^A-Za-z0-9])(${words})([^A-Za-z0-9]|$)" \
+          -- . ':(exclude,glob)**/CHANGELOG.md' \
+        | grep -v -E "^scripts/layering-gate\.sh:[0-9]+:${LAYER_ROW#^}" || true)
+      if [ -n "$hits" ]; then
+        printf 'LEAK  this repo names a layer that depends on it (%s):\n' "$forbidden"
+        printf '%s\n' "$hits" | sed 's/^/        /'
+        fail=1
+      fi
+    fi
   fi
 fi
 

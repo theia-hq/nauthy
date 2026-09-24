@@ -27,7 +27,7 @@
 #       different git sources; the umbrella [patch] hides it locally (every copy maps to one path),
 #       and CI then fails at build (`package S is specified twice`, or a cross-rev type mismatch).
 #       Checked against every name derived from the manifest git deps UNION every theia-hq git
-#       source in the lock, so transitive-only crates (bifrost-core, tightbeam-handler, ...) are
+#       source in the lock, so transitive-only crates (a sibling's own workspace members) are
 #       covered without hardcoding a name list.
 #
 # WHY IT READS THE COMMITTED/STAGED LOCK, NOT THE WORKING-TREE FILE. Under the containment model
@@ -42,7 +42,7 @@
 #
 # NOTHING IS HARDCODED about WHICH siblings exist: the sibling set is DERIVED from the git deps
 # in the manifests (same derive-from-manifest spirit as scripts/layering-gate.sh). Co-located
-# path members (beam/fetch/measure/sshh) are NOT siblings and are never required to carry a git
+# path members (this workspace's own crates) are NOT siblings and are never required to carry a git
 # source, which is what distinguishes a legit sourceless workspace member from a path-drifted
 # sibling.
 #
@@ -124,7 +124,7 @@ lock_blocks() {
 # every theia-hq git dep across the manifests. The `|| true` on the grep is necessary: under
 # `set -e` a no-match (exit 1) in this pipeline kills the `list_manifests | while` subshell at
 # the first manifest that declares no theia dep, so a git dep declared outside the ROOT manifest
-# was never enumerated (bifrost/quirk/nauthy reported 0 siblings and their drift went unchecked).
+# was never enumerated (three repos reported 0 siblings and their drift went unchecked).
 # sed with a real space avoids the BSD-sed `\t` gotcha (BSD sed emits a literal `t` for `\t`).
 siblings=$(list_manifests | while IFS= read -r m; do
   [ -n "$m" ] || continue
@@ -168,7 +168,7 @@ EOF
 # at the new rev) makes cargo resolve TWO copies of S from different git sources; the umbrella
 # [patch] hides it locally (every copy maps to one path) and CI fails at build. Names checked:
 # every manifest git-dep key UNION every theia-hq git source in the lock, so transitive-only
-# crates (bifrost-core, tightbeam-handler, ...) are covered without a hardcoded name list.
+# crates (a sibling's own workspace members) are covered without a hardcoded name list.
 lock_siblings=$(awk '
   /^name = "/ { name = $0; sub(/^name = "/, "", name); sub(/"$/, "", name) }
   index($0, "source = \"git+https://github.com/theia-hq/") == 1 { if (name != "") { print name; name = "" } }
@@ -210,7 +210,7 @@ EOF
 
 # (f): a lock block with NO `source` is a WORKSPACE member. Any other sourceless block is a path-patched
 # build's leak, and the checks above cannot see it: (a)/(b) iterate the git deps this repo's manifests
-# DECLARE, and a transitive-only sibling (tightbeam-handler, reached through tightbeam) is declared
+# DECLARE, and a transitive-only sibling (a crate reached only through another sibling) is declared
 # nowhere here; (e) unions in the lock's git-sourced names, and a leaked block has no source to union on.
 # So a sibling that arrives only through another sibling could leak in as a path entry and pass both.
 # Enumerating the repo's own [package] names and calling every OTHER sourceless block a leak needs no
