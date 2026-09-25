@@ -2,7 +2,7 @@
 
 All notable changes to nauthy, newest first.
 
-## Unreleased
+## v0.10.0
 
 ### Breaking
 - **A key that is not a usable ed25519 key is refused wherever it enters:** key text (and so a link, a
