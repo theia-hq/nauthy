@@ -8,7 +8,7 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 
 use crate::cap::SIGNED_DOCUMENT_CONTEXT;
 use crate::signed::{SignError, Signed};
-use crate::{Identity, VerifyKey};
+use crate::{Identity, KeyError, VerifyKey};
 
 /// A deterministic signing identity for the sign/verify tests.
 fn identity(seed: u8) -> Identity {
@@ -97,6 +97,23 @@ fn decode_rejects_a_blob_shorter_than_its_header() {
     // A blob too short to hold the 32-byte signer + 64-byte signature is truncated, not an empty payload.
     let short = vec![0u8; VerifyKey::LEN + 63];
     assert_eq!(Signed::decode(&short), Err(SignError::Truncated));
+}
+
+/// A blob whose signer is the torsion twin `A + T` of the key the seed `[7; 32]` binds is refused at
+/// decode, before any caller can hold it as a `Signed`.
+#[test]
+fn a_signed_blob_with_a_torsion_twin_signer_is_refused_at_decode() {
+    const TWIN_OF_SEVEN: [u8; 32] = [
+        0x1f, 0x4f, 0x58, 0x0e, 0x73, 0xac, 0x20, 0x8f, 0x06, 0x76, 0x01, 0x90, 0xe9, 0xed, 0xc6,
+        0xf5, 0x91, 0x67, 0x75, 0xda, 0xbd, 0x9c, 0x1c, 0xdc, 0xa3, 0x93, 0x17, 0x5c, 0x2d, 0x6d,
+        0x10, 0x83,
+    ];
+    let mut blob = identity(7).sign_document(b"payload").encode();
+    blob[..VerifyKey::LEN].copy_from_slice(&TWIN_OF_SEVEN);
+    assert_eq!(
+        Signed::decode(&blob),
+        Err(SignError::Signer(KeyError::HasTorsion))
+    );
 }
 
 #[test]

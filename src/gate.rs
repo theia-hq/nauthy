@@ -673,7 +673,8 @@ pub enum Admission {
 static_assertions::assert_not_impl_any!(Admitted: Clone, Copy);
 
 /// The sign twin of `key`: the negated point, which the holder of `key`'s secret proves by signing with the
-/// negated scalar. `None` for bytes that are not a curve point, which no transport proves.
+/// negated scalar. Always `Some` in practice: every `VerifyKey` is a canonical prime-order point, and so is
+/// its negation. The `Option` keeps the two conversions free of a panic.
 ///
 /// Only [`Gate::proven`] asks about it. Every other path admits on a token, and a token either binds the
 /// exact key bytes, which the twin does not match, or binds no key, which any fresh key can carry as well.
@@ -681,9 +682,7 @@ fn sign_twin(key: VerifyKey) -> Option<VerifyKey> {
     let point = ed25519_dalek::VerifyingKey::from_bytes(key.bytes())
         .ok()?
         .to_edwards();
-    Some(VerifyKey::new(
-        ed25519_dalek::VerifyingKey::from(-point).to_bytes(),
-    ))
+    VerifyKey::try_new(ed25519_dalek::VerifyingKey::from(-point).to_bytes()).ok()
 }
 
 /// The plain admission path: a peer that presents a token rooted at the authority `root`, unrevoked,
