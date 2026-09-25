@@ -61,15 +61,15 @@ impl Link {
         )
     }
 
-    /// Mint a signet-bound link granting `service` to any device of the fleet `foreign_root`,
-    /// valid for `lifetime` from now.
+    /// Mint an authority-bound link granting `service` to any device the authority `foreign_root` vouches
+    /// for, valid for `lifetime` from now.
     ///
-    /// The work-sim primitive ([`Identity::mint_authority_slip`]): issue ONCE to a person's signet
-    /// `foreign_root`, and every device that signet vouches for may use it. Inert alone: the far gate admits
-    /// it only when the presenter ALSO proves membership under `foreign_root`. Always sealed:
-    /// theft-resistant and non-delegable by construction (like [`mint_bound`](Self::mint_bound)). Offline:
-    /// needs the signing `identity` but no network.
-    pub fn mint_signet(
+    /// The link form of [`Identity::mint_authority_slip`], for a person's authority: issue it once to
+    /// `foreign_root`, and every device that authority vouches for may use it. Inert alone: the far gate admits
+    /// it only when the presenter also proves membership under `foreign_root`, so a copy observed in flight or
+    /// at rest grants no one. Like [`mint_bound`](Self::mint_bound), no holder can pass it on.
+    /// Offline: needs the signing `identity` but no network.
+    pub fn mint_authority_bound(
         identity: &Identity,
         service: &Service,
         foreign_root: VerifyKey,

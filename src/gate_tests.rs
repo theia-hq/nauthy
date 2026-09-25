@@ -841,7 +841,7 @@ fn a_store_that_keeps_no_keys_revokes_no_peer() {
 }
 
 // The anchored gate: this machine's own key is `identity(OWN)`, its pin (when it has one) is `identity(PIN)`.
-// A device of a foreign fleet is `identity(4)` under the fleet authority `identity(2)`.
+// A device of a foreign authority is `identity(4)`, badged by the authority `identity(2)`.
 
 const OWN: u8 = 3;
 const PIN: u8 = 1;
@@ -918,21 +918,21 @@ fn anchored_gate(pin: Option<u8>, issued: &[&Cap]) -> Gate {
     )
 }
 
-/// The own key's fleet slip for `svc`: any device `authority_seed` badges may reach it.
-fn own_fleet_slip(authority_seed: u8, svc: &str) -> Cap {
+/// The own key's authority-bound slip for `svc`: any device `authority_seed` badges may reach it.
+fn own_authority_slip(authority_seed: u8, svc: &str) -> Cap {
     identity(OWN)
         .mint_authority_slip(
             &service(svc),
             identity(authority_seed).verifying_key(),
             hour(),
         )
-        .expect("mint own fleet slip")
+        .expect("mint own authority-bound slip")
 }
 
 /// A token no mint in this crate writes, signed by `signer_seed`: a membership fact AND an authority-bound
 /// fact naming `authority_seed`, with no service check, so it passes both the membership question and the
 /// authority-bound slip check. Anyone holding the key can sign one.
-fn member_fleet_slip(signer_seed: u8, authority_seed: u8) -> Cap {
+fn member_authority_slip(signer_seed: u8, authority_seed: u8) -> Cap {
     let private =
         PrivateKey::from_bytes(&[signer_seed; 32], Algorithm::Ed25519).expect("valid secret");
     let token = biscuit!(
@@ -972,17 +972,17 @@ fn a_member_cap_rooted_at_own_is_refused() {
         Err(Refusal::NotGranted)
     ));
 
-    // On the two-token path: a recorded token that is both a member cap and a fleet slip, with a valid
-    // badge from that fleet. Every other check passes, so only the membership refusal stops it.
-    let slip = member_fleet_slip(OWN, 2);
+    // On the two-token path: a recorded token that is both a member cap and an authority-bound slip, with a
+    // valid badge from that authority. Every other check passes, so only the membership refusal stops it.
+    let slip = member_authority_slip(OWN, 2);
     let gate = anchored_gate(Some(PIN), &[&slip]);
-    let fleet_badge = foreign_badge(2, device);
+    let authority_badge = foreign_badge(2, device);
     assert_eq!(
-        gate.admit_foreign(proven(device), &slip, &fleet_badge, &service("ssh")),
+        gate.admit_foreign(proven(device), &slip, &authority_badge, &service("ssh")),
         Decision::Refuse(Refusal::NotGranted)
     );
     assert!(matches!(
-        gate.admit_foreign_witnessed(proven(device), &slip, &fleet_badge, &service("ssh")),
+        gate.admit_foreign_witnessed(proven(device), &slip, &authority_badge, &service("ssh")),
         Err(Refusal::NotGranted)
     ));
 }
@@ -1014,19 +1014,20 @@ fn a_narrowed_member_cap_rooted_at_own_is_refused() {
         Decision::Refuse(Refusal::NotGranted)
     );
 
-    // On the two-token path: the recorded member fleet slip, narrowed to the service it is presented for.
-    let slip = member_fleet_slip(OWN, 2);
+    // On the two-token path: the recorded member authority-bound slip, attenuated to the service it is
+    // presented for.
+    let slip = member_authority_slip(OWN, 2);
     let narrowed = slip
         .attenuate(Some(&service("ssh")), None)
         .expect("a holder narrows the slip");
     let gate = anchored_gate(Some(PIN), &[&slip]);
-    let fleet_badge = foreign_badge(2, device);
+    let authority_badge = foreign_badge(2, device);
     assert_eq!(
-        gate.admit_foreign(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        gate.admit_foreign(proven(device), &narrowed, &authority_badge, &service("ssh")),
         Decision::Refuse(Refusal::NotGranted)
     );
     assert!(matches!(
-        gate.admit_foreign_witnessed(proven(device), &narrowed, &fleet_badge, &service("ssh")),
+        gate.admit_foreign_witnessed(proven(device), &narrowed, &authority_badge, &service("ssh")),
         Err(Refusal::NotGranted)
     ));
 }
@@ -1276,8 +1277,8 @@ fn a_pin_written_later_is_trusted_at_the_next_admission() {
 
 #[test]
 fn a_token_rooted_at_the_pin_is_ruled_as_a_rooted_gate_rules_it() {
-    // A badge is a member, a slip admits its service only, a fleet slip admits its fleet's device, and a
-    // recalled token is refused, none of it needing the own key's record.
+    // A badge is a member, a slip admits its service only, an authority-bound slip admits its authority's
+    // device, and a recalled token is refused, none of it needing the own key's record.
     let device = identity(4).verifying_key();
     let gate = anchored_gate(Some(PIN), &[]);
 
@@ -1324,9 +1325,9 @@ fn a_token_rooted_at_the_pin_is_ruled_as_a_rooted_gate_rules_it() {
 }
 
 #[test]
-fn a_node_signed_fleet_slip_admits_a_device_of_that_fleet() {
+fn a_node_signed_authority_slip_admits_a_device_of_that_authority() {
     let device = identity(4).verifying_key();
-    let slip = own_fleet_slip(2, "ssh");
+    let slip = own_authority_slip(2, "ssh");
     let badge = foreign_badge(2, device);
     let gate = anchored_gate(Some(PIN), &[&slip]);
 
@@ -1336,7 +1337,7 @@ fn a_node_signed_fleet_slip_admits_a_device_of_that_fleet() {
     );
     let admitted = gate
         .admit_foreign_witnessed(proven(device), &slip, &badge, &service("ssh"))
-        .expect("a recorded fleet slip admits the fleet's device");
+        .expect("a recorded authority-bound slip admits the authority's device");
     assert_eq!(admitted.kind(), Admission::Slip);
 
     // With no pin at all: the own key's slips do not depend on a root.
@@ -1348,14 +1349,14 @@ fn a_node_signed_fleet_slip_admits_a_device_of_that_fleet() {
 }
 
 #[test]
-fn a_node_signed_fleet_slip_absent_from_the_ledger_is_refused() {
+fn a_node_signed_authority_slip_absent_from_the_ledger_is_refused() {
     let device = identity(4).verifying_key();
     let gate = anchored_gate(Some(PIN), &[]);
 
     assert_eq!(
         gate.admit_foreign(
             proven(device),
-            &own_fleet_slip(2, "ssh"),
+            &own_authority_slip(2, "ssh"),
             &foreign_badge(2, device),
             &service("ssh")
         ),
@@ -1365,10 +1366,10 @@ fn a_node_signed_fleet_slip_absent_from_the_ledger_is_refused() {
 
 #[test]
 fn a_foreign_slip_naming_own_as_authority_is_refused() {
-    // A recorded fleet slip naming the own key as its fleet. Anyone holding a copy of the own key can
-    // badge a key of their choosing under it, so the slip is refused before any badge is read.
+    // A recorded authority-bound slip naming the own key as its authority. Anyone holding a copy of the own
+    // key can badge a key of their choosing under it, so the slip is refused before any badge is read.
     let thief = identity(7).verifying_key();
-    let slip = own_fleet_slip(OWN, "ssh");
+    let slip = own_authority_slip(OWN, "ssh");
     let badge = bound_badge(OWN, thief);
     let gate = anchored_gate(Some(PIN), &[&slip]);
 
@@ -1379,14 +1380,14 @@ fn a_foreign_slip_naming_own_as_authority_is_refused() {
 }
 
 #[tokio::test]
-async fn a_latched_fleet_refuses_a_node_signed_fleet_slip() {
-    // A disabled fleet authority refuses its devices on the own key's fleet slip, asked before the pair
+async fn a_latched_authority_refuses_a_node_signed_authority_slip() {
+    // A disabled authority refuses its devices on the own key's authority-bound slip, asked before the pair
     // verifies (this slip is for `web`, asked for `ssh`, so a late read would report the miss) and again
     // after it.
     let device = identity(4).verifying_key();
-    let web = own_fleet_slip(2, "web");
-    let ssh = own_fleet_slip(2, "ssh");
-    let (gate, path) = anchored_gate_disabling(2, &[&web, &ssh], "fleet").await;
+    let web = own_authority_slip(2, "web");
+    let ssh = own_authority_slip(2, "ssh");
+    let (gate, path) = anchored_gate_disabling(2, &[&web, &ssh], "authority").await;
 
     assert_eq!(
         gate.admit_foreign(
@@ -1424,10 +1425,10 @@ fn a_cap_rooted_elsewhere_never_takes_the_self_anchor_path() {
     // A stranger's slip roots at neither the pin nor the own key. Its id is in the record, so only the
     // choice of path can refuse it.
     let stranger = slip(5, "ssh");
-    let stranger_fleet = identity(5)
+    let stranger_authority_slip = identity(5)
         .mint_authority_slip(&service("ssh"), identity(2).verifying_key(), hour())
-        .expect("mint stranger fleet slip");
-    let gate = anchored_gate(Some(PIN), &[&stranger, &stranger_fleet]);
+        .expect("mint stranger authority-bound slip");
+    let gate = anchored_gate(Some(PIN), &[&stranger, &stranger_authority_slip]);
     let device = identity(4).verifying_key();
 
     assert_eq!(
@@ -1437,7 +1438,7 @@ fn a_cap_rooted_elsewhere_never_takes_the_self_anchor_path() {
     assert_eq!(
         gate.admit_foreign(
             proven(device),
-            &stranger_fleet,
+            &stranger_authority_slip,
             &foreign_badge(2, device),
             &service("ssh")
         ),
@@ -1461,8 +1462,8 @@ fn a_self_anchored_admission_is_origin_rooted() {
     // authorities, so its admissions are `Rooted`, on both paths.
     let device = identity(4).verifying_key();
     let ssh = slip(OWN, "ssh");
-    let fleet = own_fleet_slip(2, "ssh");
-    let gate = anchored_gate(Some(PIN), &[&ssh, &fleet]);
+    let authority_bound = own_authority_slip(2, "ssh");
+    let gate = anchored_gate(Some(PIN), &[&ssh, &authority_bound]);
 
     let plain = gate
         .admit_witnessed(proven(device), Some(&ssh), &service("ssh"))
@@ -1471,11 +1472,11 @@ fn a_self_anchored_admission_is_origin_rooted() {
     let foreign = gate
         .admit_foreign_witnessed(
             proven(device),
-            &fleet,
+            &authority_bound,
             &foreign_badge(2, device),
             &service("ssh"),
         )
-        .expect("a recorded fleet slip admits");
+        .expect("a recorded authority-bound slip admits");
     assert_eq!(foreign.origin(), Origin::Rooted);
 }
 
@@ -1484,13 +1485,13 @@ fn an_anchored_gate_refuses_a_revoked_peer_key_before_any_cap() {
     // On every entry point and on both authorities, the device's own key is asked before any token.
     let device = identity(4).verifying_key();
     let own_slip = slip(OWN, "ssh");
-    let fleet = own_fleet_slip(2, "ssh");
+    let authority_bound = own_authority_slip(2, "ssh");
     let store = Arc::new(RevokedKey::new(device));
     let gate = Gate::anchored(
         FixedPin(Some(identity(PIN).verifying_key())),
         own_key(),
         Arc::clone(&store),
-        Ledger::of(&[&own_slip, &fleet]),
+        Ledger::of(&[&own_slip, &authority_bound]),
     );
 
     for presented in [Some(&own_slip), Some(&bound_badge(PIN, device)), None] {
@@ -1503,7 +1504,7 @@ fn an_anchored_gate_refuses_a_revoked_peer_key_before_any_cap() {
             Err(Refusal::Revoked)
         ));
     }
-    for slip in [&fleet, &authority_slip(2, "ssh")] {
+    for slip in [&authority_bound, &authority_slip(2, "ssh")] {
         assert_eq!(
             gate.admit_foreign(
                 proven(device),
