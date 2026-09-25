@@ -176,6 +176,35 @@ fn a_bound_link_is_sealed_at_mint() {
     );
 }
 
+/// An authority-bound link names the authority it is issued to, and no holder can attenuate it.
+#[test]
+fn an_authority_bound_link_names_its_authority_and_refuses_attenuation() {
+    let issuer = identity(1);
+    let authority = identity(2).verifying_key();
+    let link = Link::mint_authority_bound(
+        &issuer,
+        &service("ssh"),
+        authority,
+        Duration::from_secs(3600),
+    )
+    .expect("mint authority-bound");
+    assert!(link.cap().is_authority_bound());
+    assert_eq!(
+        link.cap()
+            .authority_bound_root()
+            .expect("read the authority"),
+        Some(authority)
+    );
+    assert_eq!(link.root(), issuer.verifying_key());
+    assert!(
+        matches!(
+            link.narrow(None, Some(Duration::from_secs(60))),
+            Err(CapError::Attenuate(_))
+        ),
+        "an authority-bound link cannot be attenuated"
+    );
+}
+
 /// Revoking a link records its chain in the denylist, so the gate refuses the link itself.
 #[cfg(feature = "tokio-fs")]
 #[tokio::test]

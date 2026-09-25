@@ -441,7 +441,7 @@ impl Anchor {
                     return Decision::Refuse(refusal);
                 }
                 // The own key as the slip's authority would let anyone holding a copy of it badge any key
-                // they like into the fleet the slip names, so it is refused before the badge is read.
+                // they like under the authority the slip names, so it is refused before the badge is read.
                 match verify_pair(
                     self.own,
                     revocations,

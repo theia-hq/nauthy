@@ -2,6 +2,13 @@
 
 All notable changes to nauthy, newest first.
 
+## v0.11.0
+
+### Breaking
+- **`Link::mint_signet` is renamed `Link::mint_authority_bound`**, beside `Link::mint_bound`. It mints
+  the authority-bound slip under the same checks; only the name changed. The old name is gone, with no
+  alias.
+
 ## v0.10.0
 
 ### Breaking

@@ -146,8 +146,8 @@ let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued);
   token admits a member.
 - A token rooted at `own` is admitted only as a service slip, and only when `issued` (an `IssuedIds`)
   holds its `root_revocation_id`. Record that id when you mint. A copy of the key mints slips with fresh
-  ids, so it cannot mint access. A membership badge `own` signed is refused, and so is a fleet slip that
-  names `own` as its authority.
+  ids, so it cannot mint access. A membership badge `own` signed is refused, and so is an authority-bound
+  slip that names `own` as its authority.
 - A pin equal to `own` is no pin.
 
 Its admissions carry `Origin::Rooted`; one made under `own` is never a member. `PinSource` is implemented
@@ -207,8 +207,8 @@ nauthy brings the grant vocabulary, offline verification, device binding against
   may reach; revoke it when the task ends.
 - **Licensing.** Mint one device-bound slip per customer machine. A copied license file verifies against
   no other key.
-- **Membership badges.** Mint one badge per device you own; the gate admits your fleet with no per-service
-  step.
+- **Membership badges.** Mint one badge per device you own; the gate admits every member with no
+  per-service step.
 
 ## Recipes
 
