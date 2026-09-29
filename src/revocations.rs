@@ -217,15 +217,20 @@ impl FileDenylist {
         ids.into_iter().any(|id| state.ids.contains(id))
     }
 
-    /// Reload the ids in place if the backing file's [`FileStamp`](crate::FileStamp) differs from what we last read.
-    /// Synchronous and on the admit hot path, so it debounces the stat to at most once per
+    /// Union the file into the held set if its [`FileStamp`](crate::FileStamp) differs from what we last
+    /// read. Synchronous and on the admit hot path, so it debounces the stat to at most once per
     /// [`STAT_DEBOUNCE`] and re-reads only on change.
     ///
+    /// A LIVE REFRESH ONLY EVER ADDS IDS. It unions what it reads and never assigns, so a shorter file (a
+    /// hand edit, a truncation, a crash, or a local attacker) un-revokes nothing in a running process. No
+    /// write shrinks the file, so a shorter one is never news to act on. Accepting a loss is explicit and
+    /// happens only at [`load`](Self::load): remove the `<path>.written` witness and load again, which reads
+    /// the file as it stands (see [`Lost`](DenylistError::Lost)).
+    ///
     /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
-    /// leave the last-known set intact and return. Deletion is not "the denylist is now empty": a `rm` of
-    /// the file (a botched cleanup, or a local attacker) must never silently un-revoke every recalled cap.
-    /// A denylist that never had a file stays empty (nothing to un-revoke); revocations only ever grow a
-    /// file, and a fresh file appearing is picked up through the `Ok` stat arm below.
+    /// leave the held set intact and return. Deletion is not "the denylist is now empty": a `rm` of the
+    /// file (a botched cleanup, or a local attacker) must never silently un-revoke every recalled cap. A
+    /// fresh file appearing is picked up through the `Ok` stat arm below.
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
     fn refresh(&self, state: &mut State) {
@@ -247,9 +252,6 @@ impl FileDenylist {
             return;
         }
         let ids = match std::fs::read_to_string(&self.path) {
-            // An empty body never replaces the set: no write leaves one, so it is a truncation or a crash,
-            // and replacing would un-revoke every cap at once.
-            Ok(text) if text.trim().is_empty() => return,
             Ok(text) => match parse_ids(&text) {
                 Ok(ids) => ids,
                 Err(_) => return,
@@ -257,7 +259,9 @@ impl FileDenylist {
             // Raced away between stat and read: keep last-known rather than dropping revocations.
             Err(_) => return,
         };
-        state.ids = ids;
+        // THE line that makes the denylist monotone. `state.ids = ids` would let a shorter file, an empty
+        // one included, un-revoke whatever it left out, live and without a restart.
+        state.ids.extend(ids);
         state.stamp = current;
     }
 

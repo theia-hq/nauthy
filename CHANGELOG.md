@@ -2,6 +2,14 @@
 
 All notable changes to nauthy, newest first.
 
+## Unreleased
+
+### Fixed
+- **A shorter denylist file no longer un-revokes a cap in a running process.** `FileDenylist` replaced
+  its set with any shorter non-empty file that parsed. A refresh now adds the ids it reads and never
+  drops one it holds. To accept a loss on purpose, remove the `<path>.written` witness and call
+  `FileDenylist::load` again.
+
 ## v0.11.0
 
 ### Breaking

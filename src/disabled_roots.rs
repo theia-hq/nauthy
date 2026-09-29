@@ -43,9 +43,8 @@ const MAX_LEN: u64 = 1 << 20;
 /// a restart.
 ///
 /// UNION ONLY. A refresh ADDS what it reads and never assigns. A stat or read failure, an oversized file,
-/// or the file disappearing keeps every key already held. The denylist's refresh replaces its set, which
-/// is right for ids an issuer may legitimately prune and wrong here, where a shorter file is either a
-/// mistake or an attack and must not revive a root either way.
+/// or the file disappearing keeps every key already held. A shorter file is either a mistake or an attack
+/// and must not revive a root either way; the denylist's refresh holds the same rule for its ids.
 ///
 /// A LINE THAT IS NOT A KEY DOES NOT HIDE THE ONES THAT ARE. A running latch adds every valid line of a
 /// partly malformed file and reports the first bad line through
@@ -223,8 +222,8 @@ impl DisabledRoots {
         };
         let parsed = Parsed::from(text.as_str());
         // THE line that makes the latch terminal. `state.roots = parsed.roots` would let a shorter file
-        // revive a root, which is the denylist's shape and exactly the one not to copy here. Every valid
-        // line lands even when another line is bad, so one bad line cannot freeze the latch.
+        // revive a root. Every valid line lands even when another line is bad, so one bad line cannot
+        // freeze the latch.
         state.roots.extend(parsed.roots);
         state.malformed = parsed.rejected.first().map(|rejected| rejected.line);
         // A malformed read is current too. Re-reading an unchanged bad file on every refresh would parse
