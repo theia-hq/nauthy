@@ -369,6 +369,106 @@ async fn an_emptied_denylist_neither_loads_nor_replaces_the_running_set() {
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }
 
+/// Rewrite the denylist at `path` to hold exactly `kept`, through a sibling renamed over it, so the file
+/// has a new inode and a shorter length: a fresh stamp no refresh can mistake for the one it read.
+#[cfg(unix)]
+fn shorten_to(path: &std::path::Path, kept: &crate::cap::Cap) {
+    let body: String = kept
+        .revocation_ids()
+        .iter()
+        .map(|id| format!("{}\n", id.to_hex()))
+        .collect();
+    let shorter = path.with_extension("shorter");
+    std::fs::write(&shorter, body).expect("write the shorter generation");
+    std::fs::rename(&shorter, path).expect("rename the shorter generation over the denylist");
+}
+
+/// No write shrinks the denylist, so a shorter file that still parses is a hand edit, a crash, or an
+/// attacker. A running denylist must union it, never adopt it, or the ids it left out are un-revoked live.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_shorter_valid_file_never_unrevokes_a_running_denylist() {
+    let mut denylist = denylist("shorter");
+    let path = denylist.path().to_path_buf();
+    let kept = identity(23)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint the kept cap");
+    let dropped = identity(24)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint the dropped cap");
+    denylist.revoke(&kept).await.expect("revoke the kept cap");
+    denylist
+        .revoke(&dropped)
+        .await
+        .expect("revoke the dropped cap");
+    // Arm the debounce against the file both writes left, so the refresh below is a real re-read.
+    assert!(denylist.is_revoked(&kept) && denylist.is_revoked(&dropped));
+
+    shorten_to(&path, &kept);
+    std::thread::sleep(crate::STAT_DEBOUNCE + Duration::from_millis(50));
+
+    assert!(
+        denylist.is_revoked(&kept),
+        "the id the shorter file names stays revoked"
+    );
+    assert!(
+        denylist.is_revoked(&dropped),
+        "the id the shorter file left out stays revoked"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+}
+
+/// The one way to shrink the set on purpose: remove the witness and load again. The load reads the file
+/// as it stands, and the lock is never involved.
+#[cfg(unix)]
+#[tokio::test]
+async fn removing_the_witness_accepts_the_loss_at_load() {
+    let mut denylist = denylist("accept");
+    let path = denylist.path().to_path_buf();
+    let kept = identity(25)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint the kept cap");
+    let dropped = identity(26)
+        .mint(&service("ssh"), far_expiry())
+        .expect("mint the dropped cap");
+    denylist.revoke(&kept).await.expect("revoke the kept cap");
+    denylist
+        .revoke(&dropped)
+        .await
+        .expect("revoke the dropped cap");
+    shorten_to(&path, &kept);
+
+    assert!(
+        matches!(
+            FileDenylist::load(path.clone()).await,
+            Err(crate::revocations::DenylistError::Lost {
+                expected: 2,
+                found: 1,
+                ..
+            })
+        ),
+        "a shorter file beside its witness refuses to load"
+    );
+    std::fs::remove_file(crate::revocations::witness_path(&path)).expect("accept the loss");
+
+    let loaded = FileDenylist::load(path.clone())
+        .await
+        .expect("loads the file as it stands");
+    assert!(loaded.is_revoked(&kept), "the id the file names is revoked");
+    assert!(
+        !loaded.is_revoked(&dropped),
+        "the id the file left out is un-revoked"
+    );
+    assert!(
+        crate::revocations::lock_path(&path).exists(),
+        "the lock was never touched"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
+}
+
 /// The same law as the latch, through the same check: a deleted denylist beside its witness is a loss, not
 /// a fresh start, or deleting `revoked` would un-revoke every cap at the next start.
 #[cfg(unix)]
