@@ -1,54 +1,56 @@
-//! Offline revocation for bearer caps: the [`Revocations`] oracle the gate consults, and a
-//! file-backed [`FileDenylist`] that implements it.
+//! Offline revocation for bearer caps: the [`Revocations`] oracle the gate consults, and a file-backed
+//! [`Denylist`] that implements it.
 //!
 //! A cap is offline-verifiable, so there is no server to ask "is this revoked?". Instead the issuer keeps
-//! its own set of biscuit revocation identifiers: revoking a cap records its narrowest block's id, and the
-//! gate refuses any presented cap whose chain includes a revoked id (the cap itself, or an ancestor it was
-//! attenuated from). Pure-offline, node-local, and it survives restarts, which a short TTL cannot: a TTL
-//! ages a leaked cap out eventually but cannot recall it now.
+//! its own set of what it refuses for good. Revoking a cap records its narrowest block's id, and the gate
+//! refuses any presented cap whose chain includes a revoked id (the cap itself, or an ancestor it was
+//! attenuated from). Revoking a KEY refuses it as a proven peer and refuses every cap rooted at it, past
+//! and future, which an id cannot do: an id names only what a key already signed. Pure-offline,
+//! node-local, and it survives restarts, which a short TTL cannot: a TTL ages a leaked cap out eventually
+//! but cannot recall it now.
 //!
-//! [`Revocations`] is the extension point. It is a synchronous, one-method trait, so a consumer whose distributed
+//! [`Revocations`] is the extension point. It is a synchronous trait, so a consumer whose distributed
 //! system keeps revocations in Redis, a database, or a gossip set implements it over that store and needs
-//! no file and no async runtime. The batteries-included impl is [`FileDenylist`] (behind the `tokio-fs`
-//! feature), a persisted set of ids on disk.
+//! no file. The batteries-included impl is [`Denylist`] (behind the `fs` feature), one grow-only file of
+//! ids and keys.
 //!
-//! Revocation through [`FileDenylist`] is LIVE: [`is_revoked`](FileDenylist::is_revoked) re-reads the file
-//! when its [`FileStamp`](crate::FileStamp) changes, so a revocation written by a separate process takes effect on
-//! the next connection to a long-running issuer; it does not wait for a restart. The stamp carries the
-//! length with the mtime on purpose: a revoke only ever grows the file, so a change within one coarse
-//! mtime tick is still seen. The reload is a small, rare read (only when the file actually changed), guarded by
-//! interior mutability so the gate's synchronous admit path stays synchronous.
+//! Revocation through [`Denylist`] is LIVE: a check re-reads the file when its
+//! [stamp](crate::FileStamp) changes, so a revocation written by a separate process takes effect on
+//! the next connection to a long-running issuer; it does not wait for a restart. The reload is a small,
+//! rare read (only when the file actually changed), guarded by interior mutability so the gate's
+//! synchronous admit path stays synchronous.
 //!
-//! Revocation WRITES are SERIALIZED: [`revoke`](FileDenylist::revoke) takes an exclusive advisory lock on a
-//! sibling `<path>.lock` file, re-reads the on-disk set under that lock, and writes the union of the disk
-//! set and its own, so two writers revoking different ids both survive instead of the last rewrite dropping
-//! the other's. The rewrite is atomic (a temp sibling unique per write, then one rename over the target), so
-//! a crash mid-write can never truncate the denylist. Failures leave the file untouched: a set that might
-//! be missing a revocation never replaces one that holds it.
+//! Revocation WRITES are SERIALIZED by a lock the caller holds, named by an [`Exclusive`] value: its own,
+//! or the store's [`lock`](Denylist::lock). Under it a write re-reads the file and writes the union of the
+//! file and its own set, so two writers revoking different entries both survive instead of the last
+//! rewrite dropping the other's. The rewrite is atomic (a temp sibling unique per write, then one rename
+//! over the target), so a crash mid-write can never truncate the denylist. Failures leave the file
+//! untouched: a set that might be missing a revocation never replaces one that holds it.
 
-#[cfg(feature = "tokio-fs")]
+use core::fmt;
+#[cfg(feature = "fs")]
 use core::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "tokio-fs")]
-use std::collections::HashSet;
-#[cfg(all(feature = "tokio-fs", unix))]
+#[cfg(feature = "fs")]
+use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "fs")]
+use std::io::Read as _;
+#[cfg(all(feature = "fs", unix))]
 use std::os::fd::AsRawFd as _;
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 use std::process;
 use std::sync::Arc;
-#[cfg(feature = "tokio-fs")]
-use std::sync::{Mutex, PoisonError};
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
+use std::sync::{Mutex, MutexGuard, PoisonError};
+#[cfg(feature = "fs")]
 use std::time::Instant;
 
 use data_encoding::HEXLOWER;
-#[cfg(feature = "tokio-fs")]
-use tokio::io::AsyncRead as _;
 
 use crate::VerifyKey;
 use crate::cap::Cap;
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 
 /// The revocation oracle a [`Gate::Rooted`](crate::Gate::Rooted) or [`Gate::Anchored`](crate::Gate::Anchored)
@@ -57,8 +59,7 @@ use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 /// Synchronous by design: admission is synchronous policy, so a revocation check must never require an
 /// async runtime. A consumer whose distributed system keeps revocations in Redis, a database, or a gossip
 /// set implements this over that store; nauthy's core needs no file and no runtime. The provided
-/// file-backed impl is [`FileDenylist`] behind the `tokio-fs` feature, and [`Latch`](crate::Latch) layers
-/// a set of disabled root keys over any store.
+/// file-backed impl is [`Denylist`] behind the `fs` feature.
 ///
 /// The gate asks about EVERY cap presented to it, a foreign badge on the authority-bound path included, so
 /// an impl must answer for a cap rooted at an authority it did not issue. Answering `true` there can only
@@ -119,7 +120,7 @@ impl RevocationId {
     }
 
     /// The id as lowercase hex, the form an issuer's audit log records it in AND the exact form a
-    /// [`FileDenylist`] writes one per line, so a grep of `to_hex` output against the file finds it.
+    /// [`Denylist`] writes after `id `, so a grep of `to_hex` output against the file finds it.
     pub fn to_hex(&self) -> String {
         HEXLOWER.encode(self.as_bytes())
     }
@@ -134,208 +135,354 @@ impl RevocationId {
     }
 }
 
+/// Print the id as the hex a denylist file and an audit log carry it in.
+impl fmt::Debug for RevocationId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("RevocationId").field(&self.to_hex()).finish()
+    }
+}
+
 /// The text passed to [`RevocationId::from_hex`] was not valid hex.
 #[derive(Debug, thiserror::Error)]
 #[error("parse revocation id")]
 pub struct RevocationIdParseError;
 
-/// A persisted set of revoked capability ids (biscuit revocation identifiers), one lowercase-hex id per
-/// line, and the batteries-included [`Revocations`] impl.
+/// One entry of a [`Denylist`]: a recalled cap id, or a key refused for good.
+#[cfg(feature = "fs")]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum Revocation {
+    /// A biscuit revocation id: refuses every cap whose chain carries it.
+    Id(RevocationId),
+    /// A verify key: refuses it as a proven peer, and every cap rooted at it.
+    Key(VerifyKey),
+}
+
+#[cfg(feature = "fs")]
+impl From<RevocationId> for Revocation {
+    fn from(id: RevocationId) -> Self {
+        Self::Id(id)
+    }
+}
+
+#[cfg(feature = "fs")]
+impl From<VerifyKey> for Revocation {
+    fn from(key: VerifyKey) -> Self {
+        Self::Key(key)
+    }
+}
+
+/// A value whose life is an exclusive lock over every writer, in every process, of one denylist file.
 ///
-/// nauthy is cross-cutting, so the file location is the consuming process's to choose; this type owns only
-/// the load / revoke / check logic over a path. The loaded set is behind a [`Mutex`] with the
-/// [`FileStamp`](crate::FileStamp) it was read at, so a check can refresh it in place when the file changed
-/// underneath a running process.
+/// The caller implements it on its own lock guard, so a write shows its lock at the call site and the
+/// compiler refuses a write with none. A caller with no lock of its own takes [`Denylist::lock`].
 ///
-/// CONCURRENT REVOCATIONS SURVIVE. A write locks a sibling `<path>.lock` file, re-reads the on-disk set
-/// under that lock, and rewrites the union, so two issuers that each loaded the file before either wrote
-/// (two processes, or two instances) both keep their ids. The rewrite is atomic, and a crash mid-write can
-/// never truncate the denylist. The lock is an advisory unix one at the current minimum Rust version; other
-/// platforms refuse a durable revoke loudly instead of racing it (see `persist`).
-///
-/// DURABILITY IS A HARD PRECONDITION: the backing file must live on durable storage that survives a
-/// restart. A restart on ephemeral storage resurrects every revoked cap, because [`load`](Self::load) of an
-/// absent file is an empty set, and an empty set revokes nothing.
-#[cfg(feature = "tokio-fs")]
-pub struct FileDenylist {
+/// Within one process nauthy serializes every write to a denylist directory itself (one directory holds
+/// one denylist, see [`Denylist`]), so the promise is about OTHER processes, and nauthy cannot check it
+/// for a lock it does not know, as
+/// [`ProvenPeer`](crate::ProvenPeer) marks a handshake it cannot see. A false promise can lose a
+/// revocation: two processes writing at once both return `Ok`, one body lands over the other, and a
+/// process that loads the file later admits what the lost entry refused. The writer that lost it still
+/// refuses it in memory until it exits.
+#[cfg(feature = "fs")]
+pub trait Exclusive {
+    /// Whether this guard excludes the writers of the denylist at `path`. A write asks before it touches
+    /// the file and refuses a `false` with [`WrongLock`](DenylistError::WrongLock).
+    ///
+    /// Provided, answering `true`: nauthy cannot see a caller's own lock, so it takes that guard at its
+    /// word. [`DenylistLock`] answers for the one lock file it holds, by identity: only while that very
+    /// file is still the one at `<path>.lock`.
+    fn guards(&self, path: &Path) -> bool {
+        let _ = path;
+        true
+    }
+}
+
+/// The denylist's own lock: an advisory `flock` on the sibling `<path>.lock`, for a writer with no lock
+/// of its own. Held until dropped. [`Denylist::lock`] is the only place nauthy takes a file lock, so a
+/// caller that brings its own [`Exclusive`] guard never contends on, or creates, this file.
+#[cfg(feature = "fs")]
+pub struct DenylistLock {
+    /// The denylist this guard was taken for, to name in a `Debug`; what it guards is decided by `held`.
     path: PathBuf,
+    held: WriteLock,
+}
+
+#[cfg(feature = "fs")]
+impl Exclusive for DenylistLock {
+    /// Only while the lock file this guard holds is the one now at `<path>.lock`, compared by inode, not
+    /// by name. A name can reach one file by several spellings (a case-insensitive or
+    /// normalization-insensitive filesystem, a symlinked or `..` parent), and one spelling can reach a
+    /// different file after its directory is renamed and recreated; only the inode says which lock the
+    /// other writers of `path` take.
+    fn guards(&self, path: &Path) -> bool {
+        self.held.is_at(path)
+    }
+}
+
+#[cfg(feature = "fs")]
+impl fmt::Debug for DenylistLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DenylistLock")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The largest denylist file, in bytes: room for some thirty thousand ids. The file is read on the admit
+/// hot path under the store's lock and never pruned, so a local writer that grows it without bound must
+/// not be able to turn the next admission into an allocation that size. A larger file is refused at load,
+/// ignored by a refresh, which keeps what it holds, and never written: a write that would cross it is
+/// refused, so no `Ok` leaves a file the next load refuses.
+#[cfg(feature = "fs")]
+const MAX_LEN: u64 = 4 << 20;
+
+/// The kind tag of a revocation id line: `id <lowercase hex>`.
+#[cfg(feature = "fs")]
+const ID: &str = "id";
+
+/// The kind tag of a key line: `key <ed01...>`. A tag, not a length rule, tells an id from a key: a hex id
+/// and a key's text share characters, and a length rule would tie the file to today's id size.
+#[cfg(feature = "fs")]
+const KEY: &str = "key";
+
+/// A persisted, grow-only set of revocation ids and verify keys, read live: the [`Revocations`] impl nauthy
+/// ships.
+///
+/// The file is one entry per line, `id <hex>` or `key <ed01...>`, written sorted so the same set is always
+/// the same bytes. nauthy is cross-cutting, so the file location is the consuming process's to choose; this
+/// type owns only the load / revoke / check logic over a path.
+///
+/// UNION ONLY. A check refreshes the held set when the file's stamp changed (debounced, see
+/// [`STAT_DEBOUNCE`]), and a refresh ADDS what it reads and never assigns. A stat or read failure, an
+/// oversized file, or the file disappearing keeps every entry already held. No write shrinks the file, so a
+/// shorter one is a mistake or an attack and must not un-revoke either way.
+///
+/// A LINE THAT IS NOT AN ENTRY DOES NOT HIDE THE ONES THAT ARE. A running store adds every well-formed line
+/// of a partly malformed file and reports the first bad one through
+/// [`malformed_line`](Self::malformed_line); a write carries the bad line over verbatim, since the file is
+/// deny-only and dropping it might drop a revocation. [`load`](Self::load) still refuses a malformed file:
+/// a process starting on a set it can only partly read is the case a human should see.
+///
+/// A STARTING process is held to the same law by the `<path>.written` witness, the high-water count of
+/// entries a durable write left in the file: [`load`](Self::load) refuses a file holding fewer, absent
+/// included, with [`Lost`](DenylistError::Lost).
+///
+/// ONE DIRECTORY HOLDS ONE DENYLIST. Writes in one process take turns per directory, found by its
+/// identity rather than its name, so two spellings of one file (`deny` and `DENY` on a case-insensitive
+/// filesystem, NFC and NFD forms of one name, a `..` or symlinked parent) can never write at once. A second
+/// denylist placed in the same directory loses nothing, but its writes are refused with
+/// [`WrongLock`](DenylistError::WrongLock) where its lock file collides; give each denylist its own directory.
+///
+/// DURABILITY IS A HARD PRECONDITION, and the boundary is the DIRECTORY: a process that starts after the
+/// file and its witness are both gone loads an empty set and refuses nothing, because that cannot be told
+/// apart from a store that never revoked anything. Keep both in a directory only the node's own user can
+/// write, on storage that survives a restart.
+#[cfg(feature = "fs")]
+pub struct Denylist {
+    path: PathBuf,
+    /// The held set and what it was read at. A `Mutex` rather than a channel because the admit path asks
+    /// synchronously and must see a write made through this instance at once. It is held for a lookup, a
+    /// merge, or a refresh's stat and bounded read of a regular file, never across a write, and never
+    /// while caller code runs.
     state: Mutex<State>,
 }
 
-/// The loaded ids, the [`FileStamp`](crate::FileStamp) of the file they were read at (`None` = the file was absent or
-/// reported no stamp), and the last moment we stat'd the file. The length pairs with mtime so a change within one
-/// coarse mtime tick is still seen: a revoke only ever GROWS the file, so a differing length is a reliable
-/// "changed" signal on its own.
-#[cfg(feature = "tokio-fs")]
-struct State {
-    ids: HashSet<RevocationId>,
-    stamp: Option<FileStamp>,
-    last_stat: Option<Instant>,
+#[cfg(feature = "fs")]
+impl fmt::Debug for Denylist {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Denylist")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
-#[cfg(feature = "tokio-fs")]
-impl FileDenylist {
-    /// Load the denylist from `path`; an absent file is an empty set. The ids and the stamp come from one
-    /// opened handle, so a file replaced during this load cannot stamp the old ids as current and make every
-    /// later refresh skip a real revocation.
-    ///
-    /// A file holding FEWER ids than a durable write once left there, absent included, is
-    /// [`Lost`](DenylistError::Lost), never loaded: no write shrinks the denylist, so a shorter file is a
-    /// deletion, a truncation, or a crash, and loading it would un-revoke what went missing. The count is
-    /// the high-water mark in the `<path>.written` witness each write raises; a denylist with no witness
-    /// (never durably written, or written before the witness existed) loads as it reads.
-    pub async fn load(path: PathBuf) -> Result<Self, DenylistError> {
-        let (ids, stamp) = read_ids(&path).await?;
-        Ok(Self {
-            path,
-            state: Mutex::new(State {
-                ids,
-                stamp,
-                last_stat: None,
-            }),
-        })
-    }
+/// The entries held, the stamp of the file they were last read at (`None` = absent, or no stamp), the last
+/// moment the file was stat'd, and the first line of the last read that was not an entry.
+#[cfg(feature = "fs")]
+struct State {
+    held: Entries,
+    stamp: Option<FileStamp>,
+    last_stat: Option<Instant>,
+    malformed: Option<u32>,
+}
 
-    /// Whether a presented cap is revoked: any id in its chain (the cap's own blocks, including any it
-    /// inherited from the grant it was attenuated from) is on the denylist.
+#[cfg(feature = "fs")]
+impl Denylist {
+    /// Load the denylist from `path`; an absent file is an empty set. The entries and the stamp come from
+    /// one opened handle, so a file replaced during this load cannot stamp the old entries as current and
+    /// make every later refresh skip a real revocation.
     ///
-    /// Refreshes from disk first if the file changed since the last read, so a revocation written by
-    /// another process is honored by a long-running issuer without a restart. The stat is debounced (see
-    /// `STAT_DEBOUNCE`); the file is re-read only when it actually changed.
-    pub fn is_revoked(&self, cap: &Cap) -> bool {
-        self.is_revoked_any(&cap.revocation_ids())
-    }
-
-    /// Whether any of `ids` is on the denylist: the membership query [`is_revoked`](Self::is_revoked)
-    /// runs over one cap's chain, for a caller that kept the ids and let the cap go. Holding a parsed cap
-    /// for as long as the thing it admitted stays open pins the whole token in memory and re-derives its
-    /// chain on every check; the ids are all a revocation ever matches, so they are all such a caller
-    /// needs to keep. One lock and one refresh however many ids are asked about.
-    pub fn is_revoked_any<'a>(&self, ids: impl IntoIterator<Item = &'a RevocationId>) -> bool {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        self.refresh(&mut state);
-        ids.into_iter().any(|id| state.ids.contains(id))
-    }
-
-    /// Union the file into the held set if its [`FileStamp`](crate::FileStamp) differs from what we last
-    /// read. Synchronous and on the admit hot path, so it debounces the stat to at most once per
-    /// [`STAT_DEBOUNCE`] and re-reads only on change.
-    ///
-    /// A LIVE REFRESH ONLY EVER ADDS IDS. It unions what it reads and never assigns, so a shorter file (a
-    /// hand edit, a truncation, a crash, or a local attacker) un-revokes nothing in a running process. No
-    /// write shrinks the file, so a shorter one is never news to act on. Accepting a loss is explicit and
-    /// happens only at [`load`](Self::load): remove the `<path>.written` witness and load again, which reads
-    /// the file as it stands (see [`Lost`](DenylistError::Lost)).
-    ///
-    /// Fail closed on every uncertainty: a stat/read error, a parse failure, OR the file DISAPPEARING all
-    /// leave the held set intact and return. Deletion is not "the denylist is now empty": a `rm` of the
-    /// file (a botched cleanup, or a local attacker) must never silently un-revoke every recalled cap. A
-    /// fresh file appearing is picked up through the `Ok` stat arm below.
+    /// Refused, never loaded: a malformed line ([`Parse`](DenylistError::Parse)), a file over the size cap
+    /// ([`TooLarge`](DenylistError::TooLarge)), and a file holding FEWER entries than its `<path>.written`
+    /// witness says a durable write left there, absent included ([`Lost`](DenylistError::Lost)). No write
+    /// shrinks the denylist, so a shorter file is a deletion, a truncation, or a crash, and loading it would
+    /// un-revoke what went missing. A denylist with no witness loads as it reads.
     // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
     #[allow(clippy::std_instead_of_core)]
-    fn refresh(&self, state: &mut State) {
-        // Debounce: skip the stat entirely if we checked within the last STAT_DEBOUNCE. The first check
-        // after construction (`last_stat` is None) always stats, so a freshly-loaded denylist sees the
-        // current file at once.
-        if let Some(last) = state.last_stat {
-            if last.elapsed() < STAT_DEBOUNCE {
-                return;
+    pub fn load(path: PathBuf) -> Result<Self, DenylistError> {
+        let (held, stamp) = match open_regular(&path) {
+            Ok(mut file) => read_entries_from(&mut file)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (Entries::default(), None)
             }
-        }
-        state.last_stat = Some(Instant::now());
-        let current = match std::fs::metadata(&self.path) {
-            Ok(meta) => FileStamp::of(&meta),
-            // Missing file: keep the last-known set. If one was ever loaded, this is deletion, not empty.
-            Err(_) => return,
+            Err(error) => return Err(DenylistError::Io(error)),
         };
-        if FileStamp::unchanged(state.stamp, current) {
-            return;
-        }
-        let ids = match std::fs::read_to_string(&self.path) {
-            Ok(text) => match parse_ids(&text) {
-                Ok(ids) => ids,
-                Err(_) => return,
+        check_witness(&path, held.len()).map_err(|error| match error {
+            WitnessError::Lost { expected } => DenylistError::Lost {
+                path: path.clone(),
+                expected,
+                found: u64::try_from(held.len()).unwrap_or(u64::MAX),
             },
-            // Raced away between stat and read: keep last-known rather than dropping revocations.
-            Err(_) => return,
-        };
-        // THE line that makes the denylist monotone. `state.ids = ids` would let a shorter file, an empty
-        // one included, un-revoke whatever it left out, live and without a restart.
-        state.ids.extend(ids);
-        state.stamp = current;
+            WitnessError::Io(error) => DenylistError::Io(error),
+        })?;
+        Ok(Self::unread(path, held, stamp))
     }
 
-    /// Revoke a cap and persist. Records the cap's narrowest block id, which denies this exact cap and
-    /// every cap attenuated from it, but not the ancestors it was narrowed from. Revoking a freshly minted
-    /// cap (one block) denies it and all its delegations.
-    pub async fn revoke(&mut self, cap: &Cap) -> Result<(), DenylistError> {
-        // A biscuit always has at least its authority block, so `pop` yields the narrowest id; stay total.
-        let Some(id) = cap.revocation_ids().pop() else {
-            return Ok(());
-        };
-        self.revoke_id(id).await
+    /// An instance over `path` that holds nothing and reads nothing up front: the REPAIR path when
+    /// [`load`](Self::load) refuses with [`Lost`](DenylistError::Lost). Its [`revoke`](Self::revoke) unions
+    /// whatever the file holds under the lock, so it can never shrink anything, and only a file back at its
+    /// high-water mark clears the refusal, so a partial repair does not quietly un-revoke the rest. Use it
+    /// to write, never to serve.
+    pub fn for_repair(path: PathBuf) -> Self {
+        Self::unread(path, Entries::default(), None)
     }
 
-    /// Revoke a cap at its ROOT authority block and persist. Records the cap's FIRST (authority-block) id,
-    /// the one every cap attenuated or delegated from it inherits, so this denies the WHOLE tree at once: the
-    /// root grant AND every narrower cap descended from it, however deep the delegation chain. Contrast
-    /// [`revoke`](Self::revoke), which records only the NARROWEST block and so denies a single leaf while its
-    /// ancestors keep granting. Revoking the root of a token you issued cuts off its holder and everyone they
-    /// re-shared it to in one entry, because [`is_revoked`](Self::is_revoked) checks the whole chain and every
-    /// descendant carries this root id.
-    pub async fn revoke_root(&mut self, cap: &Cap) -> Result<(), DenylistError> {
-        // `revocation_ids` is authority-block-first, so the first id is the root's; a biscuit always has an
-        // authority block, but stay total against an empty chain rather than indexing.
-        let Some(root) = cap.revocation_ids().into_iter().next() else {
-            return Ok(());
-        };
-        self.revoke_id(root).await
-    }
-
-    /// Revoke one raw biscuit revocation id and persist. The single primitive both [`revoke`](Self::revoke)
-    /// and [`revoke_root`](Self::revoke_root) funnel through: it inserts the id and, only if it was new,
-    /// merges the on-disk set into ours and atomically rewrites the file under an exclusive lock, adopting
-    /// the stamp of the bytes it just wrote, taken from the writing handle, so a second writer's rename
-    /// can never lend this instance its freshness. A caller that already holds an id it recorded when
-    /// the cap was minted (an issuer's audit index from grantee to root id) can revoke by that id directly,
-    /// without still holding the cap the id came from.
-    pub async fn revoke_id(&mut self, id: RevocationId) -> Result<(), DenylistError> {
-        let inserted = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.ids.insert(id)
-        };
-        if inserted {
-            // Adopt the stamp of the bytes this call just wrote (`persist` takes it from the same handle
-            // that wrote them). Stat-ing the path here instead is the defect this closes: a second writer's
-            // rename between our write and our stat made us adopt their stamp while keeping our
-            // in-memory set, so the next refresh saw the stamp current and skipped their revocation. A
-            // stamp the platform will not report is `None`, so the next refresh re-reads instead of
-            // trusting a stale stamp.
-            let stamp = self.persist()?;
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .stamp = stamp;
-        }
-        Ok(())
-    }
-
-    /// An empty denylist backed by `path`, before any load, and reading nothing yet. The first
-    /// [`revoke`](Self::revoke) creates and persists the file.
-    ///
-    /// This is also the REPAIR path when [`load`](Self::load) refuses with [`Lost`](DenylistError::Lost): a
-    /// revoke from here unions whatever the file holds under the lock, so it can never shrink anything,
-    /// and re-revoking everything that went missing brings the file back to its high-water mark, which is
-    /// the only thing that clears `Lost`. Use it to write, never to serve.
-    pub fn empty(path: PathBuf) -> Self {
+    /// An instance over `path` holding `held`, read at `stamp`, not yet stat'd by a refresh.
+    fn unread(path: PathBuf, held: Entries, stamp: Option<FileStamp>) -> Self {
         Self {
             path,
             state: Mutex::new(State {
-                ids: HashSet::new(),
-                stamp: None,
+                held,
+                stamp,
                 last_stat: None,
+                malformed: None,
             }),
         }
+    }
+
+    /// Take the denylist's own lock, an advisory `flock` on the sibling `<path>.lock` (created `0600` if
+    /// absent), for a writer with no lock of its own. Blocks the calling thread until any other holder
+    /// releases, so call it where blocking is allowed. Pass the guard to [`revoke`](Self::revoke) and drop
+    /// it when done. Never remove `<path>.lock`: writers serialize on its inode.
+    ///
+    /// The guard answers for this file only: a write to another denylist refuses it with
+    /// [`WrongLock`](DenylistError::WrongLock). Something other than a regular file at `<path>.lock` (a
+    /// FIFO, a device) is refused at once rather than waited on. Only unix has a cross-process file lock
+    /// at the crate's minimum Rust version, so elsewhere this is `DenylistError::LockUnsupported`.
+    #[must_use = "the lock is released when the guard is dropped"]
+    pub fn lock(&self) -> Result<DenylistLock, DenylistError> {
+        Ok(DenylistLock {
+            path: self.path.clone(),
+            held: WriteLock::acquire(&self.path)?,
+        })
+    }
+
+    /// Revoke `entries` and persist, under the lock `held` names. Takes no file lock of its own.
+    ///
+    /// The entries are drained first, before any lock is taken, so an iterator that asks this store a
+    /// question cannot deadlock it; then they join this instance's set, so this process refuses them
+    /// whatever happens next. A `held` that does not guard this file is refused with
+    /// [`WrongLock`](DenylistError::WrongLock) before the file is touched.
+    ///
+    /// Then, one write at a time per directory in this process and under the caller's lock across
+    /// processes:
+    /// read the file, union it into the held set, and if the file already holds every entry of that union,
+    /// return without writing, so a repeat pays no `fsync` (a witness left behind by a crash is still
+    /// raised to what the file holds). Otherwise write the union once, atomically and durably (the file and
+    /// its directory are `fsync`ed, so an `Ok` survives a power cut), owner-only, then raise the
+    /// `<path>.written` witness. Writing the union rather than only what is new restores an entry the file
+    /// lost while this instance held it, and ids and keys given in one call land in one rename.
+    ///
+    /// A line on disk that is not an entry is carried after the sorted ones, uncounted, with its bytes as
+    /// read except the ASCII whitespace trimmed from its ends. A
+    /// read failure, an oversized file, or a union that would grow the file past its cap returns WITHOUT
+    /// writing: the file may hold entries this instance cannot see, and replacing it would drop them. The
+    /// parent directory must already exist; the consuming process provisions it.
+    // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
+    #[allow(clippy::std_instead_of_core)]
+    pub fn revoke(
+        &self,
+        held: &impl Exclusive,
+        entries: impl IntoIterator<Item = Revocation>,
+    ) -> Result<(), DenylistError> {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        self.state().held.extend(entries);
+        if !held.guards(&self.path) {
+            return Err(DenylistError::WrongLock {
+                path: self.path.clone(),
+            });
+        }
+        let writers = writers_of(dir_id(&self.path).map_err(DenylistError::Io)?);
+        let _one_writer = writers.lock().unwrap_or_else(PoisonError::into_inner);
+
+        let (bytes, read_at) = match open_regular(&self.path) {
+            Ok(mut file) => {
+                let bytes = read_capped(&mut file).map_err(DenylistError::from_read)?;
+                (bytes, stamp_of(&file))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), None),
+            Err(error) => return Err(DenylistError::Io(error)),
+        };
+        let on_disk = Parsed::from(bytes.as_slice());
+
+        let (body, count, carried) = {
+            let mut state = self.state();
+            state.held.union(&on_disk.entries);
+            if state.held.is_subset(&on_disk.entries) {
+                // What was just read is now all this instance holds, so it is current.
+                state.stamp = read_at;
+                state.malformed = on_disk.first_rejected();
+                drop(state);
+                return raise_witness(&self.path, on_disk.entries.len()).map_err(DenylistError::Io);
+            }
+            let lines = state.held.lines();
+            let mut body = Vec::new();
+            for line in &lines {
+                body.extend_from_slice(line.as_bytes());
+                body.push(b'\n');
+            }
+            for rejected in &on_disk.rejected {
+                body.extend_from_slice(rejected.bytes);
+                body.push(b'\n');
+            }
+            (body, lines.len(), !on_disk.rejected.is_empty())
+        };
+        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_LEN {
+            return Err(DenylistError::TooLarge);
+        }
+        // Adopt the stamp of the bytes this call wrote, taken from the handle that wrote them, so a
+        // replacement renamed in after our rename cannot lend this instance its freshness and make the next
+        // refresh skip its revocation.
+        let stamp = write_atomically(&self.path, &body, count).map_err(DenylistError::Io)?;
+        let mut state = self.state();
+        state.stamp = stamp;
+        // The carried lines follow the `count` sorted ones in the body just written.
+        state.malformed = carried.then(|| u32::try_from(count + 1).unwrap_or(u32::MAX));
+        Ok(())
+    }
+
+    /// Whether any of `ids` is revoked: the membership query [`is_revoked`](Revocations::is_revoked) runs
+    /// over one cap's chain, for a caller that kept the ids and let the cap go. The ids are all a recalled
+    /// grant ever matches, so they are all such a caller needs to keep. One lock and one refresh however
+    /// many ids are asked about. The ids are drained before the lock is taken, so an iterator that asks
+    /// this store a question cannot deadlock it.
+    pub fn is_revoked_any<'a>(&self, ids: impl IntoIterator<Item = &'a RevocationId>) -> bool {
+        let ids = ids.into_iter().collect::<Vec<_>>();
+        let state = self.refreshed();
+        ids.into_iter().any(|id| state.held.ids.contains(id))
+    }
+
+    /// Whether `key` is revoked: the question a pin or a peer check asks of a key it holds rather than a
+    /// cap. [`is_revoked_peer`](Revocations::is_revoked_peer) is this.
+    pub fn is_revoked_key(&self, key: &VerifyKey) -> bool {
+        self.refreshed().held.keys.contains(key)
+    }
+
+    /// The first line (1-based) of the file, as last read, that was not an entry, or `None` when it read
+    /// clean. A running store keeps every entry of a malformed file, so this is the one sign that something
+    /// in it is being skipped; an operator or a health check reads it.
+    pub fn malformed_line(&self) -> Option<u32> {
+        self.refreshed().malformed
     }
 
     /// The file backing this denylist.
@@ -343,73 +490,326 @@ impl FileDenylist {
         &self.path
     }
 
-    /// Merge the on-disk set into this instance's set, then atomically rewrite the backing file with the
-    /// union under an exclusive cross-writer lock, owner-only and durably, and return the stamp of the
-    /// bytes written. The stamp comes from the ONE handle that received the bytes ([`write_and_stamp`]),
-    /// never from stat-ing the path after the rename, so a writer that replaces the path between our write
-    /// and our stamp cannot make this instance adopt the replacement's stamp and skip the replacement's
-    /// revocation on the next refresh.
+    /// The held state, refreshed from disk first if the file changed.
+    fn refreshed(&self) -> MutexGuard<'_, State> {
+        let mut state = self.state();
+        self.refresh(&mut state);
+        state
+    }
+
+    /// The held state. A panic elsewhere while it was held cannot have removed an entry (nothing does), so
+    /// a poisoned lock is still a sound set.
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Union the file into the held set if its stamp changed. Synchronous and on the admit hot path, so the
+    /// stat is debounced to once per [`STAT_DEBOUNCE`] and the file is read only when it changed.
     ///
-    /// The read-merge-write under the lock is what keeps concurrent revocations: two writers that each
-    /// loaded the file before either wrote would otherwise rewrite it from their own view, and the last
-    /// rename would drop the other's id. Re-reading under the lock means the second writer writes both.
-    ///
-    /// Fail closed on every uncertainty: a lock, read, or parse failure returns WITHOUT writing, so a set
-    /// that might be missing a revocation never replaces the file. The id stays in this instance's set, so
-    /// this process still refuses it.
-    ///
-    /// The whole section is synchronous on purpose: a task that holds the lock can never be suspended on an
-    /// await while another task on the same executor blocks in [`WriteLock::acquire`], so the lock cannot
-    /// deadlock an async runtime.
-    ///
-    /// The parent directory must already exist: the consuming process owns the store location and
-    /// provisions it (with whatever mode it wants), so nauthy does NOT create the dir. nauthy writes only
-    /// its OWN files there: the denylist, its `<denylist>.lock` sibling, its `<denylist>.written` witness,
-    /// and a temp sibling whose name is unique per write. The denylist is tightened to `0600` so the recall trace is not exposed to other
-    /// local users; the lock and temp are created owner-only too.
-    // `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
-    #[allow(clippy::std_instead_of_core)]
-    fn persist(&self) -> Result<Option<FileStamp>, DenylistError> {
-        // Held across the WHOLE read-merge-write: the re-read must see every id another writer already
-        // persisted, and no other writer may slip a rename in before ours. Dropping the guard releases it,
-        // so a crash never strands the lock.
-        let _lock = WriteLock::acquire(&self.path)?;
-        // Re-read the current on-disk set under the lock and union it with our in-memory set. An absent
-        // file contributes nothing. A read or parse failure aborts WITHOUT writing: the file may hold ids
-        // we cannot see, and replacing it with ours would drop them.
-        let on_disk = match std::fs::read_to_string(&self.path) {
-            Ok(text) => parse_ids(&text)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
-            Err(error) => return Err(DenylistError::Io(error)),
+    /// Every failure returns with the set untouched: a stat or read error, an oversized file, something
+    /// other than a regular file renamed over it, or the file DISAPPEARING. Deletion is not "the denylist is now empty": a `rm` of the file (a botched cleanup, or
+    /// a local attacker) must never silently un-revoke. The stamp is taken before the read, so a file
+    /// replaced between the two is read under the older stamp; that only costs one extra read on the next
+    /// refresh, because the union cannot lose an entry to it.
+    fn refresh(&self, state: &mut State) {
+        // The first check after construction always stats, so a fresh instance sees the current file at once.
+        if let Some(last) = state.last_stat {
+            if last.elapsed() < STAT_DEBOUNCE {
+                return;
+            }
+        }
+        state.last_stat = Some(Instant::now());
+        let Ok(meta) = std::fs::metadata(&self.path) else {
+            return;
         };
-        let (body, entries) = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            state.ids.extend(on_disk);
-            // Encode through RevocationId::to_hex so the file and the API encoding cannot diverge: the file
-            // is exactly what to_hex writes, and decode_id reads it back through from_hex.
-            let mut lines = state
-                .ids
-                .iter()
-                .map(RevocationId::to_hex)
-                .collect::<Vec<_>>();
-            lines.sort();
-            (lines.join("\n") + "\n", lines.len())
+        let current = FileStamp::of(&meta);
+        if FileStamp::unchanged(state.stamp, current) {
+            return;
+        }
+        let Some(bytes) = open_regular(&self.path)
+            .ok()
+            .and_then(|mut file| read_capped(&mut file).ok())
+        else {
+            return;
         };
-        write_atomically(&self.path, body.as_bytes(), entries).map_err(DenylistError::Io)
+        let parsed = Parsed::from(bytes.as_slice());
+        // THE line that makes the denylist monotone. Assigning the parsed set would let a shorter file, an
+        // empty one included, un-revoke whatever it left out, live and without a restart. Every
+        // well-formed line lands even when another line is bad, so one bad line cannot freeze the set.
+        state.held.union(&parsed.entries);
+        state.malformed = parsed.first_rejected();
+        // A malformed read is current too. Re-reading an unchanged bad file on every refresh would parse up
+        // to the whole size cap ten times a second, under the lock every admission takes, and learn
+        // nothing; any edit, a repair included, changes the stamp (its inode and ctime move) and is read.
+        state.stamp = current;
     }
 }
 
-#[cfg(feature = "tokio-fs")]
-impl Revocations for FileDenylist {
+#[cfg(feature = "fs")]
+impl Revocations for Denylist {
+    /// Any id in the cap's chain is held, or the cap's [`root`](Cap::root) key is. The root is the key
+    /// `Cap::parse` verified the whole chain against, so a cap cannot claim its way past this with a root
+    /// it does not carry, and a revoked key refuses what it signs next as well as what it signed.
     fn is_revoked(&self, cap: &Cap) -> bool {
-        FileDenylist::is_revoked(self, cap)
+        let (root, ids) = (cap.root(), cap.revocation_ids());
+        let state = self.refreshed();
+        state.held.keys.contains(&root) || ids.iter().any(|id| state.held.ids.contains(id))
+    }
+
+    /// The peer's key is held.
+    fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
+        self.is_revoked_key(peer)
     }
 }
 
-/// The sibling `<denylist>.lock` whose stable inode every writer flocks. `with_extension` would REPLACE
-/// an existing extension, letting `caps.deny` and `caps.other` collide on one sibling name, so the suffix
-/// is appended to the whole path instead (`with_suffix`). `pub(crate)` so a test can clean it up.
-#[cfg(feature = "tokio-fs")]
+/// The well-formed entries of a denylist, by kind.
+#[cfg(feature = "fs")]
+#[derive(Default)]
+pub(crate) struct Entries {
+    pub(crate) ids: HashSet<RevocationId>,
+    pub(crate) keys: HashSet<VerifyKey>,
+}
+
+#[cfg(feature = "fs")]
+impl Entries {
+    /// How many distinct entries, both kinds: the count the witness records. One count serves both
+    /// kinds because no write removes either.
+    fn len(&self) -> usize {
+        self.ids.len() + self.keys.len()
+    }
+
+    fn insert(&mut self, entry: Revocation) {
+        match entry {
+            Revocation::Id(id) => {
+                self.ids.insert(id);
+            }
+            Revocation::Key(key) => {
+                self.keys.insert(key);
+            }
+        }
+    }
+
+    fn union(&mut self, other: &Self) {
+        self.ids.extend(other.ids.iter().cloned());
+        self.keys.extend(other.keys.iter().copied());
+    }
+
+    fn is_subset(&self, other: &Self) -> bool {
+        self.ids.is_subset(&other.ids) && self.keys.is_subset(&other.keys)
+    }
+
+    /// Every entry as its file line, sorted bytewise over whole lines (so every `id` line precedes every
+    /// `key` line) and so one body for the same set every time. Written through
+    /// [`RevocationId::to_hex`] and the key's `Display`, and read back through
+    /// [`RevocationId::from_hex`] and its `FromStr`, so the file and the API encodings cannot diverge.
+    fn lines(&self) -> Vec<String> {
+        let ids = self.ids.iter().map(|id| format!("{ID} {}", id.to_hex()));
+        let keys = self.keys.iter().map(|key| format!("{KEY} {key}"));
+        let mut lines = ids.chain(keys).collect::<Vec<_>>();
+        lines.sort();
+        lines
+    }
+}
+
+#[cfg(feature = "fs")]
+impl Extend<Revocation> for Entries {
+    fn extend<I: IntoIterator<Item = Revocation>>(&mut self, entries: I) {
+        entries.into_iter().for_each(|entry| self.insert(entry));
+    }
+}
+
+/// A denylist body, decoded line by line: every well-formed entry, and every non-blank line that is not
+/// one. One bad line never discards the good ones; each caller decides what the bad ones mean.
+#[cfg(feature = "fs")]
+struct Parsed<'a> {
+    entries: Entries,
+    rejected: Vec<Rejected<'a>>,
+}
+
+/// A non-blank line that was not an entry: where it is, and its bytes with the ASCII whitespace at its ends
+/// trimmed, to carry it over. Bytes, not text: a line that is not UTF-8 is one bad line, never a reason to
+/// drop the good ones around it.
+#[cfg(feature = "fs")]
+struct Rejected<'a> {
+    line: u32,
+    bytes: &'a [u8],
+}
+
+#[cfg(feature = "fs")]
+impl Parsed<'_> {
+    /// The first line that was not an entry, 1-based.
+    fn first_rejected(&self) -> Option<u32> {
+        self.rejected.first().map(|rejected| rejected.line)
+    }
+}
+
+#[cfg(feature = "fs")]
+impl<'a> From<&'a [u8]> for Parsed<'a> {
+    /// Split on `\n` and decode each line on its own, so one line that is not UTF-8 or not an entry is
+    /// reported alone and the lines around it still land.
+    fn from(bytes: &'a [u8]) -> Self {
+        let mut parsed = Parsed {
+            entries: Entries::default(),
+            rejected: Vec::new(),
+        };
+        for (index, line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+            let line = line.trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            match core::str::from_utf8(line).ok().and_then(decode_line) {
+                Some(entry) => parsed.entries.insert(entry),
+                None => parsed.rejected.push(Rejected {
+                    line: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    bytes: line,
+                }),
+            }
+        }
+        parsed
+    }
+}
+
+/// Decode one `<kind> <value>` line, or `None` when it is not one: an unknown kind, a value that does not
+/// parse as its kind, or anything but one space between them.
+#[cfg(feature = "fs")]
+fn decode_line(line: &str) -> Option<Revocation> {
+    let (kind, value) = line.split_once(' ')?;
+    match kind {
+        ID => RevocationId::from_hex(value).ok().map(Revocation::Id),
+        KEY => value.parse().ok().map(Revocation::Key),
+        _ => None,
+    }
+}
+
+/// Read, decode and stamp the denylist from ONE already-open handle. The single handle is the invariant:
+/// the entries and the stamp describe the same inode, so a path replacement between the open and the read
+/// can never pair old entries with the replacement's freshness. A malformed line, an oversized file, or an
+/// unreadable body is an error; a stamp the platform will not report degrades to `None`, so the next
+/// refresh re-reads rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the
+/// single-handle path.
+#[cfg(feature = "fs")]
+pub(crate) fn read_entries_from(
+    file: &mut std::fs::File,
+) -> Result<(Entries, Option<FileStamp>), DenylistError> {
+    let bytes = read_capped(file).map_err(DenylistError::from_read)?;
+    let parsed = Parsed::from(bytes.as_slice());
+    if let Some(line) = parsed.first_rejected() {
+        return Err(DenylistError::Parse { line });
+    }
+    Ok((parsed.entries, stamp_of(file)))
+}
+
+/// Read at most [`MAX_LEN`] bytes of `file`; more is `FileTooLarge`, found before the excess is buffered.
+/// Bytes, not text, so the line decoder judges each line on its own.
+// `core::io::ErrorKind` is still unstable, so the error construction reads from `std`.
+#[cfg(feature = "fs")]
+#[allow(clippy::std_instead_of_core)]
+fn read_capped(file: &mut std::fs::File) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    file.take(MAX_LEN + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_LEN {
+        return Err(std::io::ErrorKind::FileTooLarge.into());
+    }
+    Ok(bytes)
+}
+
+/// Open `path` for reading only if it is a regular file. The open is non-blocking on unix, so a FIFO
+/// renamed over the path returns at once instead of waiting for a writer while the admit path holds the
+/// store's lock; anything that is not a regular file (a FIFO, a device, a directory) is then refused, so
+/// no read can wait on it or stream from it without end. `NotFound` passes through for the caller to
+/// read as absent.
+// `core::io::ErrorKind` is still unstable, so the error construction reads from `std`.
+#[cfg(feature = "fs")]
+#[allow(clippy::std_instead_of_core)]
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(not_a_regular_file());
+    }
+    Ok(file)
+}
+
+/// The refusal for a store, witness or lock path that holds something other than a regular file.
+// `core::io::ErrorKind` is still unstable, so the error construction reads from `std`.
+#[cfg(feature = "fs")]
+#[allow(clippy::std_instead_of_core)]
+fn not_a_regular_file() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file")
+}
+
+/// A directory by identity, not by name: its device and inode on unix, where every spelling of one
+/// directory (a `..`, a symlink, a case or Unicode form the filesystem folds) stats to the same pair.
+#[cfg(feature = "fs")]
+#[cfg(unix)]
+type DirId = (u64, u64);
+
+/// Elsewhere the canonical path, the nearest thing to an identity std offers there.
+#[cfg(feature = "fs")]
+#[cfg(not(unix))]
+type DirId = PathBuf;
+
+/// The identity of the directory `path` lives in. The file itself may not exist yet, so only its
+/// directory is asked; a directory that does not exist is an error, as the write that follows would be.
+#[cfg(feature = "fs")]
+#[cfg(unix)]
+fn dir_id(path: &Path) -> std::io::Result<DirId> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let meta = std::fs::metadata(parent_of(path))?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// The non-unix twin of `dir_id`.
+#[cfg(feature = "fs")]
+#[cfg(not(unix))]
+fn dir_id(path: &Path) -> std::io::Result<DirId> {
+    std::fs::canonicalize(parent_of(path))
+}
+
+/// The directory `path` names its file in: its parent, or `.` for a bare file name.
+#[cfg(feature = "fs")]
+fn parent_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// The one write slot for the directory `dir` names, shared by every [`Denylist`] in it in this process.
+///
+/// A `Mutex` per directory, not per instance or per name: two instances over one file, two spellings of
+/// its name, or two threads through one instance may hold the same guard, and nothing but this orders
+/// their read-merge-writes. Unordered, the smaller body can land last, and a revocation both callers were
+/// told was written is gone from the file. Keyed on the directory's identity because only the
+/// filesystem knows which names it folds together; one directory holds one denylist, so a slot per
+/// directory is a slot per denylist. The map grows by one entry per directory a process writes, which is
+/// a handful; it is never pruned, so two writers can never hold different slots for one directory.
+#[cfg(feature = "fs")]
+fn writers_of(dir: DirId) -> Arc<Mutex<()>> {
+    static WRITERS: Mutex<BTreeMap<DirId, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+    let mut writers = WRITERS.lock().unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(writers.entry(dir).or_default())
+}
+
+/// The stamp of an open handle, or `None` when the platform will not report one.
+#[cfg(feature = "fs")]
+fn stamp_of(file: &std::fs::File) -> Option<FileStamp> {
+    file.metadata().ok().and_then(|meta| FileStamp::of(&meta))
+}
+
+/// The sibling `<denylist>.lock` whose stable inode every self-locking writer flocks. `with_extension`
+/// would REPLACE an existing extension, letting `caps.deny` and `caps.other` collide on one sibling name,
+/// so the suffix is appended to the whole path instead (`with_suffix`). `pub(crate)` so a test can clean it
+/// up.
+#[cfg(feature = "fs")]
 #[cfg(unix)]
 pub(crate) fn lock_path(denylist: &Path) -> PathBuf {
     with_suffix(denylist, ".lock")
@@ -417,9 +817,9 @@ pub(crate) fn lock_path(denylist: &Path) -> PathBuf {
 
 /// A temp sibling unique to ONE write: the denylist path plus `.tmp.<pid>.<seq>`. The pid separates
 /// processes and an atomic sequence separates writes within one, so two writers can never share one temp
-/// path; the old fixed `<denylist>.tmp` let one writer truncate the other's in-flight body. `pub(crate)` so
-/// a test can pin the uniqueness.
-#[cfg(feature = "tokio-fs")]
+/// path, and one can never truncate the other's in-flight body. `pub(crate)` so a test can pin the
+/// uniqueness.
+#[cfg(feature = "fs")]
 pub(crate) fn temp_path(denylist: &Path) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
@@ -427,34 +827,36 @@ pub(crate) fn temp_path(denylist: &Path) -> PathBuf {
 }
 
 /// Append `suffix` to the full path, keeping the parent directory.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut sibling = path.as_os_str().to_os_string();
     sibling.push(suffix);
     PathBuf::from(sibling)
 }
 
-/// The exclusive cross-writer lock `persist` holds across its read-merge-write.
+/// The exclusive cross-writer lock a [`DenylistLock`] holds.
 ///
 /// The lock is an advisory `flock` on a sibling `<denylist>.lock`, NOT on the denylist itself: the atomic
 /// rewrite replaces the denylist's inode each time, so a lock on that moving inode would not serialize two
 /// writers. The lock file's inode is stable, so every writer contends on the same one. Being advisory, it
 /// only serializes writers that take it; a process that ignores it can still race, as with any advisory
-/// lock. Shared with the disabled-roots latch, whose writer holds the same law.
-#[cfg(feature = "tokio-fs")]
+/// lock.
+#[cfg(feature = "fs")]
 #[cfg(unix)]
-pub(crate) struct WriteLock {
+struct WriteLock {
     file: std::fs::File,
 }
 
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[cfg(unix)]
 impl WriteLock {
     /// Take the exclusive lock, creating the lock file (`0600`) if absent. Blocks (`LOCK_EX`, no
-    /// `LOCK_NB`) until any other in-flight writer releases, so a concurrent revoke waits rather than
-    /// failing. The critical section this guards is fully synchronous, so a task that holds the lock can
-    /// never be suspended while another task on the same executor blocks here.
-    pub(crate) fn acquire(denylist: &Path) -> Result<Self, LockError> {
+    /// `LOCK_NB`) until any other holder releases, so a concurrent writer waits rather than failing.
+    ///
+    /// The OPEN never blocks: it is non-blocking, so a FIFO planted at `<denylist>.lock` fails at once
+    /// (no reader) instead of waiting for one, and anything that is not a regular file is refused. The
+    /// flag does not reach the `flock`, which waits only on `LOCK_NB`.
+    fn acquire(denylist: &Path) -> Result<Self, DenylistError> {
         use std::os::unix::fs::OpenOptionsExt as _;
 
         let file = std::fs::OpenOptions::new()
@@ -463,19 +865,36 @@ impl WriteLock {
             // The lock file's contents are never written, so an existing one is opened as it is.
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NONBLOCK)
             .open(lock_path(denylist))
-            .map_err(LockError::Io)?;
+            .map_err(DenylistError::Io)?;
+        if !file.metadata().map_err(DenylistError::Io)?.is_file() {
+            return Err(DenylistError::Io(not_a_regular_file()));
+        }
         // SAFETY: `file` owns a valid fd for the duration of the call, and `flock` only associates an
         // advisory lock with that open file description; it touches no memory.
         let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
         if locked != 0 {
-            return Err(LockError::Io(std::io::Error::last_os_error()));
+            return Err(DenylistError::Io(std::io::Error::last_os_error()));
         }
         Ok(Self { file })
     }
+
+    /// Whether the file this lock holds is the one now at `<denylist>.lock`, by device and inode. A lock
+    /// file that is gone, or replaced (its directory renamed and recreated), is not the one the next
+    /// writer of `denylist` will take, so holding this one excludes nobody there.
+    fn is_at(&self, denylist: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (Ok(held), Ok(there)) = (self.file.metadata(), std::fs::metadata(lock_path(denylist)))
+        else {
+            return false;
+        };
+        (held.dev(), held.ino()) == (there.dev(), there.ino())
+    }
 }
 
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[cfg(unix)]
 impl Drop for WriteLock {
     fn drop(&mut self) {
@@ -488,76 +907,79 @@ impl Drop for WriteLock {
 }
 
 /// Non-unix builds have no cross-process file lock at the crate's minimum Rust version: std's file locking
-/// lands at 1.89 and nauthy supports 1.85, and `flock` is unix-only. Rather than racing the read-merge-write
-/// (the lost update this store exists to fix), a durable revoke FAILS: `persist` returns
-/// `LockUnsupported` and leaves the file untouched. The in-memory set still refuses the id
-/// for this process; only the durable record is unavailable. Revisit when the MSRV passes 1.89 (then this
-/// becomes `std::fs::File::lock`) or a platform lock lands.
-#[cfg(feature = "tokio-fs")]
+/// lands at 1.89 and nauthy supports 1.85, and `flock` is unix-only. Rather than hand out a guard that
+/// serializes nothing, [`Denylist::lock`] refuses with `LockUnsupported`; a caller that holds a lock of its
+/// own still writes. Revisit when the MSRV passes 1.89 (then this becomes `std::fs::File::lock`).
+#[cfg(feature = "fs")]
 #[cfg(not(unix))]
-pub(crate) struct WriteLock;
+struct WriteLock;
 
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[cfg(not(unix))]
 impl WriteLock {
-    pub(crate) fn acquire(_denylist: &Path) -> Result<Self, LockError> {
-        Err(LockError::Unsupported)
+    fn acquire(_denylist: &Path) -> Result<Self, DenylistError> {
+        Err(DenylistError::LockUnsupported)
+    }
+
+    /// Never reached: no lock is ever acquired here.
+    fn is_at(&self, _denylist: &Path) -> bool {
+        false
     }
 }
 
-/// Why [`WriteLock::acquire`] failed, before a store names it in its own public error. Crate-private so
-/// the lock stays one implementation while each store keeps its own matchable error type.
-#[cfg(feature = "tokio-fs")]
-pub(crate) enum LockError {
-    /// The lock file could not be opened or locked.
-    Io(std::io::Error),
-    /// This platform has no cross-process file lock at the crate's minimum Rust version.
-    #[cfg(not(unix))]
-    Unsupported,
-}
-
-#[cfg(feature = "tokio-fs")]
-impl From<LockError> for DenylistError {
-    fn from(error: LockError) -> Self {
-        match error {
-            LockError::Io(error) => DenylistError::Io(error),
-            #[cfg(not(unix))]
-            LockError::Unsupported => DenylistError::LockUnsupported,
-        }
-    }
-}
-
-/// Open the denylist's temp sibling for a whole-body rewrite, owner-only from creation. Opening this ONE
+/// Create the denylist's temp sibling for a whole-body rewrite, owner-only from creation. Opening this ONE
 /// handle is what lets [`write_and_stamp`] take the stamp from the bytes it wrote rather than from the path.
-/// A pre-existing temp is truncated in place and tightened again below before the rename carries `0600` onto
-/// the target.
-#[cfg(feature = "tokio-fs")]
+///
+/// Created new (`O_EXCL`), never opened: a name that already exists, left by a crashed writer or planted
+/// as a symlink by anyone who can write the directory, fails with `AlreadyExists` rather than being
+/// followed or truncated, and [`create_temp`] moves on to a fresh name. `pub(crate)` so a test can plant
+/// the symlink.
+#[cfg(feature = "fs")]
 #[cfg(unix)]
-fn open_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_tmp(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
 }
 
 /// The non-unix twin of `open_tmp`; there is no creation mode to tighten.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[cfg(not(unix))]
-fn open_tmp(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_tmp(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .open(path)
+}
+
+/// A fresh temp sibling of `path` and its open handle. A name already taken is skipped for the next
+/// sequence number, a bounded number of times, so a stale or planted name cannot wedge every write.
+// `core::io::ErrorKind` is still unstable, so the kind check reads from `std`.
+#[cfg(feature = "fs")]
+#[allow(clippy::std_instead_of_core)]
+fn create_temp(path: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    const ATTEMPTS: u32 = 16;
+    let mut attempt = 1;
+    loop {
+        let tmp = temp_path(path);
+        match open_tmp(&tmp) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < ATTEMPTS =>
+            {
+                attempt += 1;
+            }
+            opened => return opened.map(|file| (tmp, file)),
+        }
+    }
 }
 
 /// Replace the file at `path` with `body`, which holds `entries` entries, atomically and durably, owner-only,
 /// then raise the `<path>.written` witness to `entries`, and return the stamp of the bytes written. The
-/// caller holds the [`WriteLock`].
+/// caller holds the writers' lock.
 ///
 /// The witness moves only AFTER the body is durably in place, so a write that fails anywhere leaves it
 /// where it was, and no crash ordering can make a store look shorter than its witness when nothing was
@@ -570,7 +992,7 @@ fn open_tmp(path: &Path) -> std::io::Result<std::fs::File> {
 /// DURABLE, and this is what an `Ok` promises: the temp is `fsync`ed before the rename and the parent
 /// directory after it. Without both, a power cut after the caller saw success can leave the old body or
 /// a zero-length file, and either one brings back what was just revoked.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 pub(crate) fn write_atomically(
     path: &Path,
     body: &[u8],
@@ -582,10 +1004,10 @@ pub(crate) fn write_atomically(
 }
 
 /// The one place a file is renamed into place: temp sibling, `fsync`, rename, parent `fsync`.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 fn replace_durably(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
-    let tmp = temp_path(path);
-    let written = write_body(&tmp, body).and_then(|stamp| {
+    let (tmp, file) = create_temp(path)?;
+    let written = write_body(file, body).and_then(|stamp| {
         std::fs::rename(&tmp, path)?;
         Ok(stamp)
     });
@@ -597,11 +1019,10 @@ fn replace_durably(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp
     Ok(stamp)
 }
 
-/// Write `body` through a fresh temp sibling, owner-only (unix) before the first byte lands, and return the
-/// stamp of the bytes written. The rename carries the `0600` mode onto the target.
-#[cfg(feature = "tokio-fs")]
-fn write_body(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
-    let mut file = open_tmp(path)?;
+/// Write `body` through a fresh temp sibling's handle, owner-only (unix) before the first byte lands, and
+/// return the stamp of the bytes written. The rename carries the `0600` mode onto the target.
+#[cfg(feature = "fs")]
+fn write_body(mut file: std::fs::File, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -612,18 +1033,11 @@ fn write_body(path: &Path, body: &[u8]) -> std::io::Result<Option<FileStamp>> {
 }
 
 /// `fsync` the directory holding `path`, so the rename that put the new body there survives a power cut.
-/// Unix only: a directory cannot be opened as a file elsewhere, and no other platform persists at all
-/// (see [`WriteLock`]).
-#[cfg(feature = "tokio-fs")]
+/// Unix only: a directory cannot be opened as a file elsewhere.
+#[cfg(feature = "fs")]
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
-    {
-        let parent = match path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        std::fs::File::open(parent)?.sync_all()?;
-    }
+    std::fs::File::open(parent_of(path))?.sync_all()?;
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
@@ -631,18 +1045,18 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 
 /// The `<path>.written` witness: the high-water count of entries a durable write has left in the store.
 ///
-/// It is not the lock. `<path>.lock` is created before any write, so it proves only that a write was
-/// attempted, and it must never be removed, because its inode is what serializes writers. The witness
-/// is written only after a write is durably in place, and it is the one file an operator removes to
-/// accept a loss.
-#[cfg(feature = "tokio-fs")]
+/// It is not the lock. `<path>.lock` exists only for a self-locking writer and proves only that a write
+/// was attempted, and it must never be removed, because its inode is what serializes those writers. The
+/// witness is written only after a write is durably in place, and it is the one file an operator removes
+/// to accept a loss.
+#[cfg(feature = "fs")]
 pub(crate) fn witness_path(path: &Path) -> PathBuf {
     with_suffix(path, ".written")
 }
 
 /// Raise the witness to `entries` if that is higher than it holds; never lower it. A repair write from a
 /// short file therefore leaves the mark where it was, so a partial repair does not clear the refusal.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 fn raise_witness(path: &Path, entries: usize) -> std::io::Result<()> {
     let entries = u64::try_from(entries).unwrap_or(u64::MAX);
     if read_witness(path)?.is_some_and(|mark| mark >= entries) {
@@ -652,27 +1066,39 @@ fn raise_witness(path: &Path, entries: usize) -> std::io::Result<()> {
 }
 
 /// The witness's count, or `None` when there is no witness. A witness that is not a count is an error:
-/// guessing it would either refuse a sound store forever or accept a lost one.
+/// guessing it would either refuse a sound store forever or accept a lost one. It is read through the
+/// same regular-file open as the store and at most [`WITNESS_MAX_LEN`] bytes, so a witness replaced by a
+/// FIFO or grown without bound cannot wedge or balloon a load.
 // `core::io::ErrorKind` is still unstable, so the error construction reads from `std`.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[allow(clippy::std_instead_of_core)]
 fn read_witness(path: &Path) -> std::io::Result<Option<u64>> {
-    let text = match std::fs::read_to_string(witness_path(path)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    text.trim().parse().map(Some).map_err(|_| {
+    let not_a_count = || {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "store witness is not a count",
         )
-    })
+    };
+    let file = match open_regular(&witness_path(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut text = String::new();
+    file.take(WITNESS_MAX_LEN + 1).read_to_string(&mut text)?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > WITNESS_MAX_LEN {
+        return Err(not_a_count());
+    }
+    text.trim().parse().map(Some).map_err(|_| not_a_count())
 }
 
+/// The longest witness read, in bytes: the twenty digits of `u64::MAX` and a newline, with room to spare.
+#[cfg(feature = "fs")]
+const WITNESS_MAX_LEN: u64 = 32;
+
 /// Why a store may not be loaded as it reads.
-#[cfg(feature = "tokio-fs")]
-pub(crate) enum WitnessError {
+#[cfg(feature = "fs")]
+enum WitnessError {
     /// It holds fewer entries than a durable write once left there.
     Lost {
         /// The high-water count the witness records.
@@ -682,11 +1108,11 @@ pub(crate) enum WitnessError {
     Io(std::io::Error),
 }
 
-/// The one startup check both stores run: a store that `found` entries in, absent counting as zero, must
-/// hold at least what its witness says a durable write left there. Neither store has a removal API, so a
-/// shorter file can only be a loss, and loading it would turn a deny into an admit.
-#[cfg(feature = "tokio-fs")]
-pub(crate) fn check_witness(path: &Path, found: usize) -> Result<(), WitnessError> {
+/// The startup check: a store that `found` entries in, absent counting as zero, must hold at least what
+/// its witness says a durable write left there. There is no removal API, so a shorter file can only be a
+/// loss, and loading it would turn a deny into an admit.
+#[cfg(feature = "fs")]
+fn check_witness(path: &Path, found: usize) -> Result<(), WitnessError> {
     let found = u64::try_from(found).unwrap_or(u64::MAX);
     match read_witness(path).map_err(WitnessError::Io)? {
         Some(expected) if found < expected => Err(WitnessError::Lost { expected }),
@@ -700,7 +1126,7 @@ pub(crate) fn check_witness(path: &Path, found: usize) -> Result<(), WitnessErro
 /// the replacement's revocation. A stamp the platform will not report degrades to `None`, so the next
 /// refresh re-reads rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the
 /// single-handle write path.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 pub(crate) fn write_and_stamp(
     file: &mut std::fs::File,
     body: &[u8],
@@ -715,132 +1141,41 @@ pub(crate) fn write_and_stamp(
     // would make this instance adopt a stamp that no longer matches the file it just wrote. The
     // mtime still comes from the handle, so the stamp names the inode that received the bytes.
     let written = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let stamp = file
-        .metadata()
-        .ok()
-        .and_then(|meta| FileStamp::of(&meta))
-        .map(|stamp| stamp.with_len(written));
-    Ok(stamp)
-}
-
-/// Read and decode the denylist file; an absent file is an empty set. Returns the ids and the file's stamp
-/// (`None` if absent).
-// `core::io::ErrorKind` is still unstable, so the NotFound check reads from `std`.
-#[cfg(feature = "tokio-fs")]
-#[allow(clippy::std_instead_of_core)]
-async fn read_ids(
-    path: &Path,
-) -> Result<(HashSet<RevocationId>, Option<FileStamp>), DenylistError> {
-    // Open ONCE and take both the ids and the stamp from that handle (`read_ids_from`). Reading the path
-    // and then stat-ing the path again is the defect this closes: a writer that replaces the file between
-    // the two calls made the old ids wear the new file's stamp, so every later refresh saw the
-    // stamp as current and a revocation froze until the next edit.
-    let (ids, stamp) = match tokio::fs::File::open(path).await {
-        Ok(mut file) => read_ids_from(&mut file).await?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (HashSet::new(), None),
-        Err(error) => return Err(DenylistError::Io(error)),
-    };
-    // Absent counts: a deleted denylist beside its witness is a loss, not a fresh start.
-    check_witness(path, ids.len()).map_err(|error| match error {
-        WitnessError::Lost { expected } => DenylistError::Lost {
-            path: path.to_path_buf(),
-            expected,
-            found: u64::try_from(ids.len()).unwrap_or(u64::MAX),
-        },
-        WitnessError::Io(error) => DenylistError::Io(error),
-    })?;
-    Ok((ids, stamp))
-}
-
-/// Read the ids and their stamp from ONE already-open handle. The single handle is the
-/// invariant: the bytes and the stamp describe the same inode, so a path replacement between the open and
-/// the read can never pair old ids with the replacement's freshness. An unreadable body or an unparsable
-/// line is an error; a stamp the platform will not report degrades to `None`, so the next refresh re-reads
-/// rather than trusting a stale stamp. `pub(crate)` so the regression test can drive the single-handle path.
-#[cfg(feature = "tokio-fs")]
-pub(crate) async fn read_ids_from(
-    file: &mut tokio::fs::File,
-) -> Result<(HashSet<RevocationId>, Option<FileStamp>), DenylistError> {
-    // Unbounded, as the denylist has always been: an issuer's own revocations are its to grow.
-    let text = read_to_string(file, u64::MAX)
-        .await
-        .map_err(DenylistError::Io)?;
-    let ids = parse_ids(&text)?;
-    let stamp = file
-        .metadata()
-        .await
-        .ok()
-        .and_then(|meta| FileStamp::of(&meta));
-    Ok((ids, stamp))
-}
-
-/// Read an open file to a string through the core [`AsyncRead`] trait. The `tokio-fs` feature enables only
-/// `tokio/fs`; the `io-util` extension traits would add `bytes` to every consumer's lock just to read a
-/// small control file, so this loop drives `poll_read` directly. More than `max` bytes is
-/// `FileTooLarge`, found before the excess is buffered.
-// `core::io::ErrorKind` is still unstable, so the error construction reads from `std`.
-#[cfg(feature = "tokio-fs")]
-#[allow(clippy::std_instead_of_core)]
-pub(crate) async fn read_to_string(
-    file: &mut tokio::fs::File,
-    max: u64,
-) -> std::io::Result<String> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0_u8; 4096];
-    loop {
-        let filled = core::future::poll_fn(|cx| {
-            let mut buf = tokio::io::ReadBuf::new(&mut chunk);
-            core::task::ready!(core::pin::Pin::new(&mut *file).poll_read(cx, &mut buf))?;
-            core::task::Poll::Ready(Ok::<_, std::io::Error>(buf.filled().len()))
-        })
-        .await?;
-        if filled == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..filled]);
-        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max {
-            return Err(std::io::ErrorKind::FileTooLarge.into());
-        }
-    }
-    String::from_utf8(bytes).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "file is not valid UTF-8")
-    })
-}
-
-/// Decode a denylist file body into a set of revocation ids.
-#[cfg(feature = "tokio-fs")]
-fn parse_ids(text: &str) -> Result<HashSet<RevocationId>, DenylistError> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(decode_id)
-        .collect()
-}
-
-/// Decode one lowercase-hex revocation-id line into a [`RevocationId`], through the same
-/// [`RevocationId::from_hex`] the API uses, so the file and API encodings can never diverge.
-#[cfg(feature = "tokio-fs")]
-fn decode_id(line: &str) -> Result<RevocationId, DenylistError> {
-    RevocationId::from_hex(line).map_err(|_| DenylistError::Parse)
+    Ok(stamp_of(file).map(|stamp| stamp.with_len(written)))
 }
 
 /// Why loading or persisting the denylist failed.
-#[cfg(feature = "tokio-fs")]
+#[cfg(feature = "fs")]
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DenylistError {
     /// The backing file could not be read or written.
     #[error("access revocation denylist")]
     Io(#[source] std::io::Error),
-    /// A line in the file was not a valid lowercase-hex revocation id.
-    #[error("parse revocation id")]
-    Parse,
-    /// The file holds fewer ids than a durable write once left there (an absent file holds none). No write
-    /// shrinks the denylist, so ids were lost to a deletion, a truncation, or a crash, and loading it would
-    /// un-revoke them. Three ways out, in order: restore the file; re-revoke everything that went missing
-    /// through [`FileDenylist::empty`], which clears this once the file is back at `expected`; or remove
-    /// the `<path>.written` witness, which accepts the loss and un-revokes whatever was lost. Never remove
-    /// the `.lock`: writers serialize on it.
+    /// A line in the file was not an `id` or `key` entry. Only [`load`](Denylist::load) refuses on this; a
+    /// running store skips the line and reports it through [`malformed_line`](Denylist::malformed_line).
+    #[error("parse revocation denylist line {line}")]
+    Parse {
+        /// The 1-based line that failed.
+        line: u32,
+    },
+    /// The file is larger than a denylist can be, so it was not read, or a write would have made it so,
+    /// so it was not written. [`load`](Denylist::load) and [`revoke`](Denylist::revoke) refuse on this; a
+    /// running store keeps what it holds, and a refused write's entries still refuse in this process.
+    #[error("revocation denylist file is too large")]
+    TooLarge,
+    /// The lock passed to [`revoke`](Denylist::revoke) guards another file, so it excludes none of this
+    /// file's writers. Nothing was written; the entries still refuse in this process.
+    #[error("the lock passed to a write on {} guards another file", path.display())]
+    WrongLock {
+        /// The denylist the write was for.
+        path: PathBuf,
+    },
+    /// The file holds fewer entries than a durable write once left there (an absent file holds none). No
+    /// write shrinks the denylist, so entries were lost to a deletion, a truncation, or a crash, and loading
+    /// it would un-revoke them. Three ways out, in order: restore the file; re-revoke everything that went
+    /// missing through [`Denylist::for_repair`], which clears this once the file is back at `expected`; or
+    /// remove the `<path>.written` witness, which accepts the loss and un-revokes whatever was lost.
     #[error(
         "{} holds {found} revocations but held {expected}: restore it, re-revoke what is missing, or remove {}.written to accept the loss",
         path.display(),
@@ -854,10 +1189,23 @@ pub enum DenylistError {
         /// The count the file holds now.
         found: u64,
     },
-    /// This platform has no cross-process file lock at the crate's minimum Rust version, so a durable
-    /// revoke cannot be serialized and is refused rather than raced. The in-memory set still refuses
-    /// the id for this process; only the durable record is unavailable.
+    /// This platform has no cross-process file lock at the crate's minimum Rust version, so
+    /// [`Denylist::lock`] cannot hand out a guard that serializes anything. A caller holding a lock of
+    /// its own still writes.
     #[cfg(not(unix))]
     #[error("cross-process denylist locking is unavailable on this platform")]
     LockUnsupported,
+}
+
+#[cfg(feature = "fs")]
+impl DenylistError {
+    /// Name a bounded read's failure: an oversized file is its own refusal, anything else is I/O.
+    // `core::io::ErrorKind` is still unstable, so the kind reads from `std`.
+    #[allow(clippy::std_instead_of_core)]
+    fn from_read(error: std::io::Error) -> Self {
+        match error.kind() {
+            std::io::ErrorKind::FileTooLarge => DenylistError::TooLarge,
+            _ => DenylistError::Io(error),
+        }
+    }
 }

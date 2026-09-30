@@ -11,12 +11,11 @@ use biscuit_auth::{KeyPair, PrivateKey};
 use data_encoding::BASE32_NOPAD;
 
 use crate::cap::{Cap, CapError, Identity, Request};
-use crate::disabled_roots::{DisabledRoots, Latch};
 use crate::gate::{
     Admission, Checked, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
     is_recorded,
 };
-use crate::revocations::{FileDenylist, RevocationId};
+use crate::revocations::{Denylist, Exclusive, Revocation, RevocationId, Revocations};
 use crate::service::Service;
 use crate::{STAT_DEBOUNCE, VerifyKey};
 
@@ -24,11 +23,21 @@ fn identity(seed: u8) -> Identity {
     Identity::from_secret(&[seed; 32]).expect("valid ed25519 secret")
 }
 
+/// A caller's own lock guard over the denylist's writers: these tests write from one thread.
+struct Held;
+
+impl Exclusive for Held {}
+
+/// The entry that recalls `cap` and everything attenuated from it: its narrowest block's id.
+fn recall(cap: &Cap) -> Revocation {
+    Revocation::Id(cap.revocation_ids().pop().expect("a chain has a block"))
+}
+
 /// A rooted gate trusting `seed`'s authority, with an empty (no-file) revocation denylist.
 fn rooted_gate(seed: u8) -> Gate {
     Gate::rooted(
         identity(seed).verifying_key(),
-        FileDenylist::empty(PathBuf::new()),
+        Denylist::for_repair(PathBuf::new()),
     )
 }
 
@@ -170,8 +179,8 @@ fn rooted_refuses_a_token_from_a_foreign_authority() {
     );
 }
 
-#[tokio::test]
-async fn a_revoked_token_and_its_delegations_are_refused_across_a_reload() {
+#[test]
+fn a_revoked_token_and_its_delegations_are_refused_across_a_reload() {
     let authority = identity(1);
     let granted = authority.mint(&service("ssh"), hour()).expect("mint");
     // A third party narrows and re-shares the same grant: a delegation carrying the same root block.
@@ -183,11 +192,11 @@ async fn a_revoked_token_and_its_delegations_are_refused_across_a_reload() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
     {
-        let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
-        denylist.revoke(&granted).await.expect("revoke");
+        let denylist = Denylist::load(path.clone()).expect("load");
+        denylist.revoke(&Held, [recall(&granted)]).expect("revoke");
     }
     // Reload from disk: revocation must survive a restart, which a bare TTL cannot give.
-    let denylist = FileDenylist::load(path.clone()).await.expect("reload");
+    let denylist = Denylist::load(path.clone()).expect("reload");
     let gate = Gate::rooted(authority.verifying_key(), denylist);
 
     assert_eq!(
@@ -214,7 +223,7 @@ fn rooted_can_trust_a_foreign_authority_the_ci_model() {
     // ever holding its secret, so a compromised runner can mint no access. The owner's device badge is
     // admitted; a stranger's token is refused.
     let owner = identity(5);
-    let gate = Gate::rooted(owner.verifying_key(), FileDenylist::empty(PathBuf::new()));
+    let gate = Gate::rooted(owner.verifying_key(), Denylist::for_repair(PathBuf::new()));
     let owned = owner.mint_member(some_peer(), hour()).expect("mint");
     assert_eq!(
         gate.admit(proven(some_peer()), Some(&owned), &service("ssh")),
@@ -227,9 +236,9 @@ fn rooted_can_trust_a_foreign_authority_the_ci_model() {
     );
 }
 
-#[tokio::test]
-async fn revocation_goes_live_without_reconstructing_the_denylist() {
-    // A long-running issuer holds ONE FileDenylist; a revocation in a SEPARATE process writes the revoked id
+#[test]
+fn revocation_goes_live_without_reconstructing_the_denylist() {
+    // A long-running issuer holds ONE Denylist; a revocation in a SEPARATE process writes the revoked id
     // to the file. The running gate must honor it on the next check (within one stat-debounce window), not
     // at the next restart. Here the same live denylist, never reloaded or reconstructed, refuses a cap after
     // a separate handle revokes it, because is_revoked re-reads the file when its mtime changed.
@@ -240,13 +249,13 @@ async fn revocation_goes_live_without_reconstructing_the_denylist() {
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 
     // The running issuer's denylist: loaded once, empty (file absent).
-    let live = FileDenylist::load(path.clone()).await.expect("load");
+    let live = Denylist::load(path.clone()).expect("load");
     assert!(!live.is_revoked(&granted), "unrevoked at first");
 
     // A separate process revokes the cap by writing the file.
     {
-        let mut revoker = FileDenylist::load(path.clone()).await.expect("load");
-        revoker.revoke(&granted).await.expect("revoke");
+        let revoker = Denylist::load(path.clone()).expect("load");
+        revoker.revoke(&Held, [recall(&granted)]).expect("revoke");
     }
 
     // Wait past the stat debounce so the next check restats the file; a blocking sleep is fine here (a
@@ -261,8 +270,8 @@ async fn revocation_goes_live_without_reconstructing_the_denylist() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn a_deleted_denylist_file_does_not_un_revoke() {
+#[test]
+fn a_deleted_denylist_file_does_not_un_revoke() {
     // Fail closed: deleting the backing file is NOT "the denylist is empty". A running issuer that revoked
     // a cap must keep refusing it even if the file disappears (a botched cleanup, or a local attacker who
     // `rm`s it to un-revoke a lost device). The last-known set stands until a real file replaces it.
@@ -272,8 +281,8 @@ async fn a_deleted_denylist_file_does_not_un_revoke() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 
-    let mut live = FileDenylist::load(path.clone()).await.expect("load");
-    live.revoke(&granted).await.expect("revoke");
+    let live = Denylist::load(path.clone()).expect("load");
+    live.revoke(&Held, [recall(&granted)]).expect("revoke");
     assert!(live.is_revoked(&granted), "revoked after the write");
 
     // Delete the file out from under the running denylist.
@@ -455,8 +464,8 @@ fn an_authority_slip_with_a_non_member_cap_as_the_badge_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_revoked_authority_slip_is_refused_even_with_a_valid_badge() {
+#[test]
+fn a_revoked_authority_slip_is_refused_even_with_a_valid_badge() {
     // Revoke-the-slip kills the WHOLE foreign authority's access: record the slip's revocation id in work's
     // denylist, and the authority-bound arm refuses `Revoked` even though the badge under `X` still
     // verifies. The badge (rooted at `X`) is NOT work's to revoke; revoking the slip is how work cuts the
@@ -471,8 +480,10 @@ async fn a_revoked_authority_slip_is_refused_even_with_a_valid_badge() {
     let path = std::env::temp_dir().join(format!("nauthy-authority-revoke-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
-    denylist.revoke(&slip).await.expect("revoke the slip");
+    let denylist = Denylist::load(path.clone()).expect("load");
+    denylist
+        .revoke(&Held, [recall(&slip)])
+        .expect("revoke the slip");
     let gate = Gate::rooted(work.verifying_key(), denylist);
 
     assert_eq!(
@@ -483,9 +494,8 @@ async fn a_revoked_authority_slip_is_refused_even_with_a_valid_badge() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A rooted gate at `gate_seed` whose oracle disables `disabled_seed`'s root key over an empty denylist, and
-/// the latch file backing it (the caller removes it).
-async fn gate_disabling(gate_seed: u8, disabled_seed: u8, tag: &str) -> (Gate, PathBuf) {
+/// A denylist at a fresh path holding `seed`'s key, and that path (the caller removes it).
+fn revoking_key(seed: u8, tag: &str) -> (Denylist, PathBuf) {
     let path = std::env::temp_dir().join(format!(
         "nauthy-gate-disabled-{tag}-{}-{:?}",
         std::process::id(),
@@ -493,20 +503,25 @@ async fn gate_disabling(gate_seed: u8, disabled_seed: u8, tag: &str) -> (Gate, P
     ));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let mut disabled = DisabledRoots::load(path.clone()).await.expect("load");
-    disabled
-        .disable(identity(disabled_seed).verifying_key())
-        .await
-        .expect("disable");
-    let oracle = Latch::new(disabled, FileDenylist::empty(PathBuf::new()));
+    let denylist = Denylist::load(path.clone()).expect("load");
+    denylist
+        .revoke(&Held, [Revocation::Key(identity(seed).verifying_key())])
+        .expect("revoke the key");
+    (denylist, path)
+}
+
+/// A rooted gate at `gate_seed` whose denylist holds `disabled_seed`'s root key, and the file backing it
+/// (the caller removes it).
+fn gate_disabling(gate_seed: u8, disabled_seed: u8, tag: &str) -> (Gate, PathBuf) {
+    let (denylist, path) = revoking_key(disabled_seed, tag);
     (
-        Gate::rooted(identity(gate_seed).verifying_key(), oracle),
+        Gate::rooted(identity(gate_seed).verifying_key(), denylist),
         path,
     )
 }
 
-#[tokio::test]
-async fn a_disabled_root_refuses_the_foreign_badge_on_the_two_token_path() {
+#[test]
+fn a_disabled_root_refuses_the_foreign_badge_on_the_two_token_path() {
     // Work issued a slip naming the hire's authority `X`, then disabled `X`. The slip is work's own and
     // clean, so only the question about the BADGE can refuse, and it must: every device `X` badged is
     // out. The control is the same pair at a gate that disabled some other root, which admits.
@@ -514,7 +529,7 @@ async fn a_disabled_root_refuses_the_foreign_badge_on_the_two_token_path() {
     let slip = authority_slip(2, "ssh");
     let badge = foreign_badge(2, hire_device);
 
-    let (gate, path) = gate_disabling(1, 2, "foreign").await;
+    let (gate, path) = gate_disabling(1, 2, "foreign");
     assert_eq!(
         gate.admit_foreign(proven(hire_device), &slip, &badge, &service("ssh")),
         Decision::Refuse(Refusal::Revoked),
@@ -529,7 +544,7 @@ async fn a_disabled_root_refuses_the_foreign_badge_on_the_two_token_path() {
     );
     let _ = std::fs::remove_file(&path);
 
-    let (control, path) = gate_disabling(1, 3, "foreign-control").await;
+    let (control, path) = gate_disabling(1, 3, "foreign-control");
     assert_eq!(
         control.admit_foreign(proven(hire_device), &slip, &badge, &service("ssh")),
         Decision::Admit,
@@ -538,8 +553,8 @@ async fn a_disabled_root_refuses_the_foreign_badge_on_the_two_token_path() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn a_disabled_foreign_root_is_refused_before_the_pair_is_evaluated() {
+#[test]
+fn a_disabled_foreign_root_is_refused_before_the_pair_is_evaluated() {
     // The badge is asked with the slip, BEFORE the verify, as `admit_plain` asks its one token. The slip is
     // for `web` and the request is `ssh`, so the pair would also have failed; the recall is the answer
     // reached first. Ask about the badge after the verify instead and this reports `NotGranted`.
@@ -547,7 +562,7 @@ async fn a_disabled_foreign_root_is_refused_before_the_pair_is_evaluated() {
     let slip = authority_slip(2, "web");
     let badge = foreign_badge(2, hire_device);
 
-    let (gate, path) = gate_disabling(1, 2, "foreign-order").await;
+    let (gate, path) = gate_disabling(1, 2, "foreign-order");
     assert_eq!(
         gate.admit_foreign(proven(hire_device), &slip, &badge, &service("ssh")),
         Decision::Refuse(Refusal::Revoked),
@@ -556,13 +571,13 @@ async fn a_disabled_foreign_root_is_refused_before_the_pair_is_evaluated() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[tokio::test]
-async fn a_disabled_root_refuses_its_own_badge_on_the_plain_path() {
+#[test]
+fn a_disabled_root_refuses_its_own_badge_on_the_plain_path() {
     // The gate's own authority disabled: the badge it once signed for this device no longer admits.
     let device = identity(4).verifying_key();
     let badge = bound_badge(1, device);
 
-    let (gate, path) = gate_disabling(1, 1, "plain").await;
+    let (gate, path) = gate_disabling(1, 1, "plain");
     assert_eq!(
         gate.admit(proven(device), Some(&badge), &service("ssh")),
         Decision::Refuse(Refusal::Revoked),
@@ -619,7 +634,7 @@ fn an_undecided_check_refuses_as_undecided_never_as_a_denial() {
     // report the refusal every non-granting token gets: the peer would read "you are not authorized" from a
     // host that was merely busy. The connection is still refused, because nothing may be admitted on an
     // answer that was never computed.
-    let denylist = FileDenylist::empty(PathBuf::new());
+    let denylist = Denylist::for_repair(PathBuf::new());
     let cap = slip(1, "ssh");
     assert_eq!(
         Checked::from(Err(CapError::Undecided)).decide(&denylist, &cap),
@@ -637,7 +652,7 @@ fn an_undecided_check_survives_the_other_questions_refusal() {
     // a plain "no" from the service check is still not an answer: reporting `NotGranted` there would hide
     // the stall behind the other question. A real GRANT does override it, since that answer needs no help
     // from the question that stalled.
-    let denylist = FileDenylist::empty(PathBuf::new());
+    let denylist = Denylist::for_repair(PathBuf::new());
     let cap = slip(1, "ssh");
     assert_eq!(
         Checked::Undecided
@@ -653,8 +668,8 @@ fn an_undecided_check_survives_the_other_questions_refusal() {
     );
 }
 
-#[tokio::test]
-async fn a_revoked_token_is_refused_before_its_grant_is_evaluated() {
+#[test]
+fn a_revoked_token_is_refused_before_its_grant_is_evaluated() {
     // The order this holds, and the only way to observe it from outside. Revocation is a set lookup over
     // the token's own block signatures, independent of whether the token grants, so it is asked BEFORE the
     // datalog: a revoked but persistent holder can no longer make this node pay for an evaluation it was
@@ -669,8 +684,8 @@ async fn a_revoked_token_is_refused_before_its_grant_is_evaluated() {
     let path = std::env::temp_dir().join(format!("nauthy-revoke-order-{}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let mut denylist = FileDenylist::load(path.clone()).await.expect("load");
-    denylist.revoke(&revoked).await.expect("revoke");
+    let denylist = Denylist::load(path.clone()).expect("load");
+    denylist.revoke(&Held, [recall(&revoked)]).expect("revoke");
     let gate = Gate::rooted(authority.verifying_key(), denylist);
 
     assert_eq!(
@@ -777,19 +792,13 @@ fn a_revoked_peer_key_is_refused_before_any_cap() {
     );
 }
 
-#[tokio::test]
-async fn a_latch_forwards_is_revoked_peer() {
-    // `is_revoked_peer` is a provided method, so a `Latch` that did not forward it would answer the default
-    // and admit a revoked device through the store it wraps.
-    let path = std::env::temp_dir().join(format!("nauthy-latch-peer-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let disabled = DisabledRoots::load(path.clone()).await.expect("load");
+#[test]
+fn a_key_in_the_denylist_refuses_the_device_whatever_it_presents() {
+    // The denylist answers `is_revoked_peer` from its keys, so the gate refuses the proven device before it
+    // reads the badge, which is valid and rooted at a key the denylist never named.
     let device = identity(4).verifying_key();
-    let gate = Gate::rooted(
-        identity(1).verifying_key(),
-        Latch::new(disabled, RevokedKey::new(device)),
-    );
+    let (denylist, path) = revoking_key(4, "peer");
+    let gate = Gate::rooted(identity(1).verifying_key(), denylist);
 
     assert_eq!(
         gate.admit(
@@ -798,9 +807,10 @@ async fn a_latch_forwards_is_revoked_peer() {
             &service("ssh")
         ),
         Decision::Refuse(Refusal::Revoked),
-        "the latch passes the key question to its inner store"
+        "a revoked device key is refused as a peer"
     );
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }
 
 #[test]
@@ -913,7 +923,7 @@ fn anchored_gate(pin: Option<u8>, issued: &[&Cap]) -> Gate {
     Gate::anchored(
         FixedPin(pin.map(|seed| identity(seed).verifying_key())),
         own_key(),
-        FileDenylist::empty(PathBuf::new()),
+        Denylist::for_repair(PathBuf::new()),
         Ledger::of(issued),
     )
 }
@@ -1158,34 +1168,24 @@ fn a_revoked_self_slip_is_refused() {
     );
 }
 
-/// An anchored gate at `OWN` pinned to `PIN`, whose oracle disables `disabled_seed`'s root key, and the
-/// latch file backing it (the caller removes it).
-async fn anchored_gate_disabling(disabled_seed: u8, issued: &[&Cap], tag: &str) -> (Gate, PathBuf) {
-    let path = std::env::temp_dir().join(format!(
-        "nauthy-anchored-disabled-{tag}-{}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let mut disabled = DisabledRoots::load(path.clone()).await.expect("load");
-    disabled
-        .disable(identity(disabled_seed).verifying_key())
-        .await
-        .expect("disable");
+/// An anchored gate at `OWN` pinned to `PIN`, whose denylist holds `disabled_seed`'s root key, and the
+/// file backing it (the caller removes it).
+fn anchored_gate_disabling(disabled_seed: u8, issued: &[&Cap], tag: &str) -> (Gate, PathBuf) {
+    let (denylist, path) = revoking_key(disabled_seed, &format!("anchored-{tag}"));
     let gate = Gate::anchored(
         FixedPin(Some(identity(PIN).verifying_key())),
         own_key(),
-        Latch::new(disabled, FileDenylist::empty(PathBuf::new())),
+        denylist,
         Ledger::of(issued),
     );
     (gate, path)
 }
 
-#[tokio::test]
-async fn a_latched_own_key_refuses_every_self_slip() {
+#[test]
+fn a_revoked_own_key_refuses_every_self_slip() {
     let ssh = slip(OWN, "ssh");
     let web = slip(OWN, "web");
-    let (gate, path) = anchored_gate_disabling(OWN, &[&ssh, &web], "own").await;
+    let (gate, path) = anchored_gate_disabling(OWN, &[&ssh, &web], "own");
 
     assert_eq!(
         gate.admit(proven(some_peer()), Some(&ssh), &service("ssh")),
@@ -1229,7 +1229,7 @@ fn a_pin_equal_to_own_anchors_nothing() {
     let gate = Gate::anchored(
         FixedPin(Some(own_key())),
         own_key(),
-        FileDenylist::empty(PathBuf::new()),
+        Denylist::for_repair(PathBuf::new()),
         Ledger::of(&[&badge, &ssh]),
     );
 
@@ -1253,7 +1253,7 @@ fn a_pin_written_later_is_trusted_at_the_next_admission() {
     let gate = Gate::anchored(
         pin.clone(),
         own_key(),
-        FileDenylist::empty(PathBuf::new()),
+        Denylist::for_repair(PathBuf::new()),
         Ledger(Vec::new()),
     );
 
@@ -1379,15 +1379,15 @@ fn a_foreign_slip_naming_own_as_authority_is_refused() {
     );
 }
 
-#[tokio::test]
-async fn a_latched_authority_refuses_a_node_signed_authority_slip() {
+#[test]
+fn a_revoked_authority_refuses_a_node_signed_authority_slip() {
     // A disabled authority refuses its devices on the own key's authority-bound slip, asked before the pair
     // verifies (this slip is for `web`, asked for `ssh`, so a late read would report the miss) and again
     // after it.
     let device = identity(4).verifying_key();
     let web = own_authority_slip(2, "web");
     let ssh = own_authority_slip(2, "ssh");
-    let (gate, path) = anchored_gate_disabling(2, &[&web, &ssh], "authority").await;
+    let (gate, path) = anchored_gate_disabling(2, &[&web, &ssh], "authority");
 
     assert_eq!(
         gate.admit_foreign(
@@ -1534,19 +1534,15 @@ fn an_anchored_gate_refuses_a_revoked_peer_key_before_any_cap() {
     );
 }
 
-#[tokio::test]
-async fn a_latch_forwards_is_revoked_peer_on_an_anchored_gate() {
-    let path =
-        std::env::temp_dir().join(format!("nauthy-anchored-latch-peer-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
-    let disabled = DisabledRoots::load(path.clone()).await.expect("load");
+#[test]
+fn a_key_in_the_denylist_refuses_the_device_on_an_anchored_gate() {
     let device = identity(4).verifying_key();
+    let (denylist, path) = revoking_key(4, "anchored-peer");
     let own_slip = slip(OWN, "ssh");
     let gate = Gate::anchored(
         FixedPin(None),
         own_key(),
-        Latch::new(disabled, RevokedKey::new(device)),
+        denylist,
         Ledger::of(&[&own_slip]),
     );
 
@@ -1555,6 +1551,7 @@ async fn a_latch_forwards_is_revoked_peer_on_an_anchored_gate() {
         Decision::Refuse(Refusal::Revoked)
     );
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
 }
 
 #[test]
@@ -1571,7 +1568,7 @@ fn pin_source_for_arc_reads_through() {
     let gate = Gate::anchored(
         Arc::clone(&pin),
         own_key(),
-        FileDenylist::empty(PathBuf::new()),
+        Denylist::for_repair(PathBuf::new()),
         Ledger(Vec::new()),
     );
     pin.set(Some(identity(PIN).verifying_key()));

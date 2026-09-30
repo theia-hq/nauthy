@@ -1408,7 +1408,7 @@ pub enum CapError {
     /// treats both as "not admitted on the authority-bound arm".
     #[error("capability is not an authority-bound slip")]
     NotAuthorityBound,
-    /// Evaluation ran out of its [`AUTHORIZER_LIMITS`] wall-clock budget, so the request was NOT DECIDED.
+    /// Evaluation ran out of its `AUTHORIZER_LIMITS` wall-clock budget, so the request was NOT DECIDED.
     ///
     /// NOT a denial, and the distinction is the whole point of the variant: the host ran out of time, which
     /// says nothing whatever about the holder's authority. It is a TRANSIENT local condition (a loaded

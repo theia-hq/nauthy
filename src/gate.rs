@@ -95,7 +95,7 @@ impl Gate {
     ///
     /// The constructor for the boxed variant, so a caller never hand-writes the `Box::new(revocations)`.
     /// The caller brings whatever revocation store it keeps (the batteries-included
-    /// [`FileDenylist`](crate::FileDenylist), or its own [`Revocations`] impl over a database or gossip
+    /// [`Denylist`](crate::Denylist), or its own [`Revocations`] impl over a database or gossip
     /// set); building an [`Open`](Gate::Open) gate is the caller's own choice, so it is built at the call
     /// site, not here. `Send + Sync` so the built gate can be shared across async tasks.
     pub fn rooted(
@@ -807,7 +807,7 @@ fn verify_pair(
 ///
 /// On the authority-bound path the store is consulted on BOTH tokens, the foreign badge included. Three
 /// powers over a foreign member stay distinct:
-/// - this node may DISABLE THE FOREIGN ROOT: a store keyed on root keys (see [`Latch`](crate::Latch))
+/// - this node may DISABLE THE FOREIGN ROOT: a store keyed on root keys (see [`Denylist`](crate::Denylist))
 ///   refuses every badge `X` signed, so every one of `X`'s devices at once;
 /// - this node may REVOKE THE WHOLE SLIP it issued, cutting every device of `X` off from that grant;
 /// - a lost DEVICE of `X` stays `X`'s to revoke, in `X`'s own set: its badge carries `X`'s revocation

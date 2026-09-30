@@ -1,7 +1,7 @@
 #!/bin/sh
 # durable-write-gate.sh -- a store write that returned Ok survives a power cut.
 #
-# THE RULE. Every persisted store in this crate (the revocation denylist, the disabled-roots latch) is
+# THE RULE. The one persisted store in this crate (the revocation denylist of ids and keys) is
 # replaced through ONE function, `replace_durably` in src/revocations.rs: write a temp sibling, fsync
 # it, rename it over the target, fsync the parent directory. No other site may rename a file into place;
 # the store body and its `.written` witness both go through it.
@@ -9,7 +9,7 @@
 # WHY IT IS LOAD-BEARING. Without the file fsync, a power cut after the caller saw Ok can leave the
 # renamed name pointing at blocks never written, which reads back empty or as garbage. Without the
 # directory fsync, the rename itself can be lost and the old body comes back. Either one un-revokes a
-# cap or re-trusts a disabled root, silently, after an operator was told it was done.
+# cap or a key, silently, after an operator was told it was done.
 #
 # WHY A GATE AND NOT A TEST. No test can hold this. A test cannot cut the power between the write and
 # writeback, and every read in the same boot sees the page cache whether or not anything reached the

@@ -5,7 +5,8 @@ use std::time::SystemTime;
 
 use super::Link;
 use crate::cap::{Cap, CapError, Identity};
-use crate::revocations::FileDenylist;
+#[cfg(feature = "fs")]
+use crate::revocations::{Denylist, Exclusive, Revocations};
 use crate::service::Service;
 
 /// A deterministic identity for tests.
@@ -18,17 +19,24 @@ fn service(name: &str) -> Service {
 }
 
 /// A fresh denylist backed by a unique temp path, so parallel tests never share a file.
-fn denylist(tag: &str) -> FileDenylist {
+#[cfg(feature = "fs")]
+fn denylist(tag: &str) -> Denylist {
     let path = std::env::temp_dir().join(format!(
         "nauthy-link-{tag}-{}-{:?}",
         std::process::id(),
         std::thread::current().id()
     ));
     let _ = std::fs::remove_file(&path);
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(crate::revocations::lock_path(&path));
-    FileDenylist::empty(path)
+    let _ = std::fs::remove_file(crate::revocations::witness_path(&path));
+    Denylist::for_repair(path)
 }
+
+/// A caller's own lock guard, standing in for whatever lock the caller holds over its writers.
+#[cfg(feature = "fs")]
+struct Held;
+
+#[cfg(feature = "fs")]
+impl Exclusive for Held {}
 
 /// The parse boundary is the display boundary: a minted link renders its own text, and reparsing that text
 /// yields the same root and the same verification outcome.
@@ -205,10 +213,11 @@ fn an_authority_bound_link_names_its_authority_and_refuses_attenuation() {
     );
 }
 
-/// Revoking a link records its chain in the denylist, so the gate refuses the link itself.
-#[cfg(feature = "tokio-fs")]
-#[tokio::test]
-async fn revoke_records_the_links_chain() {
+/// Revoking a link records its narrowest id in the denylist, so the gate refuses the link itself and not
+/// the wider grant it was narrowed from.
+#[cfg(feature = "fs")]
+#[test]
+fn revoke_records_the_links_chain() {
     let issuer = identity(3);
     let cap = issuer
         .mint(
@@ -216,13 +225,22 @@ async fn revoke_records_the_links_chain() {
             SystemTime::now() + Duration::from_secs(3600),
         )
         .expect("mint");
-    let link = cap.link().expect("encode");
-    let mut denylist = denylist("revoke");
+    let narrowed = cap
+        .attenuate(None, Some(SystemTime::now() + Duration::from_secs(60)))
+        .expect("narrow");
+    let link = narrowed.link().expect("encode");
+    let denylist = denylist("revoke");
 
-    assert!(!denylist.is_revoked(&cap), "nothing is revoked yet");
-    link.revoke(&mut denylist).await.expect("revoke the link");
+    assert!(!denylist.is_revoked(&narrowed), "nothing is revoked yet");
+    link.revoke(&denylist, &Held).expect("revoke the link");
     assert!(
-        denylist.is_revoked(&cap),
+        denylist.is_revoked(&narrowed),
         "the revoked link is refused by the in-memory set"
     );
+    assert!(
+        !denylist.is_revoked(&cap),
+        "the wider grant it was narrowed from still grants"
+    );
+    let _ = std::fs::remove_file(denylist.path());
+    let _ = std::fs::remove_file(crate::revocations::witness_path(denylist.path()));
 }

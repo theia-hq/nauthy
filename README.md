@@ -26,19 +26,16 @@ match gate.admit(peer, presented, &service) {
 cargo add nauthy --git https://github.com/theia-hq/nauthy --branch main
 ```
 
-The defaults (`tokio-fs`, `os-rng`) give you the shipped file-backed revocation store and one-line key
-generation. For a build with no async runtime at all, take the core alone:
+The defaults (`fs`, `os-rng`) give you the file-backed revocation store and one-line key generation. For
+a build with no file access, take the core alone:
 
 ```toml
 nauthy = { git = "https://github.com/theia-hq/nauthy", branch = "main", default-features = false }
 ```
 
-The core (`Gate`, `Cap`, `Identity`, the `Revocations` trait) needs no runtime. `--no-default-features`
-drops `FileDenylist` (bring your own `Revocations`) and `Identity::generate` (use `Identity::from_rng`
-with any CSPRNG you supply).
-
-`FileDenylist` is async, so the example below runs on a Tokio runtime: add `tokio` with the `macros` and
-`rt-multi-thread` features to the binary that embeds nauthy.
+The core (`Gate`, `Cap`, `Identity`, the `Revocations` trait) reads no file and needs no async runtime.
+Without the defaults you lose `Denylist` (bring your own `Revocations`) and `Identity::generate` (use
+`Identity::from_rng` with any CSPRNG you supply).
 
 This page describes the default branch; the released docs are at the newest tag.
 
@@ -75,11 +72,13 @@ so a slip can never be widened into a badge, and a narrowed link can never be br
 
 ```rust
 use core::time::Duration;
+use std::sync::Arc;
 
-use nauthy::{Cap, Decision, FileDenylist, Gate, Identity, ProvenPeer, Refusal, Request, Service};
+use nauthy::{
+    Cap, Decision, Denylist, Gate, Identity, ProvenPeer, Refusal, Request, Revocation, Service,
+};
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. One key is your whole trust root. Generate a fresh ed25519 identity
     //    (or load a persisted 32-byte secret with `Identity::from_secret`).
     let authority = Identity::generate()?;
@@ -96,22 +95,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (In a real service this key comes from your transport, not a fresh identity.)
     let peer = ProvenPeer::from_handshake(Identity::generate()?.verifying_key());
 
-    // 4. On your node, decide whether the peer may connect. The gate trusts one key: yours.
-    //    The link arrives as text; parse it back into the cap the gate rules on.
+    // 4. On your node, decide whether the peer may connect. The gate trusts one key: yours,
+    //    and shares the denylist you revoke through. The link arrives as text; parse it
+    //    back into the cap the gate rules on.
+    let denylist = Arc::new(Denylist::load("caps.deny".into())?);
+    let gate = Gate::rooted(authority.verifying_key(), Arc::clone(&denylist));
     let presented = Cap::parse(narrowed.as_str())?;
-    let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
     match gate.admit(peer, Some(&presented), &ssh) {
         Decision::Admit => println!("admitted"),
         Decision::Refuse(why) => println!("refused: {why}"),
     }
 
-    // 5. Revoke the whole grant. Records the root id, so the cap and every link
-    //    narrowed from it are refused from now on, offline.
-    let mut denylist = FileDenylist::empty("caps.deny".into());
-    denylist.revoke_root(&cap).await?;
+    // 5. Revoke the whole grant: record its root id, so the cap and every link
+    //    narrowed from it are refused from now on, offline. A write takes the lock.
+    let guard = denylist.lock()?;
+    denylist.revoke(&guard, cap.root_revocation_id().map(Revocation::Id))?;
+    drop(guard);
 
-    // A gate reading the same denylist now refuses the narrowed link with Refusal::Revoked.
-    let gate = Gate::rooted(authority.verifying_key(), FileDenylist::load("caps.deny".into()).await?);
+    // The gate reads the same denylist, so it refuses the narrowed link at once.
     assert!(matches!(
         gate.admit(peer, Some(&presented), &ssh),
         Decision::Refuse(Refusal::Revoked),
@@ -159,32 +160,54 @@ decode and narrow it entirely offline, and a dialer learns which node to reach f
 
 ## Revocation
 
-A token verifies offline, so there is no server to ask "is this revoked?". Instead the issuer keeps a set
-of revoked ids, and the gate refuses any presented token whose chain includes one. This survives a
-restart, which a short expiry cannot: an expiry ages a leaked token out eventually but cannot recall it
-now.
+A token verifies offline, so there is no server to ask "is this revoked?". Instead the issuer keeps a
+denylist, and the gate refuses any token or device that matches it. This survives a restart, which a
+short expiry cannot: an expiry ages a leaked token out eventually but cannot recall it now.
 
-- `revoke` records a token's narrowest id: refuses that exact link, but not the grants it was narrowed
-  from.
-- `revoke_root` records the authority-block id every descendant inherits: refuses the grant and its whole
-  delegation tree in one entry.
+`Denylist` keeps that list in one file, one entry per line:
 
-The shipped `FileDenylist` is a set of ids on disk, checked at connect time and fails closed. It reloads
-live when the file changes, so a revocation written by another process takes effect on the next
-connection without a restart. Revocation does not evict a session already in progress; short expiry backs
-it up.
+```text
+id <hex>
+key <ed01...>
+```
 
-A store can also revoke a device's key itself. `Revocations::is_revoked_peer` is asked about the
+- An `id` refuses every token whose chain carries it. `link.revoke(&denylist, &guard)` records a link's
+  narrowest id: it refuses that link and anything narrowed from it, not the grant it was narrowed from.
+  Recording `cap.root_revocation_id()` as a `Revocation::Id` refuses the grant and every link narrowed
+  from it.
+- A `key` refuses that device whatever it presents, and every token rooted at that key, past and future.
+
+```rust
+let denylist = Denylist::load("caps.deny".into())?;
+let guard = denylist.lock()?;
+link.revoke(&denylist, &guard)?; // this link and its narrowings
+denylist.revoke(&guard, cap.root_revocation_id().map(Revocation::Id))?; // the whole grant
+denylist.revoke(&guard, [Revocation::Key(lost_device)])?; // a device, for good
+```
+
+A write needs a lock that excludes every other writer of the file, in every process. `denylist.lock()`
+takes the store's own (unix only). A program that already serializes its writers implements `Exclusive`
+on its own guard and passes that instead. A write re-reads the file and writes the union, so two writers
+never drop each other's entries.
+
+The file only grows. A running store checks it at connect time, so a revocation another process writes
+takes effect on the next connection without a restart; a file that shrinks or disappears un-revokes
+nothing. `Denylist::load` refuses a file holding fewer entries than its `<path>.written` witness records.
+Revocation does not evict a session already in progress; short expiry backs it up.
+
+When a load or a write refuses, `DenylistError` says why; each variant's docs name the fix.
+
+A store of your own can revoke a device's key too. `Revocations::is_revoked_peer` is asked about the
 transport-proven dialer before any token is read, and a `true` refuses that device whatever it presents,
 including a token minted for it later. It defaults to `false`, so a store that keeps only token ids
-needs nothing new. `Latch` and `Arc` pass the question on to the store they wrap; a wrapper of your own
-must do the same, or it answers the default.
+needs nothing new. `Arc` passes the question on to the store it shares; a wrapper of your own must do
+the same, or it answers the default.
 
-A store of your own can reload the same way. `FileStamp::of` takes a file's metadata and returns its
+To reload live as `Denylist` does, use `FileStamp::of`: it takes a file's metadata and returns its
 stamp (length, mtime and, on unix, inode and ctime). Stat at most once per `STAT_DEBOUNCE` and re-read
 when the stamp differs from the one you read at. `of` returns `None` when the platform reports no mtime.
 Treat that as "re-read", never as "unchanged". What a missing file means stays your store's decision:
-`FileDenylist` keeps the last set it read, because deleting a denylist must never un-revoke.
+`Denylist` keeps every entry it holds, because deleting a denylist must never un-revoke.
 
 ## The boundaries: what you bring
 
@@ -192,7 +215,7 @@ nauthy is the authorization layer, and no more. Three things are yours:
 
 - **A transport-proven peer.** You call `ProvenPeer::from_handshake` from the code that finished the
   handshake. nauthy consumes the proof; it does not perform the handshake.
-- **A revocation store.** Use the shipped `FileDenylist`, or implement the `Revocations` trait (one required method)
+- **A revocation store.** Use `Denylist`, or implement the `Revocations` trait (one required method)
   over whatever you keep (a database, Redis, a gossip set). The gate consults it synchronously.
 - **Where secrets come from.** An identity is any 32-byte ed25519 secret. Deriving many device secrets
   from one root seed (so one person's devices share an authority) is your identity layer's job; nauthy
@@ -235,7 +258,8 @@ if let Some(root_id) = cap.root_revocation_id() {
     index.insert("alice", root_id.to_hex());          // your directory
 }
 // later, revoke by that id:
-denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
+let root_id = RevocationId::from_hex(&index["alice"])?;
+denylist.revoke(&denylist.lock()?, [Revocation::Id(root_id)])?;
 ```
 
 ## The limits
@@ -247,8 +271,8 @@ denylist.revoke_id(RevocationId::from_hex(&index["alice"])?).await?;
 - **A bearer slip is a bearer token.** Whoever holds an unexpired, un-revoked one gets that service until
   it expires or you revoke it. Keep bearer slips short-lived; prefer a bound grant where you can.
 - **Revocation is node-local.** Revoking on one node does not reach others. An owner running several
-  nodes revokes on each. The `FileDenylist` file must live on durable storage: a restart on ephemeral
-  storage resurrects every revoked token.
+  nodes revokes on each. Keep the denylist file and its `<path>.written` witness on durable storage: a
+  restart that finds both gone loads an empty list and resurrects every revoked token and key.
 - **An authority-bound slip cannot single out one device** of the foreign authority it names; it sees
   only that authority, never its individual devices. When a device leaves that authority, revoke the slip
   or let it expire. Keep these short-lived.
