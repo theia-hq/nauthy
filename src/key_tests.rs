@@ -173,6 +173,28 @@ fn an_uppercase_key_text_parses() {
     );
 }
 
+/// `A`'s text under a suite tag no library knows: only the tag is wrong.
+const UNKNOWN_SUITE: &str = "ed025jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg2iwa";
+
+/// `A`'s text cut to its first 30 bytes, a whole number of base32 groups: only the length is wrong.
+const WRONG_LENGTH: &str = "ed015jfgyy7ctrjavpxvkb5rglwf7gkuo5vox27hxescd3vgsfcg";
+
+#[test]
+fn an_unknown_suite_tag_is_refused() {
+    assert_eq!(
+        UNKNOWN_SUITE.parse::<VerifyKey>(),
+        Err(KeyParseError::UnknownSuite)
+    );
+}
+
+#[test]
+fn a_key_of_the_wrong_length_is_refused() {
+    assert_eq!(
+        WRONG_LENGTH.parse::<VerifyKey>(),
+        Err(KeyParseError::WrongLength)
+    );
+}
+
 /// `text` with the first `ascii` after the tag swapped for `lookalike`.
 fn swap_first(text: &str, ascii: char, lookalike: char) -> String {
     let (tag, body) = text.split_at(4);
