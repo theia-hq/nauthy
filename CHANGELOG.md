@@ -4,11 +4,26 @@ All notable changes to nauthy, newest first.
 
 ## Unreleased
 
+### Breaking
+- **`Denylist` replaces `FileDenylist`, `DisabledRoots` and `Latch`.** One file holds revoked ids and
+  keys, one per line: `id <hex>` or `key <ed01...>`. A revoked key is refused as a peer and as the root
+  of any cap. Old denylist and disabled-roots files do not load: start fresh.
+- **The `tokio-fs` feature is now `fs`, and the store is synchronous.** `Denylist::load` returns
+  without `.await`, and nauthy no longer depends on tokio.
+- **A write takes a lock the caller holds.** `Denylist::revoke(&guard, entries)` replaces `revoke`,
+  `revoke_root` and `revoke_id`, and `Link::revoke(&denylist, &guard)` replaces
+  `Link::revoke(&mut denylist)`. The guard is `Denylist::lock()`, or your own type implementing
+  `Exclusive`. To revoke a whole grant, record `cap.root_revocation_id()` as a `Revocation::Id`.
+- **`DenylistError` changes.** `Parse` names the line (`parse revocation denylist line N`). New:
+  `WrongLock`, a guard for another file (`the lock passed to a write on <path> guards another file`),
+  and `TooLarge`, a file past the size cap (`revocation denylist file is too large`).
+  `Denylist::for_repair` replaces `FileDenylist::empty` as the way back from `Lost`.
+
 ### Fixed
-- **A shorter denylist file no longer un-revokes a cap in a running process.** `FileDenylist` replaced
-  its set with any shorter non-empty file that parsed. A refresh now adds the ids it reads and never
-  drops one it holds. To accept a loss on purpose, remove the `<path>.written` witness and call
-  `FileDenylist::load` again.
+- **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh
+  replaced the held set with any shorter non-empty file that parsed. A refresh now adds what it reads
+  and never drops an entry it holds. To accept a loss on purpose, remove the `<path>.written` witness and
+  call `Denylist::load` again.
 
 ## v0.11.0
 

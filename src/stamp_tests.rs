@@ -143,44 +143,26 @@ impl Drop for NoMtime {
 
 /// A denylist that holds no stamp and stats a file whose platform reports none must read it. Skipping
 /// would leave a revocation written by another process unseen for as long as the process runs.
-#[cfg(feature = "tokio-fs")]
-#[tokio::test]
-async fn a_denylist_reads_a_file_that_reports_no_stamp() {
+#[cfg(feature = "fs")]
+#[test]
+fn a_denylist_reads_a_file_that_reports_no_stamp() {
     let path = scratch("denylist-unstamped");
     let _ = std::fs::remove_file(&path);
-    let denylist = crate::FileDenylist::load(path.clone())
-        .await
-        .expect("an absent denylist loads empty");
+    let denylist = crate::Denylist::load(path.clone()).expect("an absent denylist loads empty");
     let id = crate::RevocationId::from_hex("aabb").expect("valid hex");
-    std::fs::write(&path, "aabb\n").expect("another process revokes");
+    let key = crate::Identity::from_secret(&[7; 32])
+        .expect("valid ed25519 secret")
+        .verifying_key();
+    std::fs::write(&path, format!("id aabb\nkey {key}\n")).expect("another process revokes");
 
     let unstamped = NoMtime::on();
     assert!(
         denylist.is_revoked_any([&id]),
-        "a revocation behind a missing stamp is read"
+        "an id behind a missing stamp is read"
     );
-    drop(unstamped);
-
-    let _ = std::fs::remove_file(&path);
-}
-
-/// The same rule for the disabled-roots latch: a missing stamp re-reads, so a root disabled by another
-/// process is refused on the next check.
-#[cfg(feature = "tokio-fs")]
-#[test]
-fn a_latch_reads_a_file_that_reports_no_stamp() {
-    let path = scratch("latch-unstamped");
-    let _ = std::fs::remove_file(&path);
-    let latch = crate::DisabledRoots::open_for_repair(path.clone());
-    let root = crate::Identity::from_secret(&[7; 32])
-        .expect("valid ed25519 secret")
-        .verifying_key();
-    std::fs::write(&path, format!("{root}\n")).expect("another process disables the root");
-
-    let unstamped = NoMtime::on();
     assert!(
-        latch.is_disabled(root),
-        "a root disabled behind a missing stamp is read"
+        denylist.is_revoked_key(&key),
+        "a key behind a missing stamp is read"
     );
     drop(unstamped);
 

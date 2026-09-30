@@ -1,11 +1,11 @@
 //! One generation of a file as a stat sees it ([`FileStamp`]), and how often a live reader may stat
 //! ([`STAT_DEBOUNCE`]).
 //!
-//! A long-running process that honors a file another process writes (a denylist, a set of disabled
-//! roots, a pin) cannot re-read it on every check, and cannot wait for a restart either. It stats the
-//! file at most once per [`STAT_DEBOUNCE`], and re-reads only when the stamp differs from the one it read
-//! at. Both [`FileDenylist`](crate::FileDenylist) and [`DisabledRoots`](crate::DisabledRoots) work this
-//! way, and a store of its own can use the same pieces, deciding by [`FileStamp::unchanged`].
+//! A long-running process that honors a file another process writes (a denylist, a pin) cannot re-read
+//! it on every check, and cannot wait for a restart either. It stats the file at most once per
+//! [`STAT_DEBOUNCE`], and re-reads only when the stamp differs from the one it read at.
+//! [`Denylist`](crate::Denylist) works this way, and a store of its own can use the same pieces, deciding
+//! by [`FileStamp::unchanged`].
 //!
 //! The stamp decides only WHETHER to re-read. What a missing, unreadable or shorter file means is the
 //! reader's own policy, and it differs between stores: a denylist keeps the last set it read, because a
@@ -80,7 +80,7 @@ impl FileStamp {
 
     /// This stamp with its length replaced by `len`: the bytes a writer knows it wrote, which a stat
     /// taken right after the write can under-report on some filesystems.
-    #[cfg(feature = "tokio-fs")]
+    #[cfg(feature = "fs")]
     pub(crate) fn with_len(self, len: u64) -> Self {
         Self { len, ..self }
     }

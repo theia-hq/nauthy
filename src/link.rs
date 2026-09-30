@@ -6,8 +6,8 @@ use core::time::Duration;
 
 use crate::VerifyKey;
 use crate::cap::{Cap, CapError, Identity, Request};
-#[cfg(feature = "tokio-fs")]
-use crate::revocations::{DenylistError, FileDenylist};
+#[cfg(feature = "fs")]
+use crate::revocations::{Denylist, DenylistError, Exclusive, Revocation};
 use crate::service::Service;
 
 /// A capability link: the shareable text form of a [`Cap`], validated at construction.
@@ -104,14 +104,18 @@ impl Link {
         Self::of(self.cap.attenuate(service, shorten)?)
     }
 
-    /// Revoke this link into an open denylist, so the gate refuses it and everything attenuated from it.
+    /// Record this link's narrowest id in `denylist`, under the lock `held` names, so the gate refuses it
+    /// and everything attenuated from it, NOT the wider grant it was attenuated from.
     ///
     /// The caller opens the denylist (from wherever it persists revocations) and passes it BY REF; this
-    /// never reads a path. It records EXACTLY the link's id and every narrower cap delegated from it, NOT
-    /// the wider grant it was attenuated from.
-    #[cfg(feature = "tokio-fs")]
-    pub async fn revoke(&self, denylist: &mut FileDenylist) -> Result<(), DenylistError> {
-        denylist.revoke(&self.cap).await
+    /// never reads a path. See [`Denylist::revoke`] for what the write does.
+    #[cfg(feature = "fs")]
+    pub fn revoke(&self, denylist: &Denylist, held: &impl Exclusive) -> Result<(), DenylistError> {
+        // A biscuit always has at least its authority block, so `pop` yields the narrowest id; stay total.
+        let Some(id) = self.cap.revocation_ids().pop() else {
+            return Ok(());
+        };
+        denylist.revoke(held, [Revocation::Id(id)])
     }
 
     /// The root identity this link addresses: the key to dial and the issuer that must verify it.

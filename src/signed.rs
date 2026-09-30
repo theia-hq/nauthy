@@ -1,8 +1,9 @@
 //! A signed document: opaque bytes an identity vouches for with a detached ed25519 signature.
 //!
-//! The generic primitive under any signed artifact rooted at an identity. [`Identity::sign_document`]
-//! signs a payload with the same ed25519 key the identity mints caps with, and [`Signed::verify`] against
-//! the key you actually trust is the whole security check: only that key's secret makes a signature the
+//! The generic primitive under any signed artifact rooted at an identity.
+//! [`Identity::sign_document`](crate::Identity::sign_document) signs a payload with the same ed25519 key
+//! the identity mints caps with, and [`Signed::verify`] against the key you actually trust is the whole
+//! security check: only that key's secret makes a signature the
 //! key verifies, so any holder may relay the blob and none can forge it. The payload is OPAQUE
 //! here (nauthy attaches no meaning to the bytes): a consumer canonicalizes and parses its own document,
 //! and this layer only proves who signed the bytes and that they were not tampered.

@@ -29,7 +29,7 @@
 //! The token is a [biscuit](biscuit_auth): an ed25519-signed, datalog-attenuable capability. nauthy never
 //! hand-rolls crypto; it wraps a vetted library behind a small parse-don't-validate [`Cap`] type, adds a
 //! signed membership claim, and revokes offline through a [`Revocations`] store (the batteries-included one
-//! is [`FileDenylist`]).
+//! is [`Denylist`]).
 //!
 //! # Identities: authorized, not provisioned
 //!
@@ -49,15 +49,13 @@
 //! - **The secret stays secret AND never signs hostile bytes.** [`Identity::sign_document`] domain-separates
 //!   its signatures so a document signature can never be reused as a biscuit block signature.
 //! - **The revocation store is DURABLE and never reset-to-empty.** A restart on ephemeral storage
-//!   resurrects every revoked cap (an absent [`FileDenylist`] file is an empty set) and re-trusts every
-//!   disabled root (so is an absent [`DisabledRoots`] file). A monotone high-water mark is out of scope;
-//!   durable storage is the precondition.
+//!   resurrects every revoked cap and key (an absent [`Denylist`] file beside no witness is an empty
+//!   set). The witness refuses a file shorter than its high-water mark, but not the loss of both; durable
+//!   storage is the precondition.
 //! - **The local clock is roughly right, or expiries are short.** Expiry is checked against the local clock;
 //!   a badly-wrong clock widens or voids a grant's window.
 
 mod cap;
-#[cfg(feature = "tokio-fs")]
-mod disabled_roots;
 mod gate;
 mod key;
 mod link;
@@ -69,15 +67,13 @@ mod stamp;
 #[cfg(test)]
 mod cap_tests;
 #[cfg(test)]
-#[cfg(feature = "tokio-fs")]
-mod disabled_roots_tests;
-#[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
 mod key_tests;
 #[cfg(test)]
 mod link_tests;
 #[cfg(test)]
+#[cfg(feature = "fs")]
 mod revocations_tests;
 #[cfg(test)]
 mod signed_tests;
@@ -85,15 +81,13 @@ mod signed_tests;
 mod stamp_tests;
 
 pub use crate::cap::{Cap, CapError, Identity, Request};
-#[cfg(feature = "tokio-fs")]
-pub use crate::disabled_roots::{DisabledRoots, DisabledRootsError, Latch};
 pub use crate::gate::{
     Admission, Admitted, Anchor, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
 };
 pub use crate::key::{KeyError, KeyParseError, VerifyKey};
 pub use crate::link::Link;
-#[cfg(feature = "tokio-fs")]
-pub use crate::revocations::{DenylistError, FileDenylist};
+#[cfg(feature = "fs")]
+pub use crate::revocations::{Denylist, DenylistError, DenylistLock, Exclusive, Revocation};
 pub use crate::revocations::{RevocationId, RevocationIdParseError, Revocations};
 pub use crate::service::{Service, ServiceParseError};
 pub use crate::signed::{SignError, Signed};
