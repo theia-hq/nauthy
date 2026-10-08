@@ -23,10 +23,12 @@ All notable changes to nauthy, newest first.
 - **A `Revocations` store implements `is_revoked_ids(root, ids)` instead of `is_revoked(cap)`.**
   `is_revoked` is provided over it with the cap's root and chain; do not override it. A held slip is
   asked through the same method, so a cap and a held slip on one chain get one answer.
-- **`Identity::mint_bound` also signs the device as a `device_bound` fact**, so the issuer can read a
-  slip's holder from what it signed and keep the slip as a held slip.
-- **A slip rooted at this machine's own key is refused when its end cannot be read or when it names
-  two holders**, on every path.
+- **`Identity::mint_bound` names the device once, in a signed `device_bound` fact, and the slip's binding
+  check reads that fact.** The device an issuer reads from the slip is the device the slip admits, so the
+  issuer can keep it as a held slip (see Added).
+- **The gate and `HeldSlip::verify` refuse a slip rooted at this machine's own key when it names more
+  than one holder (two devices, two foreign authorities, or one of each) or its end cannot be read**,
+  whether this machine holds the slip or a peer presents it.
 
 ### Added
 - **An anchored gate admits a peer on a slip this machine keeps.** A peer that presents no token rooted

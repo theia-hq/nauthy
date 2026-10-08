@@ -65,7 +65,7 @@ impl HeldSlip {
     /// - a slip whose facts cannot be read, as [`Denied`](HeldSlipError::Denied) with its cause, since it
     ///   has not shown it is no badge;
     /// - a slip signed by any key but `own`;
-    /// - a slip that names two holders;
+    /// - a slip that names more than one holder;
     /// - a slip a holder narrowed (more than one block): a held slip is kept exactly as its issuer signed it;
     /// - a bearer slip, which names no holder; a holder that is not a well-formed key; and a root slip
     ///   naming `own` itself as its authority, since anyone holding a copy of that key could badge any
@@ -348,7 +348,7 @@ enum Named {
 
 impl<'a> OwnSlip<'a> {
     /// Read `slip` as a grant `own` signed: refused as a membership badge, as another key's, or as naming
-    /// two holders. One pass over the slip's authority block (see [`Cap::authority_facts`]).
+    /// more than one holder. One pass over the slip's authority block (see [`Cap::authority_facts`]).
     pub(crate) fn read(slip: &'a Cap, own: VerifyKey) -> Result<Self, HeldSlipError> {
         // First, before anything reads the slip as a grant: the own key never makes a member, and a badge
         // its holder narrowed to one service is still a badge. A read that failed has not shown the slip is
@@ -502,7 +502,7 @@ pub enum HeldSlipError {
     #[error("slip is not signed by this key")]
     OtherKey,
     /// The slip names more than one holder: two devices, two foreign authorities, or one of each.
-    #[error("slip names two holders")]
+    #[error("slip names more than one holder")]
     TwoHolders,
     /// The slip is a root slip naming the key that signed it as its foreign authority.
     #[error("slip names its own signer as its authority")]

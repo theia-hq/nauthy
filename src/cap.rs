@@ -292,10 +292,9 @@ impl Identity {
     /// bound to one device the way a membership badge is (see [`Identity::mint_member`]). So a copy
     /// observed in flight and replayed from a DIFFERENT key verifies against no one, and a slip presented
     /// with no proven dialer (`request.bound_device` is `None`) grants nothing: theft-resistant, inert
-    /// unless the presenter IS the bound device. It needs no new verify path,
-    /// [`Cap::verify_at_root_without_revocation`] already injects the proven dialer as `bound_device`, so
-    /// the binding check falls out of the existing service verification. Only the authority (this
-    /// identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
+    /// unless the presenter IS the bound device. A verify injects the proven dialer as `bound_device`
+    /// ([`Cap::verify_at_root_without_revocation`]), so the binding check runs inside the service
+    /// verification. Only the authority (this identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
     /// device-bound slip can never be widened into an unbound slip or a badge.
     ///
     /// The device is written ONCE, as a `device_bound` AUTHORITY fact, the way
