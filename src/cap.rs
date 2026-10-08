@@ -29,8 +29,9 @@
 //!   issuer still verifies the whole chain without ever seeing the delegation.
 //! - [`Identity::verify`] checks a presented cap against this identity for a [`Request`] (service + now).
 //!
-//! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes and whose signature
-//! chain checks against the embedded root. Whether it further *grants* a given request is answered by
+//! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes, is the grammar this
+//! crate mints (ed25519 keys only, no externally signed block), and whose signature chain checks against
+//! the embedded root. Whether it further *grants* a given request is answered by
 //! [`Identity::verify`], which returns the peer identity it is rooted at only when every check passes.
 
 use core::time::Duration;
@@ -39,12 +40,14 @@ use std::time::SystemTime;
 use biscuit_auth::builder::{
     Algorithm, Binary, Check, CheckKind, Expression, Op, Predicate, Rule, Term,
 };
+use biscuit_auth::format::schema;
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{
     Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, error,
 };
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
+use prost::Message as _;
 use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 
@@ -707,8 +710,10 @@ impl Cap {
     /// Decode a cap from its `<key>.<token>` link text.
     ///
     /// parse-don't-validate at the wire edge: rejects text that is not `<key>.<token>`, a malformed [`VerifyKey`], bad base32,
-    /// or bytes whose signature chain does not check against the embedded root. It does NOT evaluate the
-    /// caveats (service, expiry); that is [`Identity::verify`]'s job at connect time.
+    /// a token outside the grammar this crate mints (a key that is not ed25519, or a block signed outside
+    /// the chain, refused before any signature is checked), or bytes whose signature chain does not check
+    /// against the embedded root. It does NOT evaluate the caveats (service, expiry); that is
+    /// [`Identity::verify`]'s job at connect time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
         let (root, encoded) = link.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
         // A key and a token each hold no separator, so a second one is a broken shape, not bad base32.
@@ -724,6 +729,9 @@ impl Cap {
         }
         let root = root.parse::<VerifyKey>().map_err(|_| CapError::Malformed)?;
         let bytes = crate::key::decode_base32(encoded).ok_or(CapError::Encoding)?;
+        // The grammar check comes BEFORE the chain verify, because the verify dispatches each block on
+        // the key the token itself names: left to it, a stranger picks which signature verifier runs.
+        refuse_unminted_grammar(&bytes)?;
         let public = root_key(root)?;
         // Decoding with the embedded root verifies the signature chain back to it; a token that does not
         // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
@@ -1027,6 +1035,61 @@ impl Cap {
         })
     }
 
+    /// Test-only: append an ordinary, empty block whose NEXT key is P-256, so the block after it (or the
+    /// seal) is checked by the P-256 verifier. Any holder can do this with biscuit's own API, no secret.
+    pub(crate) fn attenuate_with_p256_next_key(&self) -> Result<Self, CapError> {
+        let next = KeyPair::new_with_algorithm(Algorithm::Secp256r1);
+        let token = self
+            .token
+            .append_with_keypair(&next, biscuit_auth::builder::BlockBuilder::new())
+            .map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
+    }
+
+    /// Test-only: append a biscuit third-party block, signed by a fresh ed25519 key outside the chain. The
+    /// external key is ed25519 on purpose, so the refusal under test is the external signature itself and
+    /// not its algorithm.
+    pub(crate) fn attenuate_with_external_block(&self) -> Result<Self, CapError> {
+        let external = KeyPair::new_with_algorithm(Algorithm::Ed25519);
+        let response = self
+            .token
+            .third_party_request()
+            .and_then(|request| {
+                request.create_block(
+                    &external.private(),
+                    biscuit_auth::builder::BlockBuilder::new(),
+                )
+            })
+            .map_err(CapError::Attenuate)?;
+        let token = self
+            .token
+            .append_third_party(external.public(), response)
+            .map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
+    }
+
+    /// Test-only: whether biscuit's own parse accepts `link` against the root it names, with this crate's
+    /// grammar check skipped. The inversion witness for [`refuse_unminted_grammar`]: a token biscuit accepts
+    /// and [`Cap::parse`] refuses is refused by the grammar check and by nothing else.
+    pub(crate) fn biscuit_alone_accepts(link: &str) -> bool {
+        let Some((root, encoded)) = link.split_once(SEPARATOR) else {
+            return false;
+        };
+        let (Ok(root), Some(bytes)) = (
+            root.parse::<VerifyKey>(),
+            crate::key::decode_base32(encoded),
+        ) else {
+            return false;
+        };
+        root_key(root).is_ok_and(|public| Biscuit::from(&bytes, public).is_ok())
+    }
+
     /// Test-only: append `check if time($t), $t <= <secs>` with the date as raw seconds, the one clock
     /// shape this crate writes but at a date a `SystemTime` cannot hold. A holder writes it with biscuit's
     /// public builder; datalog text cannot, since it spells dates as RFC 3339.
@@ -1140,6 +1203,37 @@ const CENTURY: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 /// The biscuit root public key for a [`VerifyKey`]: the same ed25519 key, read as a verifier root.
 fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
     PublicKey::from_bytes(node.bytes(), Algorithm::Ed25519).map_err(CapError::Key)
+}
+
+/// Refuse a token this crate could not have minted or narrowed, from its protobuf frame alone, before any
+/// signature is checked.
+///
+/// biscuit verifies each block against the key the block BEFORE it names (`next_key`), and that key may be
+/// ed25519 or P-256; a third-party block adds a signature under a key the block itself carries. So the
+/// chain verify in [`Cap::parse`] runs whichever verifier the token asks for, and it runs pre-trust, on a
+/// stranger's token, before the root is compared with any trusted one. Every token this crate mints,
+/// attenuates or seals names ed25519 next keys only and carries no external signature, so refusing the
+/// rest takes nothing from a legitimate holder and leaves ed25519 the one verifier a stranger can reach.
+/// It also shuts a revocation gap: a P-256 signature can be re-encoded by anyone who holds the token,
+/// which changes that block's revocation id, so a revocation aimed at a later block could be dodged.
+///
+/// The frame is decoded here because biscuit's parse exposes neither field until after it has verified
+/// the chain; the decode is a second pass over at most [`MAX_ENCODED_LEN`] bytes and does no crypto. A
+/// frame that does not decode is [`CapError::Unverified`], the same answer biscuit's own parse gives it.
+/// The key algorithm is compared as the raw wire integer, because prost's typed getter reads an unknown
+/// value as the default, which is ed25519.
+fn refuse_unminted_grammar(bytes: &[u8]) -> Result<(), CapError> {
+    let token = schema::Biscuit::decode(bytes).map_err(|_| CapError::Unverified)?;
+    let ed25519 = schema::public_key::Algorithm::Ed25519 as i32;
+    for block in core::iter::once(&token.authority).chain(&token.blocks) {
+        if block.external_signature.is_some() {
+            return Err(CapError::ExternalSignature);
+        }
+        if block.next_key.algorithm != ed25519 {
+            return Err(CapError::NotEd25519);
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a loaded-but-not-yet-evaluated token before it can ask for work no budget would interrupt.
@@ -1357,6 +1451,17 @@ pub enum CapError {
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
+    /// The token names a key that is not ed25519 (a P-256 next key), which this crate never mints.
+    /// Refused from the token's frame before any signature is checked, so a stranger cannot make the
+    /// pre-trust parse run a second signature verifier.
+    #[error("capability carries a key that is not ed25519")]
+    NotEd25519,
+    /// The token carries a block signed by a key outside its chain (a biscuit third-party block), which
+    /// this crate never mints. Refused from the token's frame before any signature is checked. Not the
+    /// same thing as delegation: a holder narrowing a cap with [`Cap::attenuate`] appends an ordinary
+    /// block, and that parses.
+    #[error("capability carries a block signed outside its chain")]
+    ExternalSignature,
     /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing or
     /// second separator, or anything written before the key), or a key that is not a well-formed
     /// [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified), a signature-chain failure, because a

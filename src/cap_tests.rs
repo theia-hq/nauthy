@@ -1359,3 +1359,127 @@ fn a_token_body_with_a_unicode_lookalike_is_refused() {
     let swapped = format!("{root}.{}", body.replacen(ascii, &lookalike.to_string(), 1));
     assert!(matches!(Cap::parse(&swapped), Err(CapError::Encoding)));
 }
+
+/// `cap`'s link text with its token moved under `other`'s key, so the chain no longer verifies.
+fn rerooted(cap: &Cap, other: VerifyKey) -> String {
+    let text = cap.link_text().expect("encode");
+    let (_, body) = text.split_once('.').expect("key.token");
+    format!("{other}.{body}")
+}
+
+#[test]
+fn a_p256_next_key_is_refused() {
+    let issuer = identity(1);
+    let minted = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    // Last in the chain (its next key checks the proof), mid-chain (it checks the ed25519 block a holder
+    // appended after it), and sealed (it checks the seal signature): every place a P-256 key can sit.
+    let last = minted
+        .attenuate_with_p256_next_key()
+        .expect("append a P-256 next key");
+    let mid = last
+        .attenuate(None, Some(at(600)))
+        .expect("narrow past the P-256 key");
+    let sealed = last.seal().expect("seal under the P-256 key");
+    for hostile in [&last, &mid, &sealed] {
+        let text = hostile.link_text().expect("encode");
+        // The inversion: biscuit alone verifies this chain, so the grammar refusal is what fails it.
+        assert!(
+            Cap::biscuit_alone_accepts(&text),
+            "biscuit accepts the P-256 chain"
+        );
+        assert!(matches!(Cap::parse(&text), Err(CapError::NotEd25519)));
+    }
+}
+
+#[test]
+fn an_externally_signed_block_is_refused() {
+    let issuer = identity(1);
+    let hostile = issuer
+        .mint(&service("ssh"), at(3600))
+        .expect("mint")
+        .attenuate_with_external_block()
+        .expect("append a third-party block");
+    let text = hostile.link_text().expect("encode");
+    // The inversion: biscuit alone verifies the chain and the external signature, so the grammar
+    // refusal is what fails it.
+    assert!(
+        Cap::biscuit_alone_accepts(&text),
+        "biscuit accepts the third-party block"
+    );
+    assert!(matches!(
+        Cap::parse(&text),
+        Err(CapError::ExternalSignature)
+    ));
+}
+
+#[test]
+fn the_grammar_refusal_precedes_the_signature_check() {
+    // Each hostile token moved under a key that never signed it: biscuit refuses it at the AUTHORITY
+    // signature, the first signature it checks. `Cap::parse` answers with the grammar refusal instead, so
+    // that refusal ran before any signature work, and a stranger's P-256 block never reaches a verifier.
+    let issuer = identity(1);
+    let stranger = identity(2).verifying_key();
+    let minted = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let p256 = rerooted(
+        &minted
+            .attenuate_with_p256_next_key()
+            .expect("append a P-256 next key"),
+        stranger,
+    );
+    let external = rerooted(
+        &minted
+            .attenuate_with_external_block()
+            .expect("append a third-party block"),
+        stranger,
+    );
+    for text in [&p256, &external] {
+        assert!(
+            !Cap::biscuit_alone_accepts(text),
+            "the chain does not verify under the stranger's key"
+        );
+    }
+    assert!(matches!(Cap::parse(&p256), Err(CapError::NotEd25519)));
+    assert!(matches!(
+        Cap::parse(&external),
+        Err(CapError::ExternalSignature)
+    ));
+    // And a minted token under the same wrong key is still a chain failure: the grammar check refuses
+    // what nauthy never mints, not every token that fails to verify.
+    assert!(matches!(
+        Cap::parse(&rerooted(&minted, stranger)),
+        Err(CapError::Unverified)
+    ));
+}
+
+#[test]
+fn every_minted_shape_parses() {
+    // The accepted grammar equals the minted one: every token this crate mints, narrows, or seals is
+    // inside the grammar `Cap::parse` checks before the chain verify.
+    let issuer = identity(1);
+    let device = identity(2).verifying_key();
+    let authority = identity(3).verifying_key();
+    let plain = issuer.mint(&service("ssh"), at(3600)).expect("mint");
+    let mut delegated = plain.clone();
+    for step in 1..16 {
+        delegated = delegated
+            .attenuate(Some(&service("ssh")), Some(at(3600 - step)))
+            .expect("narrow");
+    }
+    let shapes = [
+        plain.clone(),
+        plain.seal().expect("seal"),
+        delegated.seal().expect("seal a full chain"),
+        delegated,
+        issuer.mint_member(device, at(3600)).expect("mint member"),
+        issuer
+            .mint_bound(&service("ssh"), device, at(3600))
+            .expect("mint bound"),
+        issuer
+            .mint_authority_slip(&service("ssh"), authority, at(3600))
+            .expect("mint authority slip"),
+    ];
+    for cap in shapes {
+        let text = cap.link_text().expect("encode");
+        assert!(Cap::parse(&text).is_ok(), "a minted shape parses: {text}");
+    }
+}
