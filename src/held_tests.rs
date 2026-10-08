@@ -589,6 +589,71 @@ fn an_own_key_root_slip_presented_alone_admits_no_one() {
 }
 
 #[test]
+fn a_holder_appended_to_a_bearer_slip_names_no_one_presented() {
+    // Anyone holding a bearer slip can append a block with biscuit's own builder. A holder fact in that
+    // block must stay invisible: the slip still names no one, so the presented path rules on it as the
+    // bearer slip its issuer signed. Read as a device, it would name the appender; read as a root, it
+    // would refuse here; read as both, it would refuse as naming two holders.
+    let bearer = identity(OWN)
+        .mint(&ssh(), hour())
+        .expect("mint a bearer slip");
+    let gate = gate_issuing(Store::default(), &[&bearer], Swap::default());
+    let device = format!("device_bound(\"{}\");", key(STRANGER));
+    let authority = format!("authority_bound(\"{}\");", key(FRIEND));
+
+    for appended in [&device, &authority, &format!("{device}\n{authority}")] {
+        let slip = bearer
+            .attenuate_with_raw_datalog(appended)
+            .expect("append a holder fact");
+        let facts = slip.authority_facts().expect("read the authority block");
+        assert_eq!(facts.device, None, "{appended}");
+        assert_eq!(facts.authority, None, "{appended}");
+        for peer in [STRANGER, DEVICE] {
+            assert_eq!(
+                gate.admit(proven(peer), Some(&slip), &ssh()),
+                Decision::Admit,
+                "{appended}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_holder_appended_to_a_device_slip_does_not_rebind_it() {
+    // The binding check joins the dialer a verify injects to the holder the authority block names. A
+    // check there sees only that block's facts and the verifier's, so a holder appended in a later block
+    // never satisfies it, and neither does the injected fact's own name appended by hand.
+    let slip = device_slip(DEVICE, "ssh");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    for appended in [
+        format!("device_bound(\"{}\");", key(STRANGER)),
+        format!("bound_device(\"{}\");", key(STRANGER)),
+    ] {
+        let rebound = slip
+            .attenuate_with_raw_datalog(&appended)
+            .expect("append a holder fact");
+        assert_eq!(
+            rebound.authority_facts().expect("read").device,
+            Some(key(DEVICE).to_string()),
+            "{appended}"
+        );
+        assert_eq!(
+            gate.admit(proven(DEVICE), Some(&rebound), &ssh()),
+            Decision::Admit,
+            "the fixture admits the device the slip names: {appended}"
+        );
+        assert!(
+            matches!(
+                gate.admit_witnessed(proven(STRANGER), Some(&rebound), &ssh()),
+                Err(Refusal::NotGranted)
+            ),
+            "{appended}"
+        );
+    }
+}
+
+#[test]
 fn a_slip_naming_a_malformed_device_is_never_held() {
     let slip = identity(OWN)
         .mint_bound_naming(&ssh(), "not a key", hour())

@@ -113,8 +113,10 @@ pub(crate) const AUTHORIZER_LIMITS: AuthorizerLimits = AuthorizerLimits {
 const MAX_TOKEN_FACTS: usize = 16;
 
 /// The widest join a check body may ask for. Every check this crate emits joins ONE predicate
-/// (`check if service($s), $s == ...`) except the authority-bound slip's, which joins two
-/// (`check if authority_bound($x), foreign_member($x)`), so two is exactly the grammar and not a guess.
+/// (`check if service($s), $s == ...`) except the two holder checks, which join a holder fact to the fact
+/// a verify injects: the authority-bound slip's (`check if authority_bound($x), foreign_member($x)`) and
+/// the device-bound slip's (`check if device_bound($d), bound_device($d)`). So two is exactly the grammar
+/// and not a guess.
 ///
 /// With [`MAX_TOKEN_FACTS`] this is the whole structural guarantee: evaluation cost is `O(F^k)` in the
 /// fact count `F` and the body arity `k`, so bounding BOTH pins the worst case at `16^2` = 256 candidate
@@ -286,20 +288,21 @@ impl Identity {
     /// `bound_to`.
     ///
     /// The standing-access primitive for an outsider's single device. Like [`Identity::mint`] it grants a
-    /// named SERVICE (never `member`, so it is per-service access, never whole-node admission), but it
-    /// carries the same `check if bound_device` binding a membership badge does (see
-    /// [`Identity::mint_member`]). So a copy observed in flight and replayed from a DIFFERENT key verifies
-    /// against no one, and a slip presented with no proven dialer (`request.bound_device` is `None`) grants
-    /// nothing: theft-resistant, inert unless the presenter IS the bound device. It needs no new verify
-    /// path, [`Cap::verify_at_root_without_revocation`] already injects the proven dialer as `bound_device`,
-    /// so the binding check falls out of the existing service verification. Only the authority (this
+    /// named SERVICE (never `member`, so it is per-service access, never whole-node admission), but it is
+    /// bound to one device the way a membership badge is (see [`Identity::mint_member`]). So a copy
+    /// observed in flight and replayed from a DIFFERENT key verifies against no one, and a slip presented
+    /// with no proven dialer (`request.bound_device` is `None`) grants nothing: theft-resistant, inert
+    /// unless the presenter IS the bound device. It needs no new verify path,
+    /// [`Cap::verify_at_root_without_revocation`] already injects the proven dialer as `bound_device`, so
+    /// the binding check falls out of the existing service verification. Only the authority (this
     /// identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
     /// device-bound slip can never be widened into an unbound slip or a badge.
     ///
-    /// The device is also written as a `device_bound` AUTHORITY fact, the way
-    /// [`mint_authority_slip`](Self::mint_authority_slip) writes its foreign authority, so an issuer that
-    /// holds the slip itself reads its holder from what it signed (see
-    /// [`HeldSlip::verify`](crate::HeldSlip::verify)) and never from a record kept beside it.
+    /// The device is written ONCE, as a `device_bound` AUTHORITY fact, the way
+    /// [`mint_authority_slip`](Self::mint_authority_slip) writes its foreign authority, and the binding
+    /// check reads that fact. So an issuer that holds the slip itself reads its holder from what it signed
+    /// (see [`HeldSlip::verify`](crate::HeldSlip::verify)), never from a record kept beside it, and the
+    /// holder it reads is the holder the check enforces.
     pub fn mint_bound(
         &self,
         service: &Service,
@@ -310,15 +313,19 @@ impl Identity {
         //
         // The holder fact is `device_bound`, NEVER `bound_device`: that one is the fact a verify INJECTS
         // for the proven dialer, so an authority block carrying `bound_device(X)` would satisfy its own
-        // binding check for every presenter and turn the slip into a bearer one. No check reads
-        // `device_bound`; it is a statement of who the slip is for, and the check below still binds.
+        // binding check for every presenter and turn the slip into a bearer one.
+        //
+        // The binding check JOINS the two: it passes only when the injected dialer equals the holder this
+        // block names. The holder is stated once, so a reader of the fact and the check can never disagree
+        // about whom the slip is for. A check in the authority block sees only that block's facts and the
+        // verifier's, so a `device_bound` a holder appends in a later block never satisfies it.
         let token = biscuit!(
             r#"
             device_bound({bound});
             expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if bound_device($d), $d == {bound};
+            check if device_bound($d), bound_device($d);
             "#,
             service = service.as_str(),
             expiry = expiry,
@@ -915,7 +922,7 @@ impl Identity {
             expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if bound_device($d), $d == {bound};
+            check if device_bound($d), bound_device($d);
             "#,
             service = service.as_str(),
             expiry = expiry,
@@ -945,7 +952,7 @@ impl Identity {
             expires_at({advertised});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if bound_device($d), $d == {bound};
+            check if device_bound($d), bound_device($d);
             "#,
             service = service.as_str(),
             expiry = expiry,
@@ -962,7 +969,7 @@ impl Identity {
 
     /// Test-only: a device-bound slip whose `device_bound` fact names `named` verbatim, so a test can sign
     /// a holder that is not a well-formed key, which [`Identity::mint_bound`] cannot express because it
-    /// takes a typed [`VerifyKey`]. Its binding check names the same text.
+    /// takes a typed [`VerifyKey`]. Its binding check reads that fact, as the mint's does.
     pub(crate) fn mint_bound_naming(
         &self,
         service: &Service,
@@ -975,7 +982,7 @@ impl Identity {
             expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if bound_device($d), $d == {named};
+            check if device_bound($d), bound_device($d);
             "#,
             service = service.as_str(),
             expiry = expiry,
