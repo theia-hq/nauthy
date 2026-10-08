@@ -20,12 +20,12 @@ All notable changes to nauthy, newest first.
   `Denylist::for_repair` replaces `FileDenylist::empty` as the way back from `Lost`.
 
 ### Changed
-- **`Cap::parse` accepts only the tokens nauthy mints.** Before any signature is checked, it refuses a
-  token with more than 16 blocks (`CapError::TooLarge`), a P-256 next key (`CapError::NotEd25519`,
-  `capability carries a key that is not ed25519`), a biscuit third-party block
-  (`CapError::ExternalSignature`, `capability carries a block signed outside its chain`), or a key named
-  in a `trusting` scope (`CapError::TrustedKey`, `capability names a key for its checks to trust`).
-  Every token nauthy mints, narrows or seals still parses.
+- **`Cap::parse` refuses token shapes nauthy never mints, before checking any signature.** New
+  `CapError` variants: `NotEd25519` for a P-256 signing key (`capability carries a key that is not
+  ed25519`); `ExternalSignature` for a biscuit third-party block (`capability carries a block signed
+  outside its chain`); `TrustedKey` for a key named in a `trusting` scope (`capability names a key to
+  trust`). A token over 16 blocks (`TooLarge`) is now also refused before the signature check. Every
+  token nauthy mints, narrows or seals still parses.
 
 ### Fixed
 - **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh

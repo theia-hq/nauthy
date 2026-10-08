@@ -29,8 +29,8 @@
 //!   issuer still verifies the whole chain without ever seeing the delegation.
 //! - [`Identity::verify`] checks a presented cap against this identity for a [`Request`] (service + now).
 //!
-//! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes, is the grammar this
-//! crate mints (at most [`MAX_BLOCKS`] blocks, ed25519 next keys only, no externally signed block, no key
+//! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes, has a shape this
+//! crate mints (at most [`MAX_BLOCKS`] blocks, ed25519 signing keys only, no externally signed block, no key
 //! named for a check to trust), and whose signature chain checks against the embedded root. Whether it
 //! further *grants* a given request is answered by [`Identity::verify`], which returns the peer identity
 //! it is rooted at only when every check passes.
@@ -711,9 +711,9 @@ impl Cap {
     /// Decode a cap from its `<key>.<token>` link text.
     ///
     /// parse-don't-validate at the wire edge: rejects text that is not `<key>.<token>`, a malformed [`VerifyKey`], bad base32,
-    /// a token outside the grammar this crate mints (too many blocks, a next key that is not ed25519, a
-    /// block signed outside the chain, or a key named for a check to trust, all refused before any
-    /// signature is checked), or bytes whose signature chain does not check against the embedded root.
+    /// or bytes whose signature chain does not check against the embedded root. Before checking any
+    /// signature, it rejects a token shape this crate never mints: too many blocks, a signing key that is
+    /// not ed25519, a block signed outside the chain, or a check that names a key to trust.
     /// It does NOT evaluate the caveats (service, expiry); that is [`Identity::verify`]'s job at connect
     /// time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
@@ -1510,21 +1510,19 @@ pub enum CapError {
     /// The link body was not valid base32.
     #[error("invalid base32 in link")]
     Encoding,
-    /// The token names a key that is not ed25519 (a P-256 next key), which this crate never mints.
-    /// Refused from the token's frame before any signature is checked, so a stranger cannot make the
-    /// pre-trust parse run a second signature verifier.
+    /// A signing key in the token's chain is not ed25519 (a P-256 next key), which this crate never
+    /// mints. Refused before any signature is checked, so an untrusted peer cannot make the parse run a
+    /// P-256 verifier.
     #[error("capability carries a key that is not ed25519")]
     NotEd25519,
     /// The token carries a block signed by a key outside its chain (a biscuit third-party block), which
-    /// this crate never mints. Refused from the token's frame before any signature is checked. Not the
-    /// same thing as delegation: a holder narrowing a cap with [`Cap::attenuate`] appends an ordinary
-    /// block, and that parses.
+    /// this crate never mints. Refused before any signature is checked. Not the same thing as delegation:
+    /// a holder narrowing a cap with [`Cap::attenuate`] appends an ordinary block, and that parses.
     #[error("capability carries a block signed outside its chain")]
     ExternalSignature,
     /// The token's datalog names a key for a check to trust (`trusting <key>`), of any algorithm, which
-    /// this crate never mints. Refused from the token's frame before any signature is checked, and before
-    /// biscuit would decode each named key as a curve point.
-    #[error("capability names a key for its checks to trust")]
+    /// this crate never mints. Refused before any signature is checked.
+    #[error("capability names a key to trust")]
     TrustedKey,
     /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing or
     /// second separator, or anything written before the key), or a key that is not a well-formed
