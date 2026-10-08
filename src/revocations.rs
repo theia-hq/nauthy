@@ -84,6 +84,18 @@ pub trait Revocations {
     fn is_revoked_peer(&self, _peer: &VerifyKey) -> bool {
         false
     }
+
+    /// Whether a grant known only by its facts is revoked: any of its `ids` is recalled, or anything else
+    /// the store keys on, such as its `root`. The question [`is_revoked`](Self::is_revoked) asks of a cap,
+    /// for a grant whose cap is no longer held: an anchored gate asks it on every admission it makes on a
+    /// [`HeldSlip`](crate::HeldSlip), which keeps the slip's facts and not the slip.
+    ///
+    /// Provided, answering `true`, so a store that has not said how it answers refuses every held slip
+    /// rather than admitting one it may have revoked. An impl that answers it answers it exactly as it
+    /// answers `is_revoked` for a cap rooted at `root` whose chain is `ids`.
+    fn is_revoked_ids(&self, _root: &VerifyKey, _ids: &[RevocationId]) -> bool {
+        true
+    }
 }
 
 /// A shared store answers as the store it shares, so one instance can back a gate and any other reader
@@ -95,6 +107,10 @@ impl<R: Revocations + ?Sized> Revocations for Arc<R> {
 
     fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
         R::is_revoked_peer(self, peer)
+    }
+
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        R::is_revoked_ids(self, root, ids)
     }
 }
 
@@ -551,14 +567,19 @@ impl Revocations for Denylist {
     /// `Cap::parse` verified the whole chain against, so a cap cannot claim its way past this with a root
     /// it does not carry, and a revoked key refuses what it signs next as well as what it signed.
     fn is_revoked(&self, cap: &Cap) -> bool {
-        let (root, ids) = (cap.root(), cap.revocation_ids());
-        let state = self.refreshed();
-        state.held.keys.contains(&root) || ids.iter().any(|id| state.held.ids.contains(id))
+        self.is_revoked_ids(&cap.root(), &cap.revocation_ids())
     }
 
     /// The peer's key is held.
     fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
         self.is_revoked_key(peer)
+    }
+
+    /// Any of `ids` is held, or `root` is: one answer for a cap and for a grant known by its facts, so the
+    /// two can never disagree about the same chain.
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        let state = self.refreshed();
+        state.held.keys.contains(root) || ids.iter().any(|id| state.held.ids.contains(id))
     }
 }
 

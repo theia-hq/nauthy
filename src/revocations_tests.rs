@@ -184,6 +184,35 @@ fn a_revoked_id_and_a_revoked_key_each_refuse_on_their_own() {
     cleanup(&path);
 }
 
+#[test]
+fn a_denylist_answers_for_held_ids_as_it_answers_for_the_cap() {
+    // A held slip is asked about by its facts, its signer and its ids, with no cap to hand. The answer
+    // must be the one the cap itself gets, both ways, or a held slip outlives its revocation.
+    let path = scratch("held-ids");
+    let recalled = cap_rooted_at(2);
+    let clean = cap_rooted_at(3);
+    let denylist = Denylist::for_repair(path.clone());
+    denylist
+        .revoke(
+            &Held,
+            [
+                Revocation::Key(key(1)),
+                Revocation::Id(recalled.root_revocation_id().expect("an authority block")),
+            ],
+        )
+        .expect("revoke");
+
+    for cap in [cap_rooted_at(1), recalled, clean] {
+        assert_eq!(
+            denylist.is_revoked_ids(&cap.root(), &cap.revocation_ids()),
+            denylist.is_revoked(&cap),
+        );
+    }
+    assert!(!denylist.is_revoked_ids(&key(3), &[id(9)]), "neither");
+    assert!(denylist.is_revoked_ids(&key(1), &[id(9)]), "revoked root");
+    cleanup(&path);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_write_under_a_callers_guard_takes_no_lock() {
