@@ -33,8 +33,9 @@ All notable changes to nauthy, newest first.
   at the pin or the own key is admitted when this machine holds a slip its own key signed for that
   peer's key, or for a foreign authority whose badge the peer presents.
   - `HeldSlip::verify` checks a slip once and keeps its facts; `HeldSlipError` says why a slip cannot be
-    held. `HeldSlips` indexes them for one own key: `insert` hands back the slip it displaced, `retain`
-    drops slips, and `iter`, `len` and `is_empty` read it.
+    held. `HeldSlips` indexes them for one own key: `insert` hands back the slip it displaced and
+    refuses a slip verified under another key, `retain` drops slips, and `iter`, `len` and `is_empty`
+    read it.
   - The gate reads the index through a `HeldSource` on every admission that reaches it, and checks each
     slip's end and revocation there. To end a held slip, revoke its id.
   - A refusal reads the same whether a held slip is absent, revoked or ended.

@@ -59,9 +59,10 @@ impl HeldSlip {
     /// no one past that end.
     ///
     /// Refuses, in order:
-    /// - a membership badge, by what its issuer signed and however a holder narrowed it, and a slip whose
-    ///   facts cannot be read, which has not shown it is no badge, as [`Denied`](HeldSlipError::Denied)
-    ///   with its cause: the own key never makes a member, here as on the gate's own-key path;
+    /// - a membership badge, by what its issuer signed and however a holder narrowed it: the own key never
+    ///   makes a member, here as on the gate's own-key path;
+    /// - a slip whose facts cannot be read, as [`Denied`](HeldSlipError::Denied) with its cause, since it
+    ///   has not shown it is no badge;
     /// - a slip signed by any key but `own`;
     /// - a slip that names two holders;
     /// - a slip a holder narrowed (more than one block): a held slip is kept exactly as its issuer signed it;
@@ -230,8 +231,8 @@ impl HeldSlips {
 /// Asked on EVERY admission that reaches the held slips, a stranger's dial included, so `current` hands
 /// back an index already built: it reads no file and verifies nothing. An index swapped in while the gate
 /// is serving is read at the next connection, with no restart. `None` admits no one on a held slip: answer
-/// it until the first index is built and whenever the slips cannot be read. Never hand back an index from
-/// an earlier read.
+/// it until the first index is built, and whenever the slips cannot be read, rather than the last index
+/// built from them.
 pub trait HeldSource: Send + Sync {
     /// The held slips as they stand now, or `None` when there are none to read.
     fn current(&self) -> Option<Arc<HeldSlips>>;
@@ -501,9 +502,10 @@ pub enum HeldSlipError {
     /// The slip is a root slip naming the key that signed it as its foreign authority.
     #[error("slip names its own signer as its authority")]
     OwnRoot,
-    /// The slip's facts cannot be read, it did not verify for the service at the moment asked, or its end
-    /// cannot be read. The cause is the capability error; an [`Undecided`](CapError::Undecided) one means
-    /// the host ran out of time and the slip may verify when asked again.
+    /// The slip's facts cannot be read, its holder or authority is not a well-formed key, it did not
+    /// verify for the service at the moment asked, or its end cannot be read. The cause is the capability
+    /// error; an [`Undecided`](CapError::Undecided) one means the host ran out of time and the slip may
+    /// verify when asked again.
     #[error("slip does not verify")]
     Denied(#[source] CapError),
     /// A holder added a block to the slip. A held slip is kept exactly as its issuer signed it.

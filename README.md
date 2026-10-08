@@ -148,10 +148,11 @@ let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued, held);
 - A token rooted at `own` is admitted only as a service slip, and only when `issued` (an `IssuedIds`)
   holds its `root_revocation_id`. Record that id when you mint. A membership badge `own` signed is
   refused, and so is an authority-bound slip that names `own` as its authority.
-- `held` is a `HeldSource`: slips `own` signed that this machine keeps, so their holder need not present
-  them. A peer that presents no token rooted at the pin or `own` is admitted when `held` has a slip for
-  its proven key, or for a foreign authority whose badge it presents. Check each slip once with
-  `HeldSlip::verify` and index it in `HeldSlips`. To end a held slip, revoke its `id()`.
+- `held` is a `HeldSource`, which hands the gate the slips `own` signed and this machine keeps, so their
+  holder need not present them. A peer that presents no token rooted at the pin or `own` is admitted
+  when `held` has a slip for its proven key, or for a foreign authority whose badge it presents. Check
+  each slip once with `HeldSlip::verify` and index it in `HeldSlips`. To end a held slip, revoke its
+  `id()`.
 - A copy of the key alone cannot mint access: its slips carry ids `issued` never recorded. With write
   access to `issued` or to the slips behind `held`, it can, so keep the slips as write-protected as
   `issued`.

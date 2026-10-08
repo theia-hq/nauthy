@@ -705,7 +705,7 @@ impl Admitted {
     ///
     /// Record these facts, not the presented tokens, to cut the admission later: each slip's id, end and
     /// signer, and for a root slip the badge's root, ids and end. A peer admitted on a device slip
-    /// presented nothing, and one admitted on a root slip presented only its badge.
+    /// presented no token rooted here, and one admitted on a root slip presented only its badge.
     pub fn held(&self) -> Option<&HeldGrant> {
         self.held.as_ref()
     }
