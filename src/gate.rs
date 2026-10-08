@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::cap::{Cap, CapError, Request};
-use crate::held::{HeldBadge, HeldGrant, HeldSlip, HeldSource, OwnSlip};
+use crate::held::{HeldBadge, HeldGrant, HeldSlip, HeldSlipError, HeldSource, OwnSlip};
 use crate::revocations::{RevocationId, Revocations};
-use crate::{Holder, Service, VerifyKey};
+use crate::{Service, VerifyKey};
 
 /// An authorization policy over proven peer identities.
 ///
@@ -124,8 +124,8 @@ impl Gate {
     /// A peer that presents no token rooted at either authority is admitted on a held slip: a device slip
     /// for its proven key and the service, or else, when it presents a membership badge bound to it, a
     /// root slip for the authority that badge chains to. Either must be unended and unrevoked on this
-    /// admission. Any other peer is refused exactly as one that presented nothing granting, so a refusal
-    /// never tells a peer whether a held slip for it exists, was revoked, or ended.
+    /// admission. Any other peer is refused exactly as one that presented nothing granting, so no refusal
+    /// value tells a peer whether a held slip for it exists, was revoked, or ended.
     pub fn anchored(
         root: impl PinSource + 'static,
         own: VerifyKey,
@@ -154,6 +154,10 @@ impl Gate {
     /// [`Undecided`](Refusal::Undecided), which is not an answer about the peer. An authority-bound slip
     /// handed here correctly refuses [`NotGranted`](Refusal::NotGranted) (it is inert alone); the two-token
     /// AND is [`admit_foreign`](Gate::admit_foreign).
+    ///
+    /// A [`Decision`] carries no held grant: an anchored gate that admits on a [`HeldSlip`] drops what it
+    /// ruled on here. A caller that records admissions to cut them on a later revocation or end must admit
+    /// through [`admit_witnessed`](Gate::admit_witnessed) and record [`Admitted::held`].
     pub fn admit(&self, peer: ProvenPeer, presented: Option<&Cap>, service: &Service) -> Decision {
         match self {
             Gate::Open => Decision::Admit,
@@ -366,9 +370,17 @@ impl Gate {
     }
 }
 
+/// Which of an anchored gate's authorities a presented token roots at.
+enum TokenRoot {
+    /// The pin, as the gate read it for this admission.
+    Pin(VerifyKey),
+    /// This machine's own key.
+    Own,
+}
+
 /// Which of an anchored gate's authorities admitted a peer.
 enum Authority {
-    /// The pin, as the gate read it for this admission.
+    /// The pin, as the gate read it for this admission, on a token the peer presented.
     Pin(VerifyKey),
     /// This machine's own key, on a token the peer presented.
     Own,
@@ -384,18 +396,17 @@ impl Anchor {
     }
 
     /// Which authority `cap` roots at, against the pin read now, or `None` for a token rooted at neither.
-    /// Never [`Held`](Authority::Held): a held slip is never presented.
     ///
     /// The pin is asked first. Since [`pin`](Self::pin) is never the own key, the two answers cannot
     /// overlap, and a pin that did equal the own key would reach membership only through this order, which
     /// is why the filter is the guard.
-    fn authority_of(&self, cap: &Cap) -> Option<Authority> {
+    fn authority_of(&self, cap: &Cap) -> Option<TokenRoot> {
         let root = cap.root();
         if self.pin() == Some(root) {
-            return Some(Authority::Pin(root));
+            return Some(TokenRoot::Pin(root));
         }
         if root == self.own {
-            return Some(Authority::Own);
+            return Some(TokenRoot::Own);
         }
         None
     }
@@ -416,15 +427,17 @@ impl Anchor {
             return Err(Refusal::Revoked);
         }
         let rooted = presented.and_then(|cap| Some((cap, self.authority_of(cap)?)));
-        let Some((cap, authority)) = rooted else {
+        let Some((cap, root)) = rooted else {
             return self
                 .admit_held(presented, service, peer)
                 .map(Authority::Held);
         };
-        let decision = match authority {
-            Authority::Pin(pin) => admit_token(pin, revocations, cap, service, peer),
-            Authority::Own => self.admit_own(cap, service, peer),
-            Authority::Held(_) => Decision::Refuse(Refusal::NotGranted),
+        let (decision, authority) = match root {
+            TokenRoot::Pin(pin) => (
+                admit_token(pin, revocations, cap, service, peer),
+                Authority::Pin(pin),
+            ),
+            TokenRoot::Own => (self.admit_own(cap, service, peer), Authority::Own),
         };
         match decision {
             Decision::Admit => Ok(authority),
@@ -433,21 +446,17 @@ impl Anchor {
     }
 
     /// A token rooted at this machine's own key, on the plain path: ruled by the same code that verifies a
-    /// held slip ([`OwnSlip::rule`]), so never a membership badge however its holder narrowed it, a slip
-    /// for `service` bound to the peer when it names a device, inert when it names a foreign authority
-    /// (that is the two-token path), unrevoked on both reads, and recorded as issued.
+    /// held slip ([`OwnSlip`]), so never a membership badge however its holder narrowed it, a slip for
+    /// `service` bound to the peer, inert when it names a foreign authority (that is the two-token path),
+    /// unrevoked on both reads, and recorded as issued.
     fn admit_own(&self, cap: &Cap, service: &Service, peer: VerifyKey) -> Decision {
         let revocations = self.revocations.as_ref();
         // The first read, before any datalog, for the reason `admit_plain` gives.
         if revocations.is_revoked(cap) {
             return Decision::Refuse(Refusal::Revoked);
         }
-        let checked = match OwnSlip::rule(cap, self.own, service, SystemTime::now(), Some(peer)) {
-            Ok(OwnSlip {
-                holder: Some(Holder::Root(_)),
-                ..
-            }) => Checked::NotGranted,
-            Ok(OwnSlip { .. }) => Checked::Granted,
+        let checked = match OwnSlip::read(cap, self.own) {
+            Ok(slip) => slip.presented(service, SystemTime::now(), peer),
             Err(refused) => refused.checked(),
         };
         match checked.decide(revocations, cap) {
@@ -463,7 +472,7 @@ impl Anchor {
     /// Every way this fails is the refusal the peer would get for presenting nothing granting:
     /// [`Missing`](Refusal::Missing) when it presented nothing, [`NotGranted`](Refusal::NotGranted) when it
     /// presented a token rooted elsewhere. A slip absent, revoked, or ended reads the same, and so does a
-    /// badge that fails or is revoked, so no refusal says what this machine holds. Only a badge whose
+    /// badge that fails or is revoked, so no refusal value says what this machine holds. Only a badge whose
     /// evaluation ran out of time is [`Undecided`](Refusal::Undecided), which is about this host.
     fn admit_held(
         &self,
@@ -494,8 +503,12 @@ impl Anchor {
         let badge = match HeldBadge::verify(badge, peer, now) {
             Ok(_) if self.revocations.is_revoked(badge) => return Err(refusal),
             Ok(facts) => facts,
-            Err(Checked::Undecided) => return Err(Refusal::Undecided),
-            Err(Checked::Granted | Checked::NotGranted) => return Err(refusal),
+            Err(error) => {
+                return Err(match Checked::from(Err(error)) {
+                    Checked::Undecided => Refusal::Undecided,
+                    Checked::Granted | Checked::NotGranted => refusal,
+                });
+            }
         };
         match index
             .root_row(service, &badge.root())
@@ -517,8 +530,8 @@ impl Anchor {
     }
 
     /// The two-token path on an anchored gate. A slip rooted at the pin is ruled as a rooted gate rules it.
-    /// A slip rooted at the own key must also be no membership badge (see [`member_badge`]), may not name the own key as its authority, and
-    /// must be recorded as issued.
+    /// A slip rooted at the own key must also be no membership badge, may not name the own key as its
+    /// authority, and must be recorded as issued.
     fn admit_foreign(
         &self,
         slip: &Cap,
@@ -531,26 +544,20 @@ impl Anchor {
             return Decision::Refuse(Refusal::Revoked);
         }
         match self.authority_of(slip) {
-            Some(Authority::Pin(pin)) => verify_pair(pin, revocations, slip, badge, service, peer),
-            Some(Authority::Own) => {
-                // Ruled by the same code that verifies a held slip ([`OwnSlip::rule`]), which refuses a
+            Some(TokenRoot::Pin(pin)) => verify_pair(pin, revocations, slip, badge, service, peer),
+            Some(TokenRoot::Own) => {
+                // Ruled by the same code that verifies a held slip ([`OwnSlip`]), which refuses a
                 // membership badge and a slip naming the own key as its authority before the badge is
                 // read: that authority would let anyone holding a copy of the key badge any key they like.
-                let authority =
-                    match OwnSlip::rule(slip, self.own, service, SystemTime::now(), Some(peer)) {
-                        Ok(OwnSlip {
-                            holder: Some(Holder::Root(authority)),
-                            ..
-                        }) => Ok(authority),
-                        Ok(OwnSlip { .. }) => Err(Checked::NotGranted),
-                        Err(refused) => Err(refused.checked()),
-                    };
+                let authority = OwnSlip::read(slip, self.own)
+                    .map_err(HeldSlipError::checked)
+                    .and_then(|read| read.foreign(service, SystemTime::now(), peer));
                 match verify_badge(authority, revocations, slip, badge, peer) {
                     Decision::Admit => self.recorded(slip),
                     refused => refused,
                 }
             }
-            Some(Authority::Held(_)) | None => Decision::Refuse(Refusal::NotGranted),
+            None => Decision::Refuse(Refusal::NotGranted),
         }
     }
 
@@ -952,25 +959,6 @@ fn revoked_or_admit(revocations: &dyn Revocations, cap: &Cap) -> Decision {
 /// Whole-node.
 fn membership(cap: &Cap, root: VerifyKey, peer: VerifyKey) -> Checked {
     Checked::from(cap.verify_member_at_root_without_revocation(SystemTime::now(), peer, root))
-}
-
-/// Whether `cap` is a membership badge by what its issuer signed, for a path that must never admit one:
-/// [`Granted`](Checked::Granted) when its authority block carries `member(true)`, whatever the peer, the
-/// time, or any block a holder added.
-///
-/// Not [`membership`]: that asks whether the badge admits `peer` now, with no `service` fact, so a holder
-/// who narrows a badge to one service makes it answer "no" there while it still grants that service. A read
-/// that failed cleanly has not shown the cap is no badge, so it reads as one; one that ran out of budget
-/// stays [`Undecided`](Checked::Undecided).
-pub(crate) fn member_badge(cap: &Cap) -> Checked {
-    match cap.is_member_badge() {
-        Ok(true) => Checked::Granted,
-        Ok(false) => Checked::NotGranted,
-        Err(error) => match Checked::from(Err(error)) {
-            Checked::Undecided => Checked::Undecided,
-            Checked::Granted | Checked::NotGranted => Checked::Granted,
-        },
-    }
 }
 
 /// The kind an admission on the plain path carries, for a token rooted at `root`: `Member` for a membership

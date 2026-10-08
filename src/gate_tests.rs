@@ -595,8 +595,8 @@ struct DisabledMidEvaluation {
 }
 
 impl crate::revocations::Revocations for DisabledMidEvaluation {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        if cap.root() != self.root {
+    fn is_revoked_ids(&self, root: &VerifyKey, _ids: &[RevocationId]) -> bool {
+        if *root != self.root {
             return false;
         }
         self.asked
@@ -718,7 +718,7 @@ impl RevokedKey {
 }
 
 impl crate::revocations::Revocations for RevokedKey {
-    fn is_revoked(&self, _cap: &Cap) -> bool {
+    fn is_revoked_ids(&self, _root: &VerifyKey, _ids: &[RevocationId]) -> bool {
         self.caps_asked
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         false
@@ -923,8 +923,8 @@ impl HeldSource for HoldsNothing {
 struct RecalledIds(Vec<RevocationId>);
 
 impl crate::revocations::Revocations for RecalledIds {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        cap.revocation_ids().iter().any(|id| self.0.contains(id))
+    fn is_revoked_ids(&self, _root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        ids.iter().any(|id| self.0.contains(id))
     }
 }
 
@@ -1061,11 +1061,12 @@ fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
     let appended = slip
         .attenuate_with_raw_datalog("member(true);")
         .expect("append a fact");
-    assert!(!appended.is_member_badge().expect("read"));
+    assert!(!appended.authority_facts().expect("read").member);
     assert!(
         bound_badge(OWN, some_peer())
-            .is_member_badge()
+            .authority_facts()
             .expect("read")
+            .member
     );
     let gate = anchored_gate(Some(PIN), &[&slip]);
     assert_eq!(
@@ -1078,7 +1079,7 @@ fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
 fn an_undecided_membership_refuses_the_own_key_path_as_undecided() {
     // The own-key path refuses a member cap, so a membership question that never finished cannot let the
     // cap through to the slip check: it may be a member. It is refused, and as `Undecided`, since nothing
-    // was decided about the holder. `OwnSlip::rule` reads an undecided membership as an undecided denial.
+    // was decided about the holder. `OwnSlip::read` reads an undecided membership as an undecided denial.
     let store = RecalledIds(Vec::new());
     let cap = slip(OWN, "ssh");
     assert_eq!(

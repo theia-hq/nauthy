@@ -139,7 +139,7 @@ the key to record if you cut live sessions on a later revocation.
 beside the root it trusts:
 
 ```rust
-let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued);
+let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued, held);
 ```
 
 - `pin` is a `PinSource`, asked on every admission, so a root written while the gate serves is trusted at

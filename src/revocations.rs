@@ -65,10 +65,23 @@ use crate::stamp::{FileStamp, STAT_DEBOUNCE};
 /// an impl must answer for a cap rooted at an authority it did not issue. Answering `true` there can only
 /// refuse, never admit: the oracle is deny-only.
 pub trait Revocations {
-    /// Whether a presented cap is revoked: any id in its chain (the cap's own blocks, including any it
-    /// inherited from the grant it was attenuated from) is recalled, or anything else the store keys on,
-    /// such as the cap's [`root`](Cap::root). See [`Cap::revocation_ids`].
-    fn is_revoked(&self, cap: &Cap) -> bool;
+    /// Whether a grant rooted at `root` whose chain is `ids` is revoked: any of `ids` is recalled, or
+    /// `root` is, or anything else the store keys on about them.
+    ///
+    /// The one question a store answers. A presented cap is asked through
+    /// [`is_revoked`](Self::is_revoked), with its [`root`](Cap::root) and its whole chain
+    /// ([`Cap::revocation_ids`]: its own blocks, and any it inherited from the grant it was narrowed
+    /// from). A [`HeldSlip`](crate::HeldSlip), which keeps a slip's facts and not the slip, is asked with
+    /// its signer and its id. Both reach this method, so a cap and a slip known by its facts can never
+    /// get two answers about one chain.
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool;
+
+    /// Whether a presented cap is revoked: [`is_revoked_ids`](Self::is_revoked_ids) of its
+    /// [`root`](Cap::root) and its chain. Provided, and an impl does not override it: answering a cap
+    /// differently from its facts is the drift this shape exists to rule out.
+    fn is_revoked(&self, cap: &Cap) -> bool {
+        self.is_revoked_ids(&cap.root(), &cap.revocation_ids())
+    }
 
     /// Whether the proven peer's own key is revoked: a device key recalled as a key, not through any cap
     /// it carries. A [`Gate::Rooted`](crate::Gate::Rooted) and a [`Gate::Anchored`](crate::Gate::Anchored)
@@ -79,38 +92,22 @@ pub trait Revocations {
     /// so a revoked key gets no witness that presents nothing.
     ///
     /// Provided, answering `false`: a store that keeps no keys keeps the default. A wrapper that holds a
-    /// store must forward this as well as [`is_revoked`](Self::is_revoked), because a provided method a
-    /// wrapper does not write answers the default, not the inner store.
+    /// store must forward this as well as [`is_revoked_ids`](Self::is_revoked_ids), because a provided
+    /// method a wrapper does not write answers the default, not the inner store.
     fn is_revoked_peer(&self, _peer: &VerifyKey) -> bool {
         false
-    }
-
-    /// Whether a grant known only by its facts is revoked: any of its `ids` is recalled, or anything else
-    /// the store keys on, such as its `root`. The question [`is_revoked`](Self::is_revoked) asks of a cap,
-    /// for a grant whose cap is no longer held: an anchored gate asks it on every admission it makes on a
-    /// [`HeldSlip`](crate::HeldSlip), which keeps the slip's facts and not the slip.
-    ///
-    /// Provided, answering `true`, so a store that has not said how it answers refuses every held slip
-    /// rather than admitting one it may have revoked. An impl that answers it answers it exactly as it
-    /// answers `is_revoked` for a cap rooted at `root` whose chain is `ids`.
-    fn is_revoked_ids(&self, _root: &VerifyKey, _ids: &[RevocationId]) -> bool {
-        true
     }
 }
 
 /// A shared store answers as the store it shares, so one instance can back a gate and any other reader
 /// that must agree with it, rather than two instances over one file drifting by a refresh.
 impl<R: Revocations + ?Sized> Revocations for Arc<R> {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        R::is_revoked(self, cap)
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        R::is_revoked_ids(self, root, ids)
     }
 
     fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
         R::is_revoked_peer(self, peer)
-    }
-
-    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
-        R::is_revoked_ids(self, root, ids)
     }
 }
 
@@ -563,23 +560,17 @@ impl Denylist {
 
 #[cfg(feature = "fs")]
 impl Revocations for Denylist {
-    /// Any id in the cap's chain is held, or the cap's [`root`](Cap::root) key is. The root is the key
-    /// `Cap::parse` verified the whole chain against, so a cap cannot claim its way past this with a root
-    /// it does not carry, and a revoked key refuses what it signs next as well as what it signed.
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        self.is_revoked_ids(&cap.root(), &cap.revocation_ids())
+    /// Any of `ids` is held, or `root` is. For a cap the root is the key `Cap::parse` verified the whole
+    /// chain against, so a cap cannot claim its way past this with a root it does not carry, and a revoked
+    /// key refuses what it signs next as well as what it signed.
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        let state = self.refreshed();
+        state.held.keys.contains(root) || ids.iter().any(|id| state.held.ids.contains(id))
     }
 
     /// The peer's key is held.
     fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
         self.is_revoked_key(peer)
-    }
-
-    /// Any of `ids` is held, or `root` is: one answer for a cap and for a grant known by its facts, so the
-    /// two can never disagree about the same chain.
-    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
-        let state = self.refreshed();
-        state.held.keys.contains(root) || ids.iter().any(|id| state.held.ids.contains(id))
     }
 }
 

@@ -126,17 +126,13 @@ impl Store {
 }
 
 impl Revocations for Store {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        self.is_revoked_ids(&cap.root(), &cap.revocation_ids())
+    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        let recalled = self.0.lock().expect("store lock");
+        recalled.keys.contains(root) || ids.iter().any(|id| recalled.ids.contains(id))
     }
 
     fn is_revoked_peer(&self, peer: &VerifyKey) -> bool {
         self.0.lock().expect("store lock").keys.contains(peer)
-    }
-
-    fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool {
-        let recalled = self.0.lock().expect("store lock");
-        recalled.keys.contains(root) || ids.iter().any(|id| recalled.ids.contains(id))
     }
 }
 
@@ -431,7 +427,10 @@ fn a_revoked_held_slip_is_refused_with_no_reload() {
     // Written beside the slips, never into them: the index the gate holds is the one it held before.
     store.revoke_id(slip.root_revocation_id().expect("a slip has an id"));
 
-    assert!(gate.admit_witnessed(proven(DEVICE), None, &ssh()).is_err());
+    assert!(matches!(
+        gate.admit_witnessed(proven(DEVICE), None, &ssh()),
+        Err(Refusal::Missing)
+    ));
 }
 
 #[test]
@@ -511,9 +510,25 @@ fn the_held_end_is_the_signed_end() {
 
 #[test]
 fn the_gates_own_key_slip_path_calls_the_held_verify() {
-    // A clock bound past what a `SystemTime` can hold passes the datalog, so a path that asked only the
-    // datalog would admit this slip. The held verify cannot read its end and refuses it, and the gate's
-    // own-key path, ruling through the same code, refuses it presented.
+    // A slip naming two holders carries no binding check, so its datalog grants whoever presents it, and
+    // a path that asked only the datalog would admit it. The held verify refuses two holders, and the
+    // gate's own-key path, ruling through the same code, refuses it presented and recorded.
+    let slip = identity(OWN)
+        .mint_naming_two_holders(&ssh(), key(DEVICE), key(FRIEND), hour())
+        .expect("sign the slip");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    assert!(matches!(held(&slip, "ssh"), Err(HeldSlipError::TwoHolders)));
+    assert!(matches!(
+        gate.admit_witnessed(proven(DEVICE), Some(&slip), &ssh()),
+        Err(Refusal::NotGranted)
+    ));
+}
+
+#[test]
+fn an_own_key_slip_whose_end_cannot_be_read_is_refused_presented() {
+    // A clock bound past what a `SystemTime` can hold passes the datalog. Its end cannot be read, so the
+    // gate refuses it presented, as whatever cuts the admission at its end would.
     let slip = device_slip(DEVICE, "ssh");
     let far = slip
         .attenuate_with_raw_clock_bound(u64::MAX)
@@ -529,9 +544,59 @@ fn the_gates_own_key_slip_path_calls_the_held_verify() {
         gate.admit_witnessed(proven(DEVICE), Some(&far), &ssh()),
         Err(Refusal::NotGranted)
     ));
+}
+
+#[test]
+fn an_own_key_device_slip_presented_by_another_key_admits_no_one() {
+    // A device slip is share material: a copy reaches anyone. Presented, it is bound to whoever presents
+    // it, and its own binding check admits only the device it names.
+    let slip = device_slip(DEVICE, "ssh");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    assert!(
+        gate.admit_witnessed(proven(DEVICE), Some(&slip), &ssh())
+            .is_ok(),
+        "the fixture admits the device the slip names"
+    );
     assert!(matches!(
-        held(&far, "ssh"),
-        Err(HeldSlipError::Denied(CapError::UnreadableExpiry))
+        gate.admit_witnessed(proven(STRANGER), Some(&slip), &ssh()),
+        Err(Refusal::NotGranted)
+    ));
+    assert_eq!(
+        gate.admit(proven(STRANGER), Some(&slip), &ssh()),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+}
+
+#[test]
+fn an_own_key_root_slip_presented_alone_admits_no_one() {
+    // A root slip admits only beside a badge under the authority it names. Presented alone it admits no
+    // one, recorded or not, whoever presents it.
+    let slip = root_slip(FRIEND, "ssh");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    assert_eq!(
+        gate.admit_foreign(proven(DEVICE), &slip, &badge(FRIEND, DEVICE), &ssh()),
+        Decision::Admit,
+        "the fixture admits the slip beside a badge under its authority"
+    );
+    for peer in [DEVICE, FRIEND, STRANGER] {
+        assert!(matches!(
+            gate.admit_witnessed(proven(peer), Some(&slip), &ssh()),
+            Err(Refusal::NotGranted)
+        ));
+    }
+}
+
+#[test]
+fn a_slip_naming_a_malformed_device_is_never_held() {
+    let slip = identity(OWN)
+        .mint_bound_naming(&ssh(), "not a key", hour())
+        .expect("sign the slip");
+
+    assert!(matches!(
+        held(&slip, "ssh"),
+        Err(HeldSlipError::Denied(CapError::MalformedAuthority))
     ));
 }
 
@@ -574,15 +639,19 @@ fn a_slip_naming_two_holders_is_never_held() {
 }
 
 #[test]
-fn the_slip_held_last_for_a_key_and_service_governs() {
+fn a_second_slip_for_a_key_and_service_displaces_the_first_and_hands_it_back() {
+    // The index keeps the last slip inserted for a holder and service, and returns the one it displaced,
+    // which still verifies: only revoking it ends it.
     let earlier = device_slip(DEVICE, "ssh");
     let later = identity(OWN)
         .mint_bound(&ssh(), key(DEVICE), ago(60))
         .expect("mint a slip that has ended");
     let mut index = index(&[&earlier], "ssh");
-    index
+    let displaced = index
         .insert(HeldSlip::verify(&later, &ssh(), ago(120), key(OWN)).expect("it granted then"))
-        .expect("verified under the index's key");
+        .expect("verified under the index's key")
+        .expect("the earlier slip is displaced");
+    assert_eq!(Some(displaced.id()), earlier.root_revocation_id().as_ref());
     assert_eq!(index.len(), 1);
     let gate = gate(Store::default(), Swap::holding(index));
 
@@ -625,26 +694,45 @@ fn a_device_slip_admits_beside_a_foreign_badge() {
     assert!(grant.badge().is_none());
 }
 
-/// A store that keeps ids but never says how it answers for a held slip's facts.
-struct CapsOnly;
+#[test]
+fn a_device_slip_admits_beside_a_revoked_or_misbound_foreign_badge() {
+    // The peer would be admitted presenting nothing, so a foreign badge beside it, revoked or bound to
+    // another device, neither refuses it nor rides on the grant.
+    let revoked = badge(FRIEND, DEVICE);
+    let misbound = badge(FRIEND, STRANGER);
+    let store = Store::default();
+    store.revoke_id(revoked.root_revocation_id().expect("a badge has an id"));
+    let gate = gate(
+        store,
+        Swap::holding(index(&[&device_slip(DEVICE, "ssh")], "ssh")),
+    );
 
-impl Revocations for CapsOnly {
-    fn is_revoked(&self, _cap: &Cap) -> bool {
-        false
+    for presented in [&revoked, &misbound] {
+        let admitted = gate
+            .admit_witnessed(proven(DEVICE), Some(presented), &ssh())
+            .expect("the device slip admits");
+        let grant = admitted.held().expect("a held admission carries its grant");
+        assert_eq!(grant.slips().len(), 1);
+        assert!(grant.badge().is_none());
     }
 }
 
 #[test]
-fn a_store_that_does_not_answer_for_held_ids_refuses_every_held_slip() {
-    let gate = gate(
-        CapsOnly,
-        Swap::holding(index(&[&device_slip(DEVICE, "ssh")], "ssh")),
-    );
+fn an_index_lists_every_slip_it_holds() {
+    let device = device_slip(DEVICE, "ssh");
+    let root = root_slip(FRIEND, "web");
+    let mut index = index(&[&device], "ssh");
+    index
+        .insert(held(&root, "web").expect("a slip this machine holds"))
+        .expect("verified under the index's key");
 
-    assert!(matches!(
-        gate.admit_witnessed(proven(DEVICE), None, &ssh()),
-        Err(Refusal::Missing)
-    ));
+    let ids: HashSet<_> = index.iter().map(|slip| slip.id().clone()).collect();
+    let expected: HashSet<_> = [&device, &root]
+        .iter()
+        .filter_map(|slip| slip.root_revocation_id())
+        .collect();
+    assert_eq!(index.iter().count(), 2);
+    assert_eq!(ids, expected);
 }
 
 #[test]
@@ -659,5 +747,8 @@ fn an_arc_forwards_is_revoked_ids() {
 
     store.revoke_id(slip.root_revocation_id().expect("a slip has an id"));
 
-    assert!(gate.admit_witnessed(proven(DEVICE), None, &ssh()).is_err());
+    assert!(matches!(
+        gate.admit_witnessed(proven(DEVICE), None, &ssh()),
+        Err(Refusal::Missing)
+    ));
 }

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::cap::{Cap, CapError, Request};
-use crate::gate::{Checked, member_badge};
+use crate::gate::Checked;
 use crate::revocations::RevocationId;
 use crate::{Service, VerifyKey};
 
@@ -27,6 +27,7 @@ use crate::{Service, VerifyKey};
 /// and [`Identity::mint_authority_slip`](crate::Identity::mint_authority_slip)), never from a record kept
 /// beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Holder {
     /// The proven device whose key this is.
     Device(VerifyKey),
@@ -58,13 +59,13 @@ impl HeldSlip {
     ///   makes a member, here as on the gate's own-key path;
     /// - a slip signed by any key but `own`;
     /// - a slip whose holder facts cannot be read, or that names two holders;
-    /// - a root slip naming `own` itself as its authority, since anyone holding a copy of that key could
-    ///   badge any device under it;
+    /// - a slip a holder narrowed (more than one block), and a bearer slip that names no holder: neither
+    ///   is a grant this machine signed for one holder to keep;
+    /// - a slip whose holder is not a well-formed key, and a root slip naming `own` itself as its
+    ///   authority, since anyone holding a copy of that key could badge any device under it;
     /// - a slip that does not grant `service` to its own holder at `now` (the wrong service, ended, or a
     ///   device binding that disagrees with the device it names);
-    /// - a slip whose end cannot be read;
-    /// - a slip a holder narrowed (more than one block), a bearer slip that names no holder, and a slip
-    ///   that never ends: none is a grant this machine signed for one holder to keep.
+    /// - a slip whose end cannot be read, and one that never ends.
     ///
     /// The checks that settle what a valid own-key slip is are the ones the gate's own-key path runs on a
     /// presented slip, through the same code, so the two cannot drift. The holder is the slip's own
@@ -76,12 +77,12 @@ impl HeldSlip {
         now: SystemTime,
         own: VerifyKey,
     ) -> Result<Self, HeldSlipError> {
-        let OwnSlip { holder, until } = OwnSlip::rule(slip, own, service, now, None)?;
+        let read = OwnSlip::read(slip, own)?;
+        // An integer read, so it runs before anything evaluates the slip as a grant.
         if slip.block_count() != 1 {
             return Err(HeldSlipError::Narrowed);
         }
-        let holder = holder.ok_or(HeldSlipError::Bearer)?;
-        let until = until.ok_or(HeldSlipError::Endless)?;
+        let (holder, until) = read.held(service, now)?;
         let id = slip.root_revocation_id().ok_or(HeldSlipError::NoId)?;
         Ok(Self {
             holder,
@@ -126,8 +127,10 @@ impl HeldSlip {
 /// feeds it the slips it keeps, and hands it to the gate whole through a [`HeldSource`], so a rebuild
 /// never stalls an admission and a gate never reads a half-built index.
 ///
-/// One slip per holder and service: a later slip for the same holder and service replaces the earlier
-/// one, so the slip inserted last is the one that governs new admissions.
+/// It holds one slip per holder and service, and does not choose between two: inserting a second one
+/// displaces the first and hands it back. A displaced slip still verifies, and it governs any index built
+/// without the later one, so leaving a slip out of an index does not end it. Revoking its
+/// [`id`](HeldSlip::id) does.
 #[derive(Debug, Clone)]
 pub struct HeldSlips {
     own: VerifyKey,
@@ -157,9 +160,10 @@ impl HeldSlips {
         self.own
     }
 
-    /// Hold `slip`, replacing any slip held for the same holder and service. Refuses a slip verified under
-    /// a key other than this index's as [`OtherKey`](HeldSlipError::OtherKey).
-    pub fn insert(&mut self, slip: HeldSlip) -> Result<(), HeldSlipError> {
+    /// Hold `slip`, returning the slip it displaced for the same holder and service, if any, as
+    /// [`HashMap::insert`] does, so a caller never loses one without seeing it. Refuses a slip verified
+    /// under a key other than this index's as [`OtherKey`](HeldSlipError::OtherKey).
+    pub fn insert(&mut self, slip: HeldSlip) -> Result<Option<HeldSlip>, HeldSlipError> {
         if slip.anchor != self.own {
             return Err(HeldSlipError::OtherKey);
         }
@@ -168,8 +172,16 @@ impl HeldSlips {
             Holder::Device(device) => (&mut rows.devices, device),
             Holder::Root(root) => (&mut rows.roots, root),
         };
-        by_key.insert(key, slip);
-        Ok(())
+        Ok(by_key.insert(key, slip))
+    }
+
+    /// Every slip held, in no order: how a consumer asks which of its slips the index already holds, by
+    /// [`id`](HeldSlip::id), before it verifies the rest. Read-only, so [`HeldSlip::verify`] stays the
+    /// only way a slip enters.
+    pub fn iter(&self) -> impl Iterator<Item = &HeldSlip> {
+        self.services
+            .values()
+            .flat_map(|rows| rows.devices.values().chain(rows.roots.values()))
     }
 
     /// Keep only the slips `keep` answers `true` for: how a consumer carries verified slips into a rebuilt
@@ -273,19 +285,14 @@ pub struct HeldBadge {
 }
 
 impl HeldBadge {
-    /// The facts of `badge`, verified for `peer` at `now` under its own root, or the answer that refused
+    /// The facts of `badge`, verified for `peer` at `now` under its own root, or the error that refused
     /// it. Verified at the root it chains to before any held slip is looked up, so a badge under an
     /// authority this machine holds a slip for and one under any other cost the same to refuse.
-    pub(crate) fn verify(badge: &Cap, peer: VerifyKey, now: SystemTime) -> Result<Self, Checked> {
+    pub(crate) fn verify(badge: &Cap, peer: VerifyKey, now: SystemTime) -> Result<Self, CapError> {
         let root = badge.root();
-        match Checked::from(badge.verify_member_at_root_without_revocation(now, peer, root)) {
-            Checked::Granted => {}
-            refused => return Err(refused),
-        }
+        badge.verify_member_at_root_without_revocation(now, peer, root)?;
         // A badge whose end cannot be read is ended: whatever records the admission could not say when.
-        let until = badge
-            .valid_until()
-            .map_err(|error| Checked::from(Err(error)))?;
+        let until = badge.valid_until()?;
         Ok(Self {
             root,
             ids: badge.revocation_ids(),
@@ -309,78 +316,171 @@ impl HeldBadge {
     }
 }
 
-/// What this machine's own key signed a slip to grant: the holder its facts name (`None` for a bearer
-/// slip) and the earliest end any of its checks sets (`None` when none reads the clock).
+/// A slip rooted at this machine's own key, read once: whom its authority block names, before anything
+/// verifies it as a grant.
 ///
-/// The one ruling on what a valid own-key slip is. [`HeldSlip::verify`] calls it, and so does the gate's
-/// own-key path for a presented slip, so the two cannot disagree about a slip both would rule on.
-pub(crate) struct OwnSlip {
-    pub(crate) holder: Option<Holder>,
-    pub(crate) until: Option<SystemTime>,
+/// The one ruling on what a valid own-key slip is. [`HeldSlip::verify`], the gate's plain own-key path
+/// and its two-token own-key path each start from [`read`](Self::read) and finish through the same
+/// verify, so no two of them can disagree about a slip both would rule on. They differ only in whom the
+/// slip must admit: the holder it names, the peer presenting it, or the members of the authority it names.
+pub(crate) struct OwnSlip<'a> {
+    slip: &'a Cap,
+    own: VerifyKey,
+    holder: Named,
+    until: Result<Option<SystemTime>, CapError>,
 }
 
-impl OwnSlip {
-    /// Rule on `slip` as a grant `own` signed for `service` at `now`. `presenter` is the proven peer
-    /// presenting it, or `None` for a slip this machine holds, which is bound to the holder it names.
-    pub(crate) fn rule(
-        slip: &Cap,
-        own: VerifyKey,
-        service: &Service,
-        now: SystemTime,
-        presenter: Option<VerifyKey>,
-    ) -> Result<Self, HeldSlipError> {
+/// The holder a slip's authority block names, as the text its issuer signed. Parsed only by a path that
+/// uses the key.
+enum Named {
+    Device(String),
+    Root(String),
+    Nobody,
+}
+
+impl<'a> OwnSlip<'a> {
+    /// Read `slip` as a grant `own` signed: refused as a membership badge, as another key's, or as naming
+    /// two holders. One pass over the slip's authority block (see [`Cap::authority_facts`]).
+    pub(crate) fn read(slip: &'a Cap, own: VerifyKey) -> Result<Self, HeldSlipError> {
         // First, before anything reads the slip as a grant: the own key never makes a member, and a badge
-        // its holder narrowed to one service is still a badge (see `member_badge`).
-        match member_badge(slip) {
-            Checked::NotGranted => {}
-            Checked::Granted => return Err(HeldSlipError::MemberBadge),
-            Checked::Undecided => return Err(HeldSlipError::Denied(CapError::Undecided)),
-        }
+        // its holder narrowed to one service is still a badge. A read that failed cleanly has not shown the
+        // slip is no badge, so it reads as one; one that ran out of budget is not decided.
+        let facts = match slip.authority_facts() {
+            Ok(facts) if facts.member => return Err(HeldSlipError::MemberBadge),
+            Ok(facts) => facts,
+            Err(error) => {
+                return Err(match Checked::from(Err(error)) {
+                    Checked::Undecided => HeldSlipError::Denied(CapError::Undecided),
+                    Checked::Granted | Checked::NotGranted => HeldSlipError::MemberBadge,
+                });
+            }
+        };
         if slip.root() != own {
             return Err(HeldSlipError::OtherKey);
         }
-        let holder = holder_of(slip)?;
-        let mut request = Request {
+        // Two holders are refused: no mint writes both, and either reading would be a guess.
+        let holder = match (facts.device, facts.authority) {
+            (Some(device), None) => Named::Device(device),
+            (None, Some(root)) => Named::Root(root),
+            (None, None) => Named::Nobody,
+            (Some(_), Some(_)) => return Err(HeldSlipError::TwoHolders),
+        };
+        Ok(Self {
+            slip,
+            own,
+            holder,
+            until: facts.until,
+        })
+    }
+
+    /// Rule on the slip as one this machine holds for `service` at `now`: bound to the device it names, or
+    /// admitting the members of the foreign authority it names. Returns its holder and its signed end.
+    pub(crate) fn held(
+        self,
+        service: &Service,
+        now: SystemTime,
+    ) -> Result<(Holder, SystemTime), HeldSlipError> {
+        let (holder, bound_device, authority) = match &self.holder {
+            Named::Device(device) => {
+                let device = parse_holder(device)?;
+                (Holder::Device(device), Some(device), None)
+            }
+            Named::Root(root) => {
+                let root = self.authority(root)?;
+                (Holder::Root(root), None, Some(root))
+            }
+            Named::Nobody => return Err(HeldSlipError::Bearer),
+        };
+        let request = Request {
             service: Service::clone(service),
             now,
-            bound_device: presenter,
+            bound_device,
         };
-        match holder {
-            Some(Holder::Root(authority)) if authority == own => {
-                return Err(HeldSlipError::OwnRoot);
-            }
-            Some(Holder::Root(_)) => {
-                slip.verify_authority_bound_at_root_without_revocation(&request, own)
-                    .map_err(HeldSlipError::Denied)?;
-            }
-            Some(Holder::Device(device)) => {
-                // A held slip is bound to the device it names; a presented one to whoever presents it, and
-                // its binding check refuses anyone but that device.
-                request.bound_device = Some(presenter.unwrap_or(device));
-                slip.verify_at_root_without_revocation(&request, own)
-                    .map_err(HeldSlipError::Denied)?;
-            }
-            None => {
-                slip.verify_at_root_without_revocation(&request, own)
-                    .map_err(HeldSlipError::Denied)?;
-            }
+        let until = self.verify(&request, authority)?;
+        Ok((holder, until.ok_or(HeldSlipError::Endless)?))
+    }
+
+    /// Rule on the slip as `peer` presents it alone, on the plain path, for `service` at `now`.
+    ///
+    /// A root slip is refused before anything verifies it: it is inert alone, and admits only beside a
+    /// badge, on the two-token path. Any other slip is bound to the peer presenting it, never to the
+    /// device it names, so its own binding check refuses anyone but that device. The named device is not
+    /// even parsed: nothing here reads it.
+    pub(crate) fn presented(self, service: &Service, now: SystemTime, peer: VerifyKey) -> Checked {
+        match self.holder {
+            Named::Root(_) => return Checked::NotGranted,
+            Named::Device(_) | Named::Nobody => {}
         }
-        let until = slip.valid_until().map_err(HeldSlipError::Denied)?;
-        Ok(Self { holder, until })
+        let request = Request {
+            service: Service::clone(service),
+            now,
+            bound_device: Some(peer),
+        };
+        match self.verify(&request, None) {
+            Ok(_) => Checked::Granted,
+            Err(refused) => refused.checked(),
+        }
+    }
+
+    /// Rule on the slip as `peer` presents it beside a badge, on the two-token path, for `service` at
+    /// `now`: it must name a foreign authority, which is returned for the badge to be verified under. Any
+    /// other slip is not granted here.
+    pub(crate) fn foreign(
+        self,
+        service: &Service,
+        now: SystemTime,
+        peer: VerifyKey,
+    ) -> Result<VerifyKey, Checked> {
+        let Named::Root(root) = &self.holder else {
+            return Err(Checked::NotGranted);
+        };
+        let authority = self.authority(root).map_err(HeldSlipError::checked)?;
+        let request = Request {
+            service: Service::clone(service),
+            now,
+            bound_device: Some(peer),
+        };
+        self.verify(&request, Some(authority))
+            .map_err(HeldSlipError::checked)?;
+        Ok(authority)
+    }
+
+    /// The foreign authority `text` names, refused when it is the own key: anyone holding a copy of that
+    /// key could badge any device they like under it.
+    fn authority(&self, text: &str) -> Result<VerifyKey, HeldSlipError> {
+        let authority = parse_holder(text)?;
+        if authority == self.own {
+            return Err(HeldSlipError::OwnRoot);
+        }
+        Ok(authority)
+    }
+
+    /// The verify every path ends in: the slip grants `request` at the own key, under the foreign
+    /// `authority` when it names one, and its end can be read. Returns that end.
+    fn verify(
+        self,
+        request: &Request,
+        authority: Option<VerifyKey>,
+    ) -> Result<Option<SystemTime>, HeldSlipError> {
+        match authority {
+            Some(authority) => self
+                .slip
+                .verify_bound_to_authority(request, self.own, authority),
+            None => self
+                .slip
+                .verify_at_root_without_revocation(request, self.own),
+        }
+        .map_err(HeldSlipError::Denied)?;
+        // A slip whose end cannot be read is refused on every path, presented or held: whatever cuts an
+        // admission when its grant ends could not say when.
+        self.until.map_err(HeldSlipError::Denied)
     }
 }
 
-/// The holder `slip`'s authority block names, or `None` when it names none. Two holders are refused: no
-/// mint writes both, and either reading would be a guess.
-fn holder_of(slip: &Cap) -> Result<Option<Holder>, HeldSlipError> {
-    let device = slip.device_bound().map_err(HeldSlipError::Denied)?;
-    let root = slip.authority_bound_root().map_err(HeldSlipError::Denied)?;
-    match (device, root) {
-        (Some(device), None) => Ok(Some(Holder::Device(device))),
-        (None, Some(root)) => Ok(Some(Holder::Root(root))),
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => Err(HeldSlipError::TwoHolders),
-    }
+/// A holder key as its issuer signed it, refused when it is not a well-formed key.
+fn parse_holder(text: &str) -> Result<VerifyKey, HeldSlipError> {
+    text.parse::<VerifyKey>()
+        .map_err(|_| HeldSlipError::Denied(CapError::MalformedAuthority))
 }
 
 /// Why a slip is not one this machine can hold, or not one it may hold in this index.
