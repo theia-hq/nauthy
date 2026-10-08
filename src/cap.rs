@@ -30,9 +30,10 @@
 //! - [`Identity::verify`] checks a presented cap against this identity for a [`Request`] (service + now).
 //!
 //! parse-don't-validate: [`Cap::parse`] yields a `Cap` only from a link that decodes, is the grammar this
-//! crate mints (ed25519 keys only, no externally signed block), and whose signature chain checks against
-//! the embedded root. Whether it further *grants* a given request is answered by
-//! [`Identity::verify`], which returns the peer identity it is rooted at only when every check passes.
+//! crate mints (at most [`MAX_BLOCKS`] blocks, ed25519 next keys only, no externally signed block, no key
+//! named for a check to trust), and whose signature chain checks against the embedded root. Whether it
+//! further *grants* a given request is answered by [`Identity::verify`], which returns the peer identity
+//! it is rooted at only when every check passes.
 
 use core::time::Duration;
 use std::time::SystemTime;
@@ -68,9 +69,9 @@ const SEPARATOR: char = '.';
 const MAX_ENCODED_LEN: usize = 13_200;
 
 /// The maximum number of blocks [`Cap::parse`] accepts: the authority block plus a bounded delegation
-/// chain. A legitimate chain is short, so a many-block token is refused. This is a secondary structural
-/// sanity bound checked AFTER verification; the actual pre-trust CPU cap is [`MAX_ENCODED_LEN`], which
-/// bounds the bytes (hence the blocks) before the O(blocks) signature check runs.
+/// chain. A legitimate chain is short, so a many-block token is refused. Checked on the token's frame
+/// BEFORE any signature, so it caps the pre-trust chain verify at this many signatures; without it,
+/// [`MAX_ENCODED_LEN`] alone lets about 74 empty blocks through to the verifier.
 const MAX_BLOCKS: usize = 16;
 
 /// The datalog evaluation budget every verification runs under.
@@ -710,11 +711,27 @@ impl Cap {
     /// Decode a cap from its `<key>.<token>` link text.
     ///
     /// parse-don't-validate at the wire edge: rejects text that is not `<key>.<token>`, a malformed [`VerifyKey`], bad base32,
-    /// a token outside the grammar this crate mints (a key that is not ed25519, or a block signed outside
-    /// the chain, refused before any signature is checked), or bytes whose signature chain does not check
-    /// against the embedded root. It does NOT evaluate the caveats (service, expiry); that is
-    /// [`Identity::verify`]'s job at connect time.
+    /// a token outside the grammar this crate mints (too many blocks, a next key that is not ed25519, a
+    /// block signed outside the chain, or a key named for a check to trust, all refused before any
+    /// signature is checked), or bytes whose signature chain does not check against the embedded root.
+    /// It does NOT evaluate the caveats (service, expiry); that is [`Identity::verify`]'s job at connect
+    /// time.
     pub fn parse(link: &str) -> Result<Self, CapError> {
+        let (root, bytes) = Self::split_link(link)?;
+        // The grammar check comes BEFORE the chain verify, because the verify dispatches each block on
+        // the key the token itself names: left to it, a stranger picks which signature verifier runs.
+        refuse_unminted_grammar(&bytes)?;
+        let public = root_key(root)?;
+        // Decoding with the embedded root verifies the signature chain back to it; a token that does not
+        // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
+        let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Unverified)?;
+        Ok(Self { root, token })
+    }
+
+    /// The front half of [`Cap::parse`]: split `<key>.<token>`, bound the size, parse the key, decode the
+    /// base32. No token structure and no crypto yet. Shared with the test-only biscuit-alone witness, so
+    /// the witness reads exactly the bytes the real parse reads.
+    fn split_link(link: &str) -> Result<(VerifyKey, Vec<u8>), CapError> {
         let (root, encoded) = link.split_once(SEPARATOR).ok_or(CapError::Malformed)?;
         // A key and a token each hold no separator, so a second one is a broken shape, not bad base32.
         if encoded.contains(SEPARATOR) {
@@ -729,19 +746,7 @@ impl Cap {
         }
         let root = root.parse::<VerifyKey>().map_err(|_| CapError::Malformed)?;
         let bytes = crate::key::decode_base32(encoded).ok_or(CapError::Encoding)?;
-        // The grammar check comes BEFORE the chain verify, because the verify dispatches each block on
-        // the key the token itself names: left to it, a stranger picks which signature verifier runs.
-        refuse_unminted_grammar(&bytes)?;
-        let public = root_key(root)?;
-        // Decoding with the embedded root verifies the signature chain back to it; a token that does not
-        // chain to the VerifyKey it claims is rejected here, before any caveat is ever considered.
-        let token = Biscuit::from(&bytes, public).map_err(|_| CapError::Unverified)?;
-        // A well-formed but deeply-attenuated token is still a DoS via O(blocks) work; a legitimate
-        // delegation chain is short, so bound the block count too.
-        if token.block_count() > MAX_BLOCKS {
-            return Err(CapError::TooLarge);
-        }
-        Ok(Self { root, token })
+        Ok((root, bytes))
     }
 
     /// The identity this cap is rooted at: the [`VerifyKey`] a dialer should dial and the issuer must be to
@@ -867,6 +872,35 @@ impl Identity {
         let token = token
             .append(block!(r#"member(true);"#))
             .map_err(CapError::Attenuate)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a plain service cap whose AUTHORITY block names a P-256 next key, the first key a
+    /// stranger who mints under their own root controls. [`Identity::mint`] cannot express it: biscuit's
+    /// default build picks an ed25519 next key, so this reaches past it with biscuit's public builder.
+    pub(crate) fn mint_with_p256_authority_next_key(
+        &self,
+        service: &Service,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let next = KeyPair::new_with_algorithm(Algorithm::Secp256r1);
+        let token = biscuit!(
+            r#"
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            "#,
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build_with_key_pair(
+            &self.root,
+            biscuit_auth::datalog::SymbolTable::default(),
+            &next,
+        )
+        .map_err(CapError::Mint)?;
         Ok(Cap {
             root: self.verifying_key(),
             token,
@@ -1074,20 +1108,31 @@ impl Cap {
         })
     }
 
-    /// Test-only: whether biscuit's own parse accepts `link` against the root it names, with this crate's
-    /// grammar check skipped. The inversion witness for [`refuse_unminted_grammar`]: a token biscuit accepts
-    /// and [`Cap::parse`] refuses is refused by the grammar check and by nothing else.
-    pub(crate) fn biscuit_alone_accepts(link: &str) -> bool {
-        let Some((root, encoded)) = link.split_once(SEPARATOR) else {
-            return false;
-        };
-        let (Ok(root), Some(bytes)) = (
-            root.parse::<VerifyKey>(),
-            crate::key::decode_base32(encoded),
-        ) else {
-            return false;
-        };
-        root_key(root).is_ok_and(|public| Biscuit::from(&bytes, public).is_ok())
+    /// Test-only: biscuit's own verdict on `link` against the root it names, with this crate's grammar
+    /// check skipped. The outer error is the link's shape (the same front half [`Cap::parse`] runs); the
+    /// inner result is biscuit's. The inversion witness for [`refuse_unminted_grammar`]: a token biscuit
+    /// accepts and [`Cap::parse`] refuses is refused by the grammar check and by nothing else.
+    pub(crate) fn parse_with_biscuit_alone(
+        link: &str,
+    ) -> Result<Result<(), error::Token>, CapError> {
+        let (root, bytes) = Self::split_link(link)?;
+        let public = root_key(root)?;
+        Ok(Biscuit::from(&bytes, public).map(|_| ()))
+    }
+
+    /// Test-only: append a block whose one check names a key to trust (`trusting <alg>/<key>`), the
+    /// shape a check reaches a third party through. biscuit decodes every such key on parse, before any
+    /// trust decision, so a P-256 one runs P-256 point decoding on a stranger's bytes.
+    pub(crate) fn attenuate_trusting(&self, algorithm: Algorithm) -> Result<Self, CapError> {
+        let trusted = KeyPair::new_with_algorithm(algorithm).public();
+        let block = biscuit_auth::builder::BlockBuilder::new()
+            .code(format!("check if true trusting {trusted}"))
+            .map_err(CapError::Attenuate)?;
+        let token = self.token.append(block).map_err(CapError::Attenuate)?;
+        Ok(Self {
+            root: self.root,
+            token,
+        })
     }
 
     /// Test-only: append `check if time($t), $t <= <secs>` with the date as raw seconds, the one clock
@@ -1209,21 +1254,30 @@ fn root_key(node: VerifyKey) -> Result<PublicKey, CapError> {
 /// signature is checked.
 ///
 /// biscuit verifies each block against the key the block BEFORE it names (`next_key`), and that key may be
-/// ed25519 or P-256; a third-party block adds a signature under a key the block itself carries. So the
-/// chain verify in [`Cap::parse`] runs whichever verifier the token asks for, and it runs pre-trust, on a
-/// stranger's token, before the root is compared with any trusted one. Every token this crate mints,
-/// attenuates or seals names ed25519 next keys only and carries no external signature, so refusing the
-/// rest takes nothing from a legitimate holder and leaves ed25519 the one verifier a stranger can reach.
-/// It also shuts a revocation gap: a P-256 signature can be re-encoded by anyone who holds the token,
-/// which changes that block's revocation id, so a revocation aimed at a later block could be dodged.
+/// ed25519 or P-256; a third-party block adds a signature under a key the block itself carries; and a
+/// block's datalog may name keys for its checks to trust (`trusting <key>`), each of which biscuit decodes
+/// as a curve point when it loads the token. So the parse in [`Cap::parse`] runs whichever verifier and
+/// point decoder the token asks for, as many times as the token asks, pre-trust, on a stranger's token,
+/// before the root is compared with any trusted one. Every token this crate mints, attenuates or seals is
+/// at most [`MAX_BLOCKS`] blocks, names ed25519 next keys only, carries no external signature and names
+/// no key to trust, so refusing the rest takes nothing from a legitimate holder and leaves a bounded
+/// ed25519 chain the only crypto a stranger can reach. It also shuts a revocation gap: the P-256
+/// signature on the last block of an unsealed token can be re-encoded by anyone who holds the token,
+/// which changes that block's revocation id, so a revocation aimed at that block could be dodged.
 ///
-/// The frame is decoded here because biscuit's parse exposes neither field until after it has verified
-/// the chain; the decode is a second pass over at most [`MAX_ENCODED_LEN`] bytes and does no crypto. A
-/// frame that does not decode is [`CapError::Unverified`], the same answer biscuit's own parse gives it.
-/// The key algorithm is compared as the raw wire integer, because prost's typed getter reads an unknown
-/// value as the default, which is ed25519.
+/// The frame is decoded here because biscuit's parse exposes none of these until after it has verified
+/// the chain; the decode is a second pass over at most [`MAX_ENCODED_LEN`] bytes and does no crypto. Each
+/// block's inner datalog is decoded too, with the same decoder biscuit uses, only to read its key table.
+/// A frame or block that does not decode is [`CapError::Unverified`], the same answer biscuit's own parse
+/// gives it. The key algorithm is compared as the raw wire integer, because prost's typed getter reads an
+/// unknown value as the default, which is ed25519.
 fn refuse_unminted_grammar(bytes: &[u8]) -> Result<(), CapError> {
     let token = schema::Biscuit::decode(bytes).map_err(|_| CapError::Unverified)?;
+    // The block count first: it is one comparison, and it bounds every per-block step below as well as
+    // the chain verify after this.
+    if token.blocks.len() + 1 > MAX_BLOCKS {
+        return Err(CapError::TooLarge);
+    }
     let ed25519 = schema::public_key::Algorithm::Ed25519 as i32;
     for block in core::iter::once(&token.authority).chain(&token.blocks) {
         if block.external_signature.is_some() {
@@ -1231,6 +1285,11 @@ fn refuse_unminted_grammar(bytes: &[u8]) -> Result<(), CapError> {
         }
         if block.next_key.algorithm != ed25519 {
             return Err(CapError::NotEd25519);
+        }
+        let datalog =
+            schema::Block::decode(block.block.as_slice()).map_err(|_| CapError::Unverified)?;
+        if !datalog.public_keys.is_empty() {
+            return Err(CapError::TrustedKey);
         }
     }
     Ok(())
@@ -1462,6 +1521,11 @@ pub enum CapError {
     /// block, and that parses.
     #[error("capability carries a block signed outside its chain")]
     ExternalSignature,
+    /// The token's datalog names a key for a check to trust (`trusting <key>`), of any algorithm, which
+    /// this crate never mints. Refused from the token's frame before any signature is checked, and before
+    /// biscuit would decode each named key as a curve point.
+    #[error("capability names a key for its checks to trust")]
+    TrustedKey,
     /// The link was structurally broken before any signature check: not `<key>.<token>` (a missing or
     /// second separator, or anything written before the key), or a key that is not a well-formed
     /// [`VerifyKey`]. Distinct from [`Unverified`](Self::Unverified), a signature-chain failure, because a

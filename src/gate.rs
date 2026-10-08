@@ -968,6 +968,7 @@ impl From<Result<VerifyKey, CapError>> for Checked {
                 | CapError::Encoding
                 | CapError::NotEd25519
                 | CapError::ExternalSignature
+                | CapError::TrustedKey
                 | CapError::Malformed
                 | CapError::MalformedAuthority
                 | CapError::Unverified
