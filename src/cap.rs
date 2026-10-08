@@ -683,10 +683,15 @@ impl Cap {
         let authority: Vec<(String,)> = authorizer
             .query("bound($x) <- authority_bound($x)")
             .map_err(CapError::from_evaluation)?;
+        // Every holder fact is kept, never only the first: a check that reads the fact admits each one
+        // it names, so a reader that kept one would report a holder narrower than the slip admits.
         Ok(AuthorityFacts {
             member: !member.is_empty(),
-            device: device.into_iter().next().map(|(device,)| device),
-            authority: authority.into_iter().next().map(|(authority,)| authority),
+            devices: device.into_iter().map(|(device,)| device).collect(),
+            authorities: authority
+                .into_iter()
+                .map(|(authority,)| authority)
+                .collect(),
             until,
         })
     }
@@ -1015,6 +1020,70 @@ impl Identity {
             "#,
             device = device.to_string(),
             root = foreign_root.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a device-bound slip naming TWO devices, which no mint writes. Its binding check reads
+    /// the fact the way [`Identity::mint_bound`]'s does, so its datalog admits either device, and only a
+    /// read that refuses more than one holder stops it.
+    pub(crate) fn mint_naming_two_devices(
+        &self,
+        service: &Service,
+        first: VerifyKey,
+        second: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            device_bound({first});
+            device_bound({second});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if device_bound($d), bound_device($d);
+            "#,
+            first = first.to_string(),
+            second = second.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: an authority slip naming TWO foreign authorities, which no mint writes. Its check is
+    /// [`Identity::mint_authority_slip`]'s, so its datalog admits a member of either, and only a read that
+    /// refuses more than one holder stops it.
+    pub(crate) fn mint_naming_two_authorities(
+        &self,
+        service: &Service,
+        first: VerifyKey,
+        second: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            authority_bound({first});
+            authority_bound({second});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if authority_bound($x), foreign_member($x);
+            "#,
+            first = first.to_string(),
+            second = second.to_string(),
             service = service.as_str(),
             expiry = expiry,
         )
@@ -1421,10 +1490,12 @@ pub(crate) struct AuthorityFacts {
     /// no `service` fact, so a holder who narrows a badge to one service makes it fail there while it
     /// still passes the service question. The badge is still a badge, and this read still sees it.
     pub(crate) member: bool,
-    /// The device a `device_bound` fact names (see [`Identity::mint_bound`]).
-    pub(crate) device: Option<String>,
-    /// The foreign authority an `authority_bound` fact names (see [`Identity::mint_authority_slip`]).
-    pub(crate) authority: Option<String>,
+    /// Every device a `device_bound` fact names (see [`Identity::mint_bound`]). A mint writes at most
+    /// one; more is a slip that names several holders, which a reader refuses rather than picks from.
+    pub(crate) devices: Vec<String>,
+    /// Every foreign authority an `authority_bound` fact names (see [`Identity::mint_authority_slip`]).
+    /// A mint writes at most one, as for `devices`.
+    pub(crate) authorities: Vec<String>,
     /// [`Cap::valid_until`]'s answer, from the same authorizer.
     pub(crate) until: Result<Option<SystemTime>, CapError>,
 }

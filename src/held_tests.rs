@@ -606,8 +606,8 @@ fn a_holder_appended_to_a_bearer_slip_names_no_one_presented() {
             .attenuate_with_raw_datalog(appended)
             .expect("append a holder fact");
         let facts = slip.authority_facts().expect("read the authority block");
-        assert_eq!(facts.device, None, "{appended}");
-        assert_eq!(facts.authority, None, "{appended}");
+        assert!(facts.devices.is_empty(), "{appended}");
+        assert!(facts.authorities.is_empty(), "{appended}");
         for peer in [STRANGER, DEVICE] {
             assert_eq!(
                 gate.admit(proven(peer), Some(&slip), &ssh()),
@@ -616,6 +616,23 @@ fn a_holder_appended_to_a_bearer_slip_names_no_one_presented() {
             );
         }
     }
+
+    // A holder derived by a rule in the appended block names no one either: the token's shape is refused
+    // before anything evaluates, since no mint or attenuation here writes a rule.
+    let derived = bearer
+        .attenuate_with_raw_datalog(&format!(
+            "device_bound(\"{}\") <- service($s);",
+            key(STRANGER)
+        ))
+        .expect("append a holder rule");
+    assert!(matches!(
+        derived.authority_facts(),
+        Err(CapError::TooComplex)
+    ));
+    assert_eq!(
+        gate.admit(proven(STRANGER), Some(&derived), &ssh()),
+        Decision::Refuse(Refusal::NotGranted)
+    );
 }
 
 #[test]
@@ -634,8 +651,8 @@ fn a_holder_appended_to_a_device_slip_does_not_rebind_it() {
             .attenuate_with_raw_datalog(&appended)
             .expect("append a holder fact");
         assert_eq!(
-            rebound.authority_facts().expect("read").device,
-            Some(key(DEVICE).to_string()),
+            rebound.authority_facts().expect("read").devices,
+            [key(DEVICE).to_string()],
             "{appended}"
         );
         assert_eq!(
@@ -732,6 +749,43 @@ fn a_slip_naming_two_holders_is_never_held() {
         .expect("sign the slip");
 
     assert!(matches!(held(&slip, "ssh"), Err(HeldSlipError::TwoHolders)));
+}
+
+#[test]
+fn a_slip_naming_two_devices_admits_no_one() {
+    // Its binding check reads the fact, so its datalog admits either device it names. A read that kept
+    // only the first would report one holder while the slip admits two; the read refuses it instead,
+    // held and presented, whichever device presents it.
+    let slip = identity(OWN)
+        .mint_naming_two_devices(&ssh(), key(DEVICE), key(STRANGER), hour())
+        .expect("sign the slip");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    assert!(matches!(held(&slip, "ssh"), Err(HeldSlipError::TwoHolders)));
+    for peer in [DEVICE, STRANGER] {
+        assert_eq!(
+            gate.admit(proven(peer), Some(&slip), &ssh()),
+            Decision::Refuse(Refusal::NotGranted)
+        );
+    }
+}
+
+#[test]
+fn a_slip_naming_two_authorities_admits_no_one() {
+    // Its check admits a member of either authority it names, so it is refused the same way: held, and
+    // beside a badge under either authority.
+    let slip = identity(OWN)
+        .mint_naming_two_authorities(&ssh(), key(FRIEND), key(ELSEWHERE), hour())
+        .expect("sign the slip");
+    let gate = gate_issuing(Store::default(), &[&slip], Swap::default());
+
+    assert!(matches!(held(&slip, "ssh"), Err(HeldSlipError::TwoHolders)));
+    for authority in [FRIEND, ELSEWHERE] {
+        assert_eq!(
+            gate.admit_foreign(proven(DEVICE), &slip, &badge(authority, DEVICE), &ssh()),
+            Decision::Refuse(Refusal::NotGranted)
+        );
+    }
 }
 
 #[test]

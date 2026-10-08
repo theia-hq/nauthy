@@ -13,6 +13,7 @@
 //! ([`HeldSlips`]) is all that is kept, never the parsed slip. What time and the revocation store can
 //! change (the end, the slip's ids, the foreign badge a root row needs) the gate asks on every admission.
 
+use core::mem;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -353,7 +354,7 @@ impl<'a> OwnSlip<'a> {
         // its holder narrowed to one service is still a badge. A read that failed has not shown the slip is
         // no badge, so it is refused here too, with its cause: `checked` makes it not granted, or not
         // decided when it ran out of budget.
-        let facts = match slip.authority_facts() {
+        let mut facts = match slip.authority_facts() {
             Ok(facts) if facts.member => return Err(HeldSlipError::MemberBadge),
             Ok(facts) => facts,
             Err(error) => return Err(HeldSlipError::Denied(error)),
@@ -361,12 +362,16 @@ impl<'a> OwnSlip<'a> {
         if slip.root() != own {
             return Err(HeldSlipError::OtherKey);
         }
-        // Two holders are refused: no mint writes both, and either reading would be a guess.
-        let holder = match (facts.device, facts.authority) {
-            (Some(device), None) => Named::Device(device),
-            (None, Some(root)) => Named::Root(root),
-            (None, None) => Named::Nobody,
-            (Some(_), Some(_)) => return Err(HeldSlipError::TwoHolders),
+        // More than one holder is refused, of either kind or one of each: no mint writes two, a check
+        // that reads the fact admits every holder it names, and naming any one of them would be a guess.
+        let holder = match (
+            facts.devices.as_mut_slice(),
+            facts.authorities.as_mut_slice(),
+        ) {
+            ([device], []) => Named::Device(mem::take(device)),
+            ([], [root]) => Named::Root(mem::take(root)),
+            ([], []) => Named::Nobody,
+            _ => return Err(HeldSlipError::TwoHolders),
         };
         Ok(Self {
             slip,
@@ -496,7 +501,7 @@ pub enum HeldSlipError {
     /// The slip was signed by, or verified under, a key other than the one holding it.
     #[error("slip is not signed by this key")]
     OtherKey,
-    /// The slip names both a device and a foreign authority as its holder.
+    /// The slip names more than one holder: two devices, two foreign authorities, or one of each.
     #[error("slip names two holders")]
     TwoHolders,
     /// The slip is a root slip naming the key that signed it as its foreign authority.
