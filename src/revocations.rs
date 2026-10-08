@@ -68,17 +68,15 @@ pub trait Revocations {
     /// Whether a grant rooted at `root` whose chain is `ids` is revoked: any of `ids` is recalled, or
     /// `root` is, or anything else the store keys on about them.
     ///
-    /// The one question a store answers. A presented cap is asked through
-    /// [`is_revoked`](Self::is_revoked), with its [`root`](Cap::root) and its whole chain
-    /// ([`Cap::revocation_ids`]: its own blocks, and any it inherited from the grant it was narrowed
-    /// from). A [`HeldSlip`](crate::HeldSlip), which keeps a slip's facts and not the slip, is asked with
-    /// its signer and its id. Both reach this method, so a cap and a slip known by its facts can never
-    /// get two answers about one chain.
+    /// The one required method. A presented cap reaches it through [`is_revoked`](Self::is_revoked) with its
+    /// [`root`](Cap::root) and whole chain ([`Cap::revocation_ids`]: its own blocks, and any it inherited
+    /// from the grant it was narrowed from); a [`HeldSlip`](crate::HeldSlip) reaches it with its signer and
+    /// its id. One method for both, so a cap and a held slip on one chain never get two answers.
     fn is_revoked_ids(&self, root: &VerifyKey, ids: &[RevocationId]) -> bool;
 
     /// Whether a presented cap is revoked: [`is_revoked_ids`](Self::is_revoked_ids) of its
-    /// [`root`](Cap::root) and its chain. Provided, and an impl does not override it: answering a cap
-    /// differently from its facts is the drift this shape exists to rule out.
+    /// [`root`](Cap::root) and its chain. Provided; do not override it, or a cap and a held slip on one
+    /// chain can get two answers.
     fn is_revoked(&self, cap: &Cap) -> bool {
         self.is_revoked_ids(&cap.root(), &cap.revocation_ids())
     }

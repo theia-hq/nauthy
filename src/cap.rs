@@ -1552,7 +1552,7 @@ pub enum CapError {
     /// The cap parsed and verified, but the key its `authority_bound` or `device_bound` fact names is not
     /// a well-formed [`VerifyKey`]. A property of a signed token, not of link text, so it is kept apart from
     /// [`Malformed`](Self::Malformed): the input was a link, and the issuer signed a key nobody can hold.
-    #[error("capability pins a malformed authority key")]
+    #[error("capability names a malformed key")]
     MalformedAuthority,
     /// The token decoded but its signature chain did not verify against the embedded root: tampered,
     /// truncated mid-chain, or never signed by the key it claims. A security-relevant failure, kept distinct

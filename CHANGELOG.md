@@ -18,6 +18,32 @@ All notable changes to nauthy, newest first.
   `WrongLock`, a guard for another file (`the lock passed to a write on <path> guards another file`),
   and `TooLarge`, a file past the size cap (`revocation denylist file is too large`).
   `Denylist::for_repair` replaces `FileDenylist::empty` as the way back from `Lost`.
+- **`Gate::anchored` takes a fifth argument, `held`: a `HeldSource`.** It names the slips this machine
+  keeps for its peers (see Added).
+- **A `Revocations` store implements `is_revoked_ids(root, ids)` instead of `is_revoked(cap)`.**
+  `is_revoked` is provided over it with the cap's root and chain; do not override it. A held slip is
+  asked through the same method, so a cap and a held slip on one chain get one answer.
+- **`Identity::mint_bound` also signs the device as a `device_bound` fact**, so the issuer can read a
+  slip's holder from what it signed and keep the slip as a held slip.
+- **A slip rooted at this machine's own key is refused when its end cannot be read or when it names
+  two holders**, on every path.
+
+### Added
+- **An anchored gate admits a peer on a slip this machine keeps.** A peer that presents no token rooted
+  at the pin or the own key is admitted when this machine holds a slip its own key signed for that
+  peer's key, or for a foreign authority whose badge the peer presents.
+  - `HeldSlip::verify` checks a slip once and keeps its facts; `HeldSlipError` says why a slip cannot be
+    held. `HeldSlips` indexes them for one own key: `insert` hands back the slip it displaced, `retain`
+    drops slips, and `iter`, `len` and `is_empty` read it.
+  - The gate reads the index through a `HeldSource` on every admission that reaches it, and checks each
+    slip's end and revocation there. To end a held slip, revoke its id.
+  - A refusal reads the same whether a held slip is absent, revoked or ended.
+  - `Admitted::held` returns the `HeldGrant` the peer was admitted on: its slips and, for a root slip,
+    the `HeldBadge`.
+
+### Changed
+- **`CapError::MalformedAuthority` also covers a malformed `device_bound` key**, and prints `capability
+  names a malformed key`.
 
 ### Fixed
 - **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh

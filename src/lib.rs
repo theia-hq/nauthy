@@ -12,9 +12,9 @@
 //!   (a [`VerifyKey`] you own). One key you own authorizes both your own devices and anyone you delegate to,
 //!   offline and revocably: the thing `authorized_keys` cannot do.
 //! - [`Gate::Anchored`] permits what a rooted gate permits under a pin it reads live ([`PinSource`]), plus
-//!   the service slips this machine's own key signed and recorded ([`IssuedIds`]), plus a proven key that
-//!   presents nothing when this machine holds a slip its own key signed for that key ([`HeldSlips`]). The
-//!   own key never makes a member.
+//!   the service slips this machine's own key signed and recorded ([`IssuedIds`]), plus a proven key this
+//!   machine holds a slip for ([`HeldSlips`]): one its own key signed for that key, or for a foreign
+//!   authority whose badge the key presents. The own key never makes a member.
 //!
 //! One authority signs four grant shapes, verified offline against it:
 //! - a **membership badge** ([`Identity::mint_member`]): whole-node admission, bound to one device;

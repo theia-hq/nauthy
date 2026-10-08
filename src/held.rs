@@ -54,18 +54,24 @@ pub struct HeldSlip {
 impl HeldSlip {
     /// Verify `slip` as a grant this machine, `own`, holds for `service`, evaluated at `now`.
     ///
+    /// `now` is the caller's to pick and is used only here: the gate checks each held slip's signed end
+    /// against its own clock on every admission, so a slip verified at a stale `now` is indexed but admits
+    /// no one past that end.
+    ///
     /// Refuses, in order:
-    /// - a membership badge, by what its issuer signed and however a holder narrowed it: the own key never
-    ///   makes a member, here as on the gate's own-key path;
+    /// - a membership badge, by what its issuer signed and however a holder narrowed it, and a slip whose
+    ///   facts cannot be read, which has not shown it is no badge, as [`Denied`](HeldSlipError::Denied)
+    ///   with its cause: the own key never makes a member, here as on the gate's own-key path;
     /// - a slip signed by any key but `own`;
-    /// - a slip whose holder facts cannot be read, or that names two holders;
-    /// - a slip a holder narrowed (more than one block), and a bearer slip that names no holder: neither
-    ///   is a grant this machine signed for one holder to keep;
-    /// - a slip whose holder is not a well-formed key, and a root slip naming `own` itself as its
-    ///   authority, since anyone holding a copy of that key could badge any device under it;
+    /// - a slip that names two holders;
+    /// - a slip a holder narrowed (more than one block): a held slip is kept exactly as its issuer signed it;
+    /// - a bearer slip, which names no holder; a holder that is not a well-formed key; and a root slip
+    ///   naming `own` itself as its authority, since anyone holding a copy of that key could badge any
+    ///   device under it;
     /// - a slip that does not grant `service` to its own holder at `now` (the wrong service, ended, or a
     ///   device binding that disagrees with the device it names);
-    /// - a slip whose end cannot be read, and one that never ends.
+    /// - a slip whose end cannot be read, and one that never ends;
+    /// - a slip with no revocation id, which nothing could revoke.
     ///
     /// The checks that settle what a valid own-key slip is are the ones the gate's own-key path runs on a
     /// presented slip, through the same code, so the two cannot drift. The holder is the slip's own
@@ -128,9 +134,8 @@ impl HeldSlip {
 /// never stalls an admission and a gate never reads a half-built index.
 ///
 /// It holds one slip per holder and service, and does not choose between two: inserting a second one
-/// displaces the first and hands it back. A displaced slip still verifies, and it governs any index built
-/// without the later one, so leaving a slip out of an index does not end it. Revoking its
-/// [`id`](HeldSlip::id) does.
+/// displaces the first and hands it back. A displaced or dropped slip still verifies, so any index that
+/// holds it again admits on it. To end a slip, revoke its [`id`](HeldSlip::id).
 #[derive(Debug, Clone)]
 pub struct HeldSlips {
     own: VerifyKey,
@@ -222,10 +227,11 @@ impl HeldSlips {
 
 /// Where an anchored gate reads its held slips.
 ///
-/// Asked on EVERY admission that reaches the held slips, so an index swapped in while the gate is serving
-/// is read at the next connection with no restart. `None` holds nothing, and admits no one on a held
-/// slip: a source answers `None` until its first index is built and whenever the slips it keeps cannot be
-/// read, never an index kept from an earlier read whose slips may since have been revoked or removed.
+/// Asked on EVERY admission that reaches the held slips, a stranger's dial included, so `current` hands
+/// back an index already built: it reads no file and verifies nothing. An index swapped in while the gate
+/// is serving is read at the next connection, with no restart. `None` admits no one on a held slip: answer
+/// it until the first index is built and whenever the slips cannot be read. Never hand back an index from
+/// an earlier read.
 pub trait HeldSource: Send + Sync {
     /// The held slips as they stand now, or `None` when there are none to read.
     fn current(&self) -> Option<Arc<HeldSlips>>;
@@ -343,17 +349,13 @@ impl<'a> OwnSlip<'a> {
     /// two holders. One pass over the slip's authority block (see [`Cap::authority_facts`]).
     pub(crate) fn read(slip: &'a Cap, own: VerifyKey) -> Result<Self, HeldSlipError> {
         // First, before anything reads the slip as a grant: the own key never makes a member, and a badge
-        // its holder narrowed to one service is still a badge. A read that failed cleanly has not shown the
-        // slip is no badge, so it reads as one; one that ran out of budget is not decided.
+        // its holder narrowed to one service is still a badge. A read that failed has not shown the slip is
+        // no badge, so it is refused here too, with its cause: `checked` makes it not granted, or not
+        // decided when it ran out of budget.
         let facts = match slip.authority_facts() {
             Ok(facts) if facts.member => return Err(HeldSlipError::MemberBadge),
             Ok(facts) => facts,
-            Err(error) => {
-                return Err(match Checked::from(Err(error)) {
-                    Checked::Undecided => HeldSlipError::Denied(CapError::Undecided),
-                    Checked::Granted | Checked::NotGranted => HeldSlipError::MemberBadge,
-                });
-            }
+            Err(error) => return Err(HeldSlipError::Denied(error)),
         };
         if slip.root() != own {
             return Err(HeldSlipError::OtherKey);
@@ -499,9 +501,9 @@ pub enum HeldSlipError {
     /// The slip is a root slip naming the key that signed it as its foreign authority.
     #[error("slip names its own signer as its authority")]
     OwnRoot,
-    /// The slip did not verify for the service at the moment asked, or its end cannot be read. The cause
-    /// is the capability error; an [`Undecided`](CapError::Undecided) one means the host ran out of time
-    /// and the slip may verify when asked again.
+    /// The slip's facts cannot be read, it did not verify for the service at the moment asked, or its end
+    /// cannot be read. The cause is the capability error; an [`Undecided`](CapError::Undecided) one means
+    /// the host ran out of time and the slip may verify when asked again.
     #[error("slip does not verify")]
     Denied(#[source] CapError),
     /// A holder added a block to the slip. A held slip is kept exactly as its issuer signed it.

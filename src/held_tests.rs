@@ -601,6 +601,37 @@ fn a_slip_naming_a_malformed_device_is_never_held() {
 }
 
 #[test]
+fn an_own_key_slip_naming_a_malformed_device_admits_no_one_presented() {
+    // The presented path never parses the device a slip names: it binds the slip to the peer presenting
+    // it. A named device that is not a key never equals a proven peer, so the slip's own binding check
+    // refuses everyone, recorded or not. A mint that drops that check, or a path that trusts the named
+    // fact, turns this red.
+    let named = identity(OWN)
+        .mint_bound_naming(&ssh(), &key(DEVICE).to_string(), hour())
+        .expect("sign the slip");
+    let malformed = identity(OWN)
+        .mint_bound_naming(&ssh(), "not a key", hour())
+        .expect("sign the slip");
+    let gate = gate_issuing(Store::default(), &[&named, &malformed], Swap::default());
+
+    assert!(
+        gate.admit_witnessed(proven(DEVICE), Some(&named), &ssh())
+            .is_ok(),
+        "the fixture admits a recorded slip naming a well-formed device"
+    );
+    for peer in [DEVICE, FRIEND, OWN, PIN, STRANGER] {
+        assert!(matches!(
+            gate.admit_witnessed(proven(peer), Some(&malformed), &ssh()),
+            Err(Refusal::NotGranted)
+        ));
+        assert_eq!(
+            gate.admit(proven(peer), Some(&malformed), &ssh()),
+            Decision::Refuse(Refusal::NotGranted)
+        );
+    }
+}
+
+#[test]
 fn a_narrowed_slip_is_never_held() {
     let narrowed = device_slip(DEVICE, "ssh")
         .attenuate(None, Some(hour()))

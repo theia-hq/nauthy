@@ -25,10 +25,10 @@ use crate::{Service, VerifyKey};
 /// - [`Gate::Anchored`] trusts two authorities: a pin it reads afresh on every admission, ruled exactly as
 ///   a rooted gate rules on its authority, and this machine's own key, which admits only the service slips
 ///   this machine recorded issuing and never a member. A machine with no pin admits no member at all. It
-///   also admits a proven key that presents nothing on a slip this machine signed for that key, or for a
-///   foreign authority whose badge the key presents, and keeps itself ([`HeldSlip`]). Even then it rules
-///   on a signed slip, never on a list entry: a key written into a list without this machine's secret
-///   admits no one.
+///   also admits a proven key that presents no token rooted here, on a slip this machine's own key signed
+///   and this machine keeps ([`HeldSlip`]): one for that key, or for a foreign authority whose badge the
+///   key presents. Even then it rules on a signed slip, never on a list entry: a key written into a list
+///   without this machine's secret admits no one.
 ///
 /// A rooted or anchored gate can also witness a proven key that presents nothing ([`Gate::proven`]); the
 /// witness carries no authority and reaches only a handler built for it.
@@ -155,9 +155,9 @@ impl Gate {
     /// handed here correctly refuses [`NotGranted`](Refusal::NotGranted) (it is inert alone); the two-token
     /// AND is [`admit_foreign`](Gate::admit_foreign).
     ///
-    /// A [`Decision`] carries no held grant: an anchored gate that admits on a [`HeldSlip`] drops what it
-    /// ruled on here. A caller that records admissions to cut them on a later revocation or end must admit
-    /// through [`admit_witnessed`](Gate::admit_witnessed) and record [`Admitted::held`].
+    /// A [`Decision`] does not say which held slip admitted a peer. To cut an admission when its
+    /// [`HeldSlip`] is revoked or ends, admit through [`admit_witnessed`](Gate::admit_witnessed) and record
+    /// [`Admitted::held`].
     pub fn admit(&self, peer: ProvenPeer, presented: Option<&Cap>, service: &Service) -> Decision {
         match self {
             Gate::Open => Decision::Admit,
@@ -703,10 +703,9 @@ impl Admitted {
     /// The held grant this peer was admitted on: `Some` only when an [`Anchored`](Gate::Anchored) gate
     /// admitted it on a slip this machine holds ([`HeldSlip`]), `None` on every other admission.
     ///
-    /// A held admission rules on no token the peer presented, so a caller that records an admission to cut
-    /// it later records these facts: each slip's id, end and signer, and for a root slip the badge's root,
-    /// ids and end. Recording the presented tokens instead keeps nothing for a peer that presented none,
-    /// and keeps a foreign badge that anchors nothing here for one that presented its badge.
+    /// Record these facts, not the presented tokens, to cut the admission later: each slip's id, end and
+    /// signer, and for a root slip the badge's root, ids and end. A peer admitted on a device slip
+    /// presented nothing, and one admitted on a root slip presented only its badge.
     pub fn held(&self) -> Option<&HeldGrant> {
         self.held.as_ref()
     }

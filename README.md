@@ -146,13 +146,21 @@ let gate = Gate::anchored(pin, own.verifying_key(), denylist, issued, held);
   the next connection. A token rooted at it is ruled exactly as `Gate::rooted` rules. With no pin, no
   token admits a member.
 - A token rooted at `own` is admitted only as a service slip, and only when `issued` (an `IssuedIds`)
-  holds its `root_revocation_id`. Record that id when you mint. A copy of the key mints slips with fresh
-  ids, so it cannot mint access. A membership badge `own` signed is refused, and so is an authority-bound
-  slip that names `own` as its authority.
+  holds its `root_revocation_id`. Record that id when you mint. A membership badge `own` signed is
+  refused, and so is an authority-bound slip that names `own` as its authority.
+- `held` is a `HeldSource`: slips `own` signed that this machine keeps, so their holder need not present
+  them. A peer that presents no token rooted at the pin or `own` is admitted when `held` has a slip for
+  its proven key, or for a foreign authority whose badge it presents. Check each slip once with
+  `HeldSlip::verify` and index it in `HeldSlips`. To end a held slip, revoke its `id()`.
+- A copy of the key alone cannot mint access: its slips carry ids `issued` never recorded. With write
+  access to `issued` or to the slips behind `held`, it can, so keep the slips as write-protected as
+  `issued`.
 - A pin equal to `own` is no pin.
 
-Its admissions carry `Origin::Rooted`; one made under `own` is never a member. `PinSource` is implemented
-for `Arc<P>`, so the gate and any other reader can share one source.
+Its admissions carry `Origin::Rooted`; one made under `own` is never a member. One made on a held slip
+names that slip in `Admitted::held()`: to cut the session later, record that, not the presented token.
+`PinSource` and `HeldSource` are implemented for `Arc`, so the gate and the code that updates a source can
+share one.
 
 A link is `<key>.<token>`: it carries the authority's public key beside the token, so a holder can
 decode and narrow it entirely offline, and a dialer learns which node to reach from the link alone. The
@@ -200,7 +208,7 @@ When a load or a write refuses, `DenylistError` says why; each variant's docs na
 A store of your own can revoke a device's key too. `Revocations::is_revoked_peer` is asked about the
 transport-proven dialer before any token is read, and a `true` refuses that device whatever it presents,
 including a token minted for it later. It defaults to `false`, so a store that keeps only token ids
-needs nothing new. `Arc` passes the question on to the store it shares; a wrapper of your own must do
+can leave it out. `Arc` passes the question on to the store it shares; a wrapper of your own must do
 the same, or it answers the default.
 
 To reload live as `Denylist` does, use `FileStamp::of`: it takes a file's metadata and returns its
@@ -215,8 +223,9 @@ nauthy is the authorization layer, and no more. Three things are yours:
 
 - **A transport-proven peer.** You call `ProvenPeer::from_handshake` from the code that finished the
   handshake. nauthy consumes the proof; it does not perform the handshake.
-- **A revocation store.** Use `Denylist`, or implement the `Revocations` trait (one required method)
-  over whatever you keep (a database, Redis, a gossip set). The gate consults it synchronously.
+- **A revocation store.** Use `Denylist`, or implement the `Revocations` trait (one required method,
+  `is_revoked_ids`) over whatever you keep (a database, Redis, a gossip set). The gate consults it
+  synchronously.
 - **Where secrets come from.** An identity is any 32-byte ed25519 secret. Deriving many device secrets
   from one root seed (so one person's devices share an authority) is your identity layer's job; nauthy
   mints a badge for whatever key you name.
