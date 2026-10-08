@@ -105,15 +105,18 @@ pub(crate) const AUTHORIZER_LIMITS: AuthorizerLimits = AuthorizerLimits {
 
 /// The most facts an evaluation may start from: the token's own authority facts plus the ones nauthy's
 /// authorizer program injects. This crate AUTHORED every legitimate token, so the real number is known
-/// and small: at most `authority_bound` + `expires_at` + `member` from the authority block (three, and no
-/// mint emits all three), plus `time` + `service` + `bound_device` + `foreign_member` from the verify
-/// programs (at most three of the four on any one path). Six, so sixteen is double headroom for a grant
-/// shape we have not minted yet, and still leaves the worst case tiny (see [`MAX_JOIN_ARITY`]).
+/// and small: at most two of `authority_bound`, `device_bound` and `member`, beside `expires_at`, from the
+/// authority block (three, and no mint emits more), plus `time` + `service` + `bound_device` +
+/// `foreign_member` from the verify programs (at most three of the four on any one path). Six, so sixteen
+/// is double headroom for a grant shape we have not minted yet, and still leaves the worst case tiny (see
+/// [`MAX_JOIN_ARITY`]).
 const MAX_TOKEN_FACTS: usize = 16;
 
 /// The widest join a check body may ask for. Every check this crate emits joins ONE predicate
-/// (`check if service($s), $s == ...`) except the authority-bound slip's, which joins two
-/// (`check if authority_bound($x), foreign_member($x)`), so two is exactly the grammar and not a guess.
+/// (`check if service($s), $s == ...`) except the two holder checks, which join a holder fact to the fact
+/// a verify injects: the authority-bound slip's (`check if authority_bound($x), foreign_member($x)`) and
+/// the device-bound slip's (`check if device_bound($d), bound_device($d)`). So two is exactly the grammar
+/// and not a guess.
 ///
 /// With [`MAX_TOKEN_FACTS`] this is the whole structural guarantee: evaluation cost is `O(F^k)` in the
 /// fact count `F` and the body arity `k`, so bounding BOTH pins the worst case at `16^2` = 256 candidate
@@ -285,15 +288,20 @@ impl Identity {
     /// `bound_to`.
     ///
     /// The standing-access primitive for an outsider's single device. Like [`Identity::mint`] it grants a
-    /// named SERVICE (never `member`, so it is per-service access, never whole-node admission), but it
-    /// carries the same `check if bound_device` binding a membership badge does (see
-    /// [`Identity::mint_member`]). So a copy observed in flight and replayed from a DIFFERENT key verifies
-    /// against no one, and a slip presented with no proven dialer (`request.bound_device` is `None`) grants
-    /// nothing: theft-resistant, inert unless the presenter IS the bound device. It needs no new verify
-    /// path, [`Cap::verify_at_root_without_revocation`] already injects the proven dialer as `bound_device`,
-    /// so the binding check falls out of the existing service verification. Only the authority (this
-    /// identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
+    /// named SERVICE (never `member`, so it is per-service access, never whole-node admission), but it is
+    /// bound to one device the way a membership badge is (see [`Identity::mint_member`]). So a copy
+    /// observed in flight and replayed from a DIFFERENT key verifies against no one, and a slip presented
+    /// with no proven dialer (`request.bound_device` is `None`) grants nothing: theft-resistant, inert
+    /// unless the presenter IS the bound device. A verify injects the proven dialer as `bound_device`
+    /// ([`Cap::verify_at_root_without_revocation`]), so the binding check runs inside the service
+    /// verification. Only the authority (this identity) can mint one (minting needs the root secret), and attenuation only ADDS checks, so a
     /// device-bound slip can never be widened into an unbound slip or a badge.
+    ///
+    /// The device is written ONCE, as a `device_bound` AUTHORITY fact, the way
+    /// [`mint_authority_slip`](Self::mint_authority_slip) writes its foreign authority, and the binding
+    /// check reads that fact. So an issuer that holds the slip itself reads its holder from what it signed
+    /// (see [`HeldSlip::verify`](crate::HeldSlip::verify)), never from a record kept beside it, and the
+    /// holder it reads is the holder the check enforces.
     pub fn mint_bound(
         &self,
         service: &Service,
@@ -301,12 +309,22 @@ impl Identity {
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
         // `expires_at`: the advisory, readable twin of the expiry check (see [`Cap::expiry`]).
+        //
+        // The holder fact is `device_bound`, NEVER `bound_device`: that one is the fact a verify INJECTS
+        // for the proven dialer, so an authority block carrying `bound_device(X)` would satisfy its own
+        // binding check for every presenter and turn the slip into a bearer one.
+        //
+        // The binding check JOINS the two: it passes only when the injected dialer equals the holder this
+        // block names. The holder is stated once, so a reader of the fact and the check can never disagree
+        // about whom the slip is for. A check in the authority block sees only that block's facts and the
+        // verifier's, so a `device_bound` a holder appends in a later block never satisfies it.
         let token = biscuit!(
             r#"
+            device_bound({bound});
             expires_at({expiry});
             check if service($s), $s == {service};
             check if time($t), $t <= {expiry};
-            check if bound_device($d), $d == {bound};
+            check if device_bound($d), bound_device($d);
             "#,
             service = service.as_str(),
             expiry = expiry,
@@ -485,12 +503,25 @@ impl Cap {
         }
         // Read the pinned foreign root from the authority block (origin-0 only, so an attenuation-block
         // `authority_bound` is invisible). A missing fact is a clean "not this kind".
-        let x_text = self
-            .authority_bound_text()?
+        let x = self
+            .authority_bound_root()?
             .ok_or(CapError::NotAuthorityBound)?;
-        let x = x_text
-            .parse::<VerifyKey>()
-            .map_err(|_| CapError::MalformedAuthority)?;
+        self.verify_bound_to_authority(request, root, x)
+    }
+
+    /// The authorize half of
+    /// [`verify_authority_bound_at_root_without_revocation`](Self::verify_authority_bound_at_root_without_revocation),
+    /// for a caller that already read and parsed `x` from this cap's `authority_bound` fact, so the fact
+    /// is not read and the key not parsed a second time. Returns `x` on success.
+    pub(crate) fn verify_bound_to_authority(
+        &self,
+        request: &Request,
+        root: VerifyKey,
+        x: VerifyKey,
+    ) -> Result<VerifyKey, CapError> {
+        if self.root != root {
+            return Err(CapError::ForeignRoot);
+        }
         // Authorize the slip's service + expiry checks AND satisfy its `foreign_member($x)` check by
         // injecting the authority it named. This is what makes it authorize HERE and NOWHERE else; the gate
         // still ANDs an independent badge check under `x` before it admits, so this method never admits on
@@ -574,15 +605,7 @@ impl Cap {
     /// A check reads the clock when a query's body names the `time` predicate, the only fact that carries
     /// the request's clock. Checks that do not (service, device binding, membership) set no bound.
     pub fn valid_until(&self) -> Result<Option<SystemTime>, CapError> {
-        let authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
-        let (_facts, _rules, checks, _policies) = authorizer.dump();
-        checks.iter().filter_map(clock_bound).try_fold(
-            None,
-            |earliest: Option<SystemTime>, bound| {
-                let bound = bound?;
-                Ok(Some(earliest.map_or(bound, |held| held.min(bound))))
-            },
-        )
+        earliest_end(&self.budgeted_authorizer(AuthorizerBuilder::new())?)
     }
 
     /// Whether this cap is an AUTHORITY-BOUND slip: it carries an `authority_bound` fact in its AUTHORITY
@@ -639,21 +662,43 @@ impl Cap {
         Ok(rows.into_iter().next().map(|(x,)| x))
     }
 
-    /// Whether this cap is a MEMBERSHIP badge by what its issuer signed: its AUTHORITY block carries
-    /// `member(true)`. Reads origin-0 facts only, the same wall as `authority_bound_text`, and asks nothing
-    /// about the peer, the time, or any added block.
+    /// What this cap's AUTHORITY block says about whom it was signed for, and when it ends, read in ONE
+    /// pass: one budgeted authorizer, evaluated once, asked every question (see [`AuthorityFacts`]).
     ///
-    /// This is the question a path that must never admit a member asks, and it is deliberately not
-    /// [`verify_member_at_root_without_revocation`](Self::verify_member_at_root_without_revocation): that
-    /// one supplies no `service` fact, so a holder who narrows a badge to one service with
-    /// [`attenuate`](Self::attenuate) makes it fail there while it still passes the service question. The
-    /// badge is still a badge, and this read still sees it.
-    pub(crate) fn is_member_badge(&self) -> Result<bool, CapError> {
+    /// Each fact is read at origin 0 only, the same wall as `authority_bound_text`: `query` defaults its
+    /// scope to the authority block, so a `member`, `device_bound` or `authority_bound` fact a holder
+    /// appends is invisible. The end is [`valid_until`](Self::valid_until)'s, read from the same
+    /// authorizer's checks, so it still covers every block.
+    pub(crate) fn authority_facts(&self) -> Result<AuthorityFacts, CapError> {
         let mut authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
-        let rows: Vec<(bool,)> = authorizer
+        let until = earliest_end(&authorizer);
+        // The world runs on the first query and is kept, so the next two only match a rule against it.
+        let member: Vec<(bool,)> = authorizer
             .query("badge(true) <- member(true)")
             .map_err(CapError::from_evaluation)?;
-        Ok(!rows.is_empty())
+        let device: Vec<(String,)> = authorizer
+            .query("device($d) <- device_bound($d)")
+            .map_err(CapError::from_evaluation)?;
+        let authority: Vec<(String,)> = authorizer
+            .query("bound($x) <- authority_bound($x)")
+            .map_err(CapError::from_evaluation)?;
+        // Every holder fact is kept, never only the first: a check that reads the fact admits each one
+        // it names, so a reader that kept one would report a holder narrower than the slip admits.
+        Ok(AuthorityFacts {
+            member: !member.is_empty(),
+            devices: device.into_iter().map(|(device,)| device).collect(),
+            authorities: authority
+                .into_iter()
+                .map(|(authority,)| authority)
+                .collect(),
+            until,
+        })
+    }
+
+    /// How many blocks this token carries: one for a slip as its issuer signed it, more once a holder has
+    /// narrowed it.
+    pub(crate) fn block_count(&self) -> usize {
+        self.token.block_count()
     }
 
     /// Evaluate `program` against this token under [`AUTHORIZER_LIMITS`] and rule on its policies.
@@ -859,6 +904,190 @@ impl Identity {
         let token = token
             .append(block!(r#"member(true);"#))
             .map_err(CapError::Attenuate)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a token no mint writes, signed by this identity: a membership badge that ALSO names its
+    /// device in a `device_bound` fact and checks one service, so it carries everything a held device slip
+    /// carries. Only the membership question tells it from one, which is what the held verify must ask.
+    pub(crate) fn mint_member_naming_device(
+        &self,
+        service: &Service,
+        bound_to: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            member(true);
+            device_bound({bound});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if device_bound($d), bound_device($d);
+            "#,
+            service = service.as_str(),
+            expiry = expiry,
+            bound = bound_to.to_string(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a device-bound slip whose advisory `expires_at` fact says `advertised` while its clock
+    /// check ends at `expiry`, so a reader of the fact and a reader of the check disagree. No mint writes
+    /// one; a held grant must end where the check ends.
+    pub(crate) fn mint_bound_advertising(
+        &self,
+        service: &Service,
+        bound_to: VerifyKey,
+        expiry: SystemTime,
+        advertised: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            device_bound({bound});
+            expires_at({advertised});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if device_bound($d), bound_device($d);
+            "#,
+            service = service.as_str(),
+            expiry = expiry,
+            advertised = advertised,
+            bound = bound_to.to_string(),
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a device-bound slip whose `device_bound` fact names `named` verbatim, so a test can sign
+    /// a holder that is not a well-formed key, which [`Identity::mint_bound`] cannot express because it
+    /// takes a typed [`VerifyKey`]. Its binding check reads that fact, as the mint's does.
+    pub(crate) fn mint_bound_naming(
+        &self,
+        service: &Service,
+        named: &str,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            device_bound({named});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if device_bound($d), bound_device($d);
+            "#,
+            service = service.as_str(),
+            expiry = expiry,
+            named = named,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a slip naming BOTH a device and a foreign authority as its holder, which no mint writes.
+    /// It carries no binding check, so only the held verify's refusal of two holders stops it.
+    pub(crate) fn mint_naming_two_holders(
+        &self,
+        service: &Service,
+        device: VerifyKey,
+        foreign_root: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            device_bound({device});
+            authority_bound({root});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            "#,
+            device = device.to_string(),
+            root = foreign_root.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: a device-bound slip naming TWO devices, which no mint writes. Its binding check reads
+    /// the fact the way [`Identity::mint_bound`]'s does, so its datalog admits either device, and only a
+    /// read that refuses more than one holder stops it.
+    pub(crate) fn mint_naming_two_devices(
+        &self,
+        service: &Service,
+        first: VerifyKey,
+        second: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            device_bound({first});
+            device_bound({second});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if device_bound($d), bound_device($d);
+            "#,
+            first = first.to_string(),
+            second = second.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
+        Ok(Cap {
+            root: self.verifying_key(),
+            token,
+        })
+    }
+
+    /// Test-only: an authority slip naming TWO foreign authorities, which no mint writes. Its check is
+    /// [`Identity::mint_authority_slip`]'s, so its datalog admits a member of either, and only a read that
+    /// refuses more than one holder stops it.
+    pub(crate) fn mint_naming_two_authorities(
+        &self,
+        service: &Service,
+        first: VerifyKey,
+        second: VerifyKey,
+        expiry: SystemTime,
+    ) -> Result<Cap, CapError> {
+        let token = biscuit!(
+            r#"
+            authority_bound({first});
+            authority_bound({second});
+            expires_at({expiry});
+            check if service($s), $s == {service};
+            check if time($t), $t <= {expiry};
+            check if authority_bound($x), foreign_member($x);
+            "#,
+            first = first.to_string(),
+            second = second.to_string(),
+            service = service.as_str(),
+            expiry = expiry,
+        )
+        .build(&self.root)
+        .map_err(CapError::Mint)?;
         Ok(Cap {
             root: self.verifying_key(),
             token,
@@ -1248,6 +1477,40 @@ fn opens_a_closure(op: &Op) -> bool {
     }
 }
 
+/// What a cap's authority block says about whom it was signed for, and its end, as
+/// [`Cap::authority_facts`] reads them in one pass.
+///
+/// Keys stay the text the issuer signed. Parsing one is the costliest step of a read (a curve point
+/// decompression), so only a path that uses the key parses it, and a path that binds a slip to the
+/// peer presenting it never does.
+pub(crate) struct AuthorityFacts {
+    /// Whether the authority block carries `member(true)`: a membership badge by what its issuer signed,
+    /// whatever the peer, the time, or any block a holder added. Not the membership VERIFY: that supplies
+    /// no `service` fact, so a holder who narrows a badge to one service makes it fail there while it
+    /// still passes the service question. The badge is still a badge, and this read still sees it.
+    pub(crate) member: bool,
+    /// Every device a `device_bound` fact names (see [`Identity::mint_bound`]). A mint writes at most
+    /// one; more is a slip that names several holders, which a reader refuses rather than picks from.
+    pub(crate) devices: Vec<String>,
+    /// Every foreign authority an `authority_bound` fact names (see [`Identity::mint_authority_slip`]).
+    /// A mint writes at most one, as for `devices`.
+    pub(crate) authorities: Vec<String>,
+    /// [`Cap::valid_until`]'s answer, from the same authorizer.
+    pub(crate) until: Result<Option<SystemTime>, CapError>,
+}
+
+/// The earliest end any check `authorizer` loaded sets, as [`Cap::valid_until`] defines it.
+fn earliest_end(authorizer: &Authorizer) -> Result<Option<SystemTime>, CapError> {
+    let (_facts, _rules, checks, _policies) = authorizer.dump();
+    checks
+        .iter()
+        .filter_map(clock_bound)
+        .try_fold(None, |earliest: Option<SystemTime>, bound| {
+            let bound = bound?;
+            Ok(Some(earliest.map_or(bound, |held| held.min(bound))))
+        })
+}
+
 /// The latest instant `check` can pass at, or `None` when it does not read the clock at all.
 ///
 /// A check passes when ANY of its queries does, so a check of several recognized time queries is bounded
@@ -1363,10 +1626,10 @@ pub enum CapError {
     /// structural break is a malformed input, not a security event.
     #[error("not a link: expected <key>.<token>")]
     Malformed,
-    /// The cap parsed and verified, but the authority key its `authority_bound` fact pins is not a
-    /// well-formed [`VerifyKey`]. A property of a signed token, not of link text, so it is kept apart from
+    /// The cap parsed and verified, but the key its `authority_bound` or `device_bound` fact names is not
+    /// a well-formed [`VerifyKey`]. A property of a signed token, not of link text, so it is kept apart from
     /// [`Malformed`](Self::Malformed): the input was a link, and the issuer signed a key nobody can hold.
-    #[error("capability pins a malformed authority key")]
+    #[error("capability names a malformed key")]
     MalformedAuthority,
     /// The token decoded but its signature chain did not verify against the embedded root: tampered,
     /// truncated mid-chain, or never signed by the key it claims. A security-relevant failure, kept distinct

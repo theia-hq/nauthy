@@ -12,8 +12,9 @@
 //!   (a [`VerifyKey`] you own). One key you own authorizes both your own devices and anyone you delegate to,
 //!   offline and revocably: the thing `authorized_keys` cannot do.
 //! - [`Gate::Anchored`] permits what a rooted gate permits under a pin it reads live ([`PinSource`]), plus
-//!   the service slips this machine's own key signed and recorded ([`IssuedIds`]). The own key never makes a
-//!   member.
+//!   the service slips this machine's own key signed and recorded ([`IssuedIds`]), plus a proven key
+//!   admitted on a slip this machine's own key signed and keeps ([`HeldSlips`]): one for that key, or for
+//!   a foreign authority whose badge the key presents. The own key never makes a member.
 //!
 //! One authority signs four grant shapes, verified offline against it:
 //! - a **membership badge** ([`Identity::mint_member`]): whole-node admission, bound to one device;
@@ -57,6 +58,7 @@
 
 mod cap;
 mod gate;
+mod held;
 mod key;
 mod link;
 mod revocations;
@@ -68,6 +70,8 @@ mod stamp;
 mod cap_tests;
 #[cfg(test)]
 mod gate_tests;
+#[cfg(test)]
+mod held_tests;
 #[cfg(test)]
 mod key_tests;
 #[cfg(test)]
@@ -83,6 +87,9 @@ mod stamp_tests;
 pub use crate::cap::{Cap, CapError, Identity, Request};
 pub use crate::gate::{
     Admission, Admitted, Anchor, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
+};
+pub use crate::held::{
+    HeldBadge, HeldGrant, HeldSlip, HeldSlipError, HeldSlips, HeldSource, Holder,
 };
 pub use crate::key::{KeyError, KeyParseError, VerifyKey};
 pub use crate::link::Link;

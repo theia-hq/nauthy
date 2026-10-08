@@ -538,7 +538,7 @@ fn a_pinned_authority_that_is_no_key_is_its_own_error() {
     assert!(matches!(at_gate, Err(CapError::MalformedAuthority)));
     assert_eq!(
         CapError::MalformedAuthority.to_string(),
-        "capability pins a malformed authority key"
+        "capability names a malformed key"
     );
 }
 

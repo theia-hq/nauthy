@@ -15,6 +15,7 @@ use crate::gate::{
     Admission, Checked, Decision, Gate, IssuedIds, Origin, PinSource, ProvenPeer, Refusal,
     is_recorded,
 };
+use crate::held::{HeldSlipError, HeldSlips, HeldSource};
 use crate::revocations::{Denylist, Exclusive, Revocation, RevocationId, Revocations};
 use crate::service::Service;
 use crate::{STAT_DEBOUNCE, VerifyKey};
@@ -594,8 +595,8 @@ struct DisabledMidEvaluation {
 }
 
 impl crate::revocations::Revocations for DisabledMidEvaluation {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        if cap.root() != self.root {
+    fn is_revoked_ids(&self, root: &VerifyKey, _ids: &[RevocationId]) -> bool {
+        if *root != self.root {
             return false;
         }
         self.asked
@@ -717,7 +718,7 @@ impl RevokedKey {
 }
 
 impl crate::revocations::Revocations for RevokedKey {
-    fn is_revoked(&self, _cap: &Cap) -> bool {
+    fn is_revoked_ids(&self, _root: &VerifyKey, _ids: &[RevocationId]) -> bool {
         self.caps_asked
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         false
@@ -909,12 +910,21 @@ impl IssuedIds for Ledger {
     }
 }
 
+/// A source that holds no slips: every gate in this file rules on presented tokens alone.
+struct HoldsNothing;
+
+impl HeldSource for HoldsNothing {
+    fn current(&self) -> Option<Arc<HeldSlips>> {
+        None
+    }
+}
+
 /// A store that recalls every id of the caps it was given.
 struct RecalledIds(Vec<RevocationId>);
 
 impl crate::revocations::Revocations for RecalledIds {
-    fn is_revoked(&self, cap: &Cap) -> bool {
-        cap.revocation_ids().iter().any(|id| self.0.contains(id))
+    fn is_revoked_ids(&self, _root: &VerifyKey, ids: &[RevocationId]) -> bool {
+        ids.iter().any(|id| self.0.contains(id))
     }
 }
 
@@ -925,6 +935,7 @@ fn anchored_gate(pin: Option<u8>, issued: &[&Cap]) -> Gate {
         own_key(),
         Denylist::for_repair(PathBuf::new()),
         Ledger::of(issued),
+        HoldsNothing,
     )
 }
 
@@ -1050,11 +1061,12 @@ fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
     let appended = slip
         .attenuate_with_raw_datalog("member(true);")
         .expect("append a fact");
-    assert!(!appended.is_member_badge().expect("read"));
+    assert!(!appended.authority_facts().expect("read").member);
     assert!(
         bound_badge(OWN, some_peer())
-            .is_member_badge()
+            .authority_facts()
             .expect("read")
+            .member
     );
     let gate = anchored_gate(Some(PIN), &[&slip]);
     assert_eq!(
@@ -1067,10 +1079,19 @@ fn a_member_fact_in_an_added_block_does_not_make_a_badge() {
 fn an_undecided_membership_refuses_the_own_key_path_as_undecided() {
     // The own-key path refuses a member cap, so a membership question that never finished cannot let the
     // cap through to the slip check: it may be a member. It is refused, and as `Undecided`, since nothing
-    // was decided about the holder.
-    assert_eq!(Checked::Granted.refuse_member(), Err(Refusal::NotGranted));
-    assert_eq!(Checked::Undecided.refuse_member(), Err(Refusal::Undecided));
-    assert_eq!(Checked::NotGranted.refuse_member(), Ok(()));
+    // was decided about the holder. `OwnSlip::read` reads an undecided membership as an undecided denial.
+    let store = RecalledIds(Vec::new());
+    let cap = slip(OWN, "ssh");
+    assert_eq!(
+        HeldSlipError::MemberBadge.checked().decide(&store, &cap),
+        Decision::Refuse(Refusal::NotGranted)
+    );
+    assert_eq!(
+        HeldSlipError::Denied(CapError::Undecided)
+            .checked()
+            .decide(&store, &cap),
+        Decision::Refuse(Refusal::Undecided)
+    );
 }
 
 #[test]
@@ -1133,6 +1154,7 @@ fn a_revoked_self_slip_is_refused() {
         own_key(),
         RecalledIds(issued.revocation_ids()),
         Ledger::of(&[&issued]),
+        HoldsNothing,
     );
     assert_eq!(
         gate.admit(proven(some_peer()), Some(&issued), &service("ssh")),
@@ -1146,6 +1168,7 @@ fn a_revoked_self_slip_is_refused() {
         own_key(),
         RecalledIds(web.revocation_ids()),
         Ledger::of(&[&web]),
+        HoldsNothing,
     );
     assert_eq!(
         gate.admit(proven(some_peer()), Some(&web), &service("ssh")),
@@ -1161,6 +1184,7 @@ fn a_revoked_self_slip_is_refused() {
             asked: core::sync::atomic::AtomicU32::new(0),
         },
         Ledger::of(&[&issued]),
+        HoldsNothing,
     );
     assert_eq!(
         gate.admit(proven(some_peer()), Some(&issued), &service("ssh")),
@@ -1177,6 +1201,7 @@ fn anchored_gate_disabling(disabled_seed: u8, issued: &[&Cap], tag: &str) -> (Ga
         own_key(),
         denylist,
         Ledger::of(issued),
+        HoldsNothing,
     );
     (gate, path)
 }
@@ -1231,6 +1256,7 @@ fn a_pin_equal_to_own_anchors_nothing() {
         own_key(),
         Denylist::for_repair(PathBuf::new()),
         Ledger::of(&[&badge, &ssh]),
+        HoldsNothing,
     );
 
     assert_eq!(
@@ -1255,6 +1281,7 @@ fn a_pin_written_later_is_trusted_at_the_next_admission() {
         own_key(),
         Denylist::for_repair(PathBuf::new()),
         Ledger(Vec::new()),
+        HoldsNothing,
     );
 
     assert_eq!(
@@ -1317,6 +1344,7 @@ fn a_token_rooted_at_the_pin_is_ruled_as_a_rooted_gate_rules_it() {
         own_key(),
         RecalledIds(recalled.revocation_ids()),
         Ledger(Vec::new()),
+        HoldsNothing,
     );
     assert_eq!(
         gate.admit(proven(device), Some(&recalled), &service("ssh")),
@@ -1408,6 +1436,7 @@ fn a_revoked_authority_refuses_a_node_signed_authority_slip() {
             asked: core::sync::atomic::AtomicU32::new(0),
         },
         Ledger::of(&[&ssh]),
+        HoldsNothing,
     );
     assert_eq!(
         gate.admit_foreign(
@@ -1492,6 +1521,7 @@ fn an_anchored_gate_refuses_a_revoked_peer_key_before_any_cap() {
         own_key(),
         Arc::clone(&store),
         Ledger::of(&[&own_slip, &authority_bound]),
+        HoldsNothing,
     );
 
     for presented in [Some(&own_slip), Some(&bound_badge(PIN, device)), None] {
@@ -1544,6 +1574,7 @@ fn a_key_in_the_denylist_refuses_the_device_on_an_anchored_gate() {
         own_key(),
         denylist,
         Ledger::of(&[&own_slip]),
+        HoldsNothing,
     );
 
     assert_eq!(
@@ -1570,6 +1601,7 @@ fn pin_source_for_arc_reads_through() {
         own_key(),
         Denylist::for_repair(PathBuf::new()),
         Ledger(Vec::new()),
+        HoldsNothing,
     );
     pin.set(Some(identity(PIN).verifying_key()));
     assert_eq!(
@@ -1635,6 +1667,7 @@ fn gate_proven_refuses_a_revoked_peer_key_on_an_anchored_gate() {
         own_key(),
         RevokedKey::new(device),
         Ledger(Vec::new()),
+        HoldsNothing,
     );
     assert!(matches!(gate.proven(proven(device)), Err(Refusal::Revoked)));
     let sibling = identity(5).verifying_key();
@@ -1669,6 +1702,7 @@ fn gate_proven_refuses_the_sign_twin_of_a_revoked_peer_key() {
         own_key(),
         RevokedKey::new(device),
         Ledger(Vec::new()),
+        HoldsNothing,
     );
     for gate in [&rooted, &anchored] {
         assert!(matches!(gate.proven(proven(twin)), Err(Refusal::Revoked)));
