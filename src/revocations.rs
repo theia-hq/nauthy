@@ -907,7 +907,7 @@ impl Drop for WriteLock {
 }
 
 /// Non-unix builds have no cross-process file lock at the crate's minimum Rust version: std's file locking
-/// lands at 1.89 and nauthy supports 1.85, and `flock` is unix-only. Rather than hand out a guard that
+/// lands at 1.89 and nauthy supports 1.88, and `flock` is unix-only. Rather than hand out a guard that
 /// serializes nothing, [`Denylist::lock`] refuses with `LockUnsupported`; a caller that holds a lock of its
 /// own still writes. Revisit when the MSRV passes 1.89 (then this becomes `std::fs::File::lock`).
 #[cfg(feature = "fs")]
