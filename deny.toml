@@ -3,14 +3,14 @@
 # The hand-rolled scripts/lock-guard.sh owns path-drift, sibling rev, and own-version skew. This
 # owns the complementary SUPPLY-CHAIN question it does not: no crate may resolve from an
 # unexpected git host or registry (a typosquat, a hijacked mirror, an accidental `git = "a-fork"`).
-# Only our own siblings (github.com/theia-hq) and crates.io are allowed by source.
+# Only crates.io is allowed by source.
 #
 # bans and licenses stay out of scope. Run: cargo deny check sources advisories
 [sources]
 unknown-registry = "deny"
 unknown-git      = "deny"
 allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
-allow-git        = ["https://github.com/theia-hq"]
+# No git source is allowed; a sibling git dependency adds its own allow line when it enters the lock.
 
 # Advisories against the resolved graph, checked on every push, every pull request and daily
 # (.github/workflows/advisories.yml), because an advisory filed against an unchanged lock must still
