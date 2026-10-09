@@ -18,6 +18,7 @@ All notable changes to nauthy, newest first.
   `WrongLock`, a guard for another file (`the lock passed to a write on <path> guards another file`),
   and `TooLarge`, a file past the size cap (`revocation denylist file is too large`).
   `Denylist::for_repair` replaces `FileDenylist::empty` as the way back from `Lost`.
+- **nauthy needs Rust 1.88 (was 1.85)**, to take time 0.3.47, the fix for RUSTSEC-2026-0009.
 
 ### Fixed
 - **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh
