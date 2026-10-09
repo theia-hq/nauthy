@@ -513,10 +513,10 @@ impl Denylist {
     /// refresh, because the union cannot lose an entry to it.
     fn refresh(&self, state: &mut State) {
         // The first check after construction always stats, so a fresh instance sees the current file at once.
-        if let Some(last) = state.last_stat {
-            if last.elapsed() < STAT_DEBOUNCE {
-                return;
-            }
+        if let Some(last) = state.last_stat
+            && last.elapsed() < STAT_DEBOUNCE
+        {
+            return;
         }
         state.last_stat = Some(Instant::now());
         let Ok(meta) = std::fs::metadata(&self.path) else {
