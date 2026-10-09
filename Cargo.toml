@@ -28,6 +28,11 @@ ed25519-dalek = "2"
 # The advisory `flock` that serializes denylist writers. Already in the tree transitively; declared
 # directly so the syscall rides the standard binding rather than a hand-declared symbol.
 libc = "0.2"
+# Decode a token's protobuf frame to read each block's key algorithm and external signature BEFORE any
+# signature is checked (`Cap::parse`), which biscuit's own parse only exposes after it has verified the
+# chain. Already in the tree through biscuit-auth; pinned to its major so `Message` is the same trait
+# biscuit's schema types derive, and a biscuit bump that moves prost fails to compile rather than drift.
+prost = "0.10"
 # The CSPRNG traits `Identity::from_rng` accepts, so keygen needs no OS dependency in the core; the
 # OS-seeded `Identity::generate` is behind `os-rng`, which turns on rand_core's own `getrandom`.
 rand_core = "0.6"

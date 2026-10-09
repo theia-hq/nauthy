@@ -20,6 +20,14 @@ All notable changes to nauthy, newest first.
   `Denylist::for_repair` replaces `FileDenylist::empty` as the way back from `Lost`.
 - **nauthy needs Rust 1.88 (was 1.85)**, to take time 0.3.47, the fix for RUSTSEC-2026-0009.
 
+### Changed
+- **`Cap::parse` refuses token shapes nauthy never mints, before checking any signature.** New
+  `CapError` variants: `NotEd25519` for a P-256 signing key (`capability carries a key that is not
+  ed25519`); `ExternalSignature` for a biscuit third-party block (`capability carries a block signed
+  outside its chain`); `TrustedKey` for a key named in a `trusting` scope (`capability names a key to
+  trust`). A token over 16 blocks (`TooLarge`) is now also refused before the signature check. Every
+  token nauthy mints, narrows or seals still parses.
+
 ### Fixed
 - **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh
   replaced the held set with any shorter non-empty file that parsed. A refresh now adds what it reads
