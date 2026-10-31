@@ -19,11 +19,9 @@ fs = []
 os-rng = ["rand_core/getrandom"]
 
 [dependencies]
-biscuit-auth = "6"
+biscuit-auth = { git = "https://github.com/eclipse-biscuit/biscuit-rust", rev = "93832a82bf509ad81f05fdb6adaf69d03c56887b" }
 data-encoding = "2"
-# The raw ed25519 signer/verifier for the roster document (a detached signature over a blob, not a biscuit
-# token). Already in the tree transitively via biscuit-auth; declared directly so the roster primitive signs
-# with a plain, obvious ed25519 signature rather than smuggling a document into an authorization token.
+# The raw Ed25519 signer/verifier for detached documents, separate from the capability-token provider.
 ed25519-dalek = "2"
 # The advisory `flock` that serializes denylist writers. Already in the tree transitively; declared
 # directly so the syscall rides the standard binding rather than a hand-declared symbol.
@@ -32,7 +30,7 @@ libc = "0.2"
 # signature is checked (`Cap::parse`), which biscuit's own parse only exposes after it has verified the
 # chain. Already in the tree through biscuit-auth; pinned to its major so `Message` is the same trait
 # biscuit's schema types derive, and a biscuit bump that moves prost fails to compile rather than drift.
-prost = "0.10"
+prost = "0.14.3"
 # The CSPRNG traits `Identity::from_rng` accepts, so keygen needs no OS dependency in the core; the
 # OS-seeded `Identity::generate` is behind `os-rng`, which turns on rand_core's own `getrandom`.
 rand_core = "0.6"

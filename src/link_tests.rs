@@ -1,6 +1,7 @@
 //! The link as a typed value: parse/display round trip, seal, narrow, and revoke.
 
 use core::time::Duration;
+#[cfg(feature = "fs")]
 use std::time::SystemTime;
 
 use super::Link;
