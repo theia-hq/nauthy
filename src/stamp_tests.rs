@@ -126,8 +126,10 @@ fn an_mtime_set_back_by_hand_changes_the_stamp() {
 }
 
 /// Stamps on this thread report no mtime until this is dropped.
+#[cfg(feature = "fs")]
 struct NoMtime;
 
+#[cfg(feature = "fs")]
 impl NoMtime {
     fn on() -> Self {
         crate::stamp::NO_MTIME.with(|flag| flag.set(true));
@@ -135,6 +137,7 @@ impl NoMtime {
     }
 }
 
+#[cfg(feature = "fs")]
 impl Drop for NoMtime {
     fn drop(&mut self) {
         crate::stamp::NO_MTIME.with(|flag| flag.set(false));
