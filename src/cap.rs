@@ -44,7 +44,7 @@ use biscuit_auth::builder::{
 use biscuit_auth::format::schema;
 use biscuit_auth::macros::{authorizer, biscuit, block, fact};
 use biscuit_auth::{
-    Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, KeyPair, PrivateKey, PublicKey, error,
+    Authorizer, AuthorizerBuilder, AuthorizerLimits, Biscuit, PrivateKey, PublicKey, error,
 };
 use data_encoding::BASE32_NOPAD;
 use ed25519_dalek::{Signer as _, SigningKey};
@@ -157,7 +157,7 @@ pub(crate) const SIGNED_DOCUMENT_CONTEXT: &[u8] = b"nauthy-signed-document-v1\0"
 /// nauthy's: nauthy mints a device badge for whatever [`VerifyKey`] you name in `bound_to`, and where that
 /// device's secret comes from is above the auth layer.
 pub struct Identity {
-    root: KeyPair,
+    root: PrivateKey,
     /// The same ed25519 secret as `root`, as a raw signer for detached signatures over documents (the
     /// roster). Derived from the same 32-byte seed at construction, so its public half equals
     /// [`verifying_key`](Self::verifying_key): a roster this signs verifies against the same key a cap roots
@@ -173,7 +173,7 @@ impl Identity {
     pub fn from_secret(secret: &[u8; 32]) -> Result<Self, CapError> {
         let private = PrivateKey::from_bytes(secret, Algorithm::Ed25519).map_err(CapError::Key)?;
         Ok(Self {
-            root: KeyPair::from(&private),
+            root: private,
             signing: SigningKey::from_bytes(secret),
         })
     }
@@ -886,7 +886,7 @@ impl Identity {
         service: &Service,
         expiry: SystemTime,
     ) -> Result<Cap, CapError> {
-        let next = KeyPair::new_with_algorithm(Algorithm::Secp256r1);
+        let next = PrivateKey::new_with_algorithm(Algorithm::Secp256r1);
         let token = biscuit!(
             r#"
             check if service($s), $s == {service};
@@ -1072,10 +1072,10 @@ impl Cap {
     /// Test-only: append an ordinary, empty block whose NEXT key is P-256, so the block after it (or the
     /// seal) is checked by the P-256 verifier. Any holder can do this with biscuit's own API, no secret.
     pub(crate) fn attenuate_with_p256_next_key(&self) -> Result<Self, CapError> {
-        let next = KeyPair::new_with_algorithm(Algorithm::Secp256r1);
+        let next = PrivateKey::new_with_algorithm(Algorithm::Secp256r1);
         let token = self
             .token
-            .append_with_keypair(&next, biscuit_auth::builder::BlockBuilder::new())
+            .append_with_key(&next, biscuit_auth::builder::BlockBuilder::new())
             .map_err(CapError::Attenuate)?;
         Ok(Self {
             root: self.root,
@@ -1087,15 +1087,12 @@ impl Cap {
     /// external key is ed25519 on purpose, so the refusal under test is the external signature itself and
     /// not its algorithm.
     pub(crate) fn attenuate_with_external_block(&self) -> Result<Self, CapError> {
-        let external = KeyPair::new_with_algorithm(Algorithm::Ed25519);
+        let external = PrivateKey::new_with_algorithm(Algorithm::Ed25519);
         let response = self
             .token
             .third_party_request()
             .and_then(|request| {
-                request.create_block(
-                    &external.private(),
-                    biscuit_auth::builder::BlockBuilder::new(),
-                )
+                request.create_block(&external, biscuit_auth::builder::BlockBuilder::new())
             })
             .map_err(CapError::Attenuate)?;
         let token = self
@@ -1124,7 +1121,7 @@ impl Cap {
     /// shape a check reaches a third party through. biscuit decodes every such key on parse, before any
     /// trust decision, so a P-256 one runs P-256 point decoding on a stranger's bytes.
     pub(crate) fn attenuate_trusting(&self, algorithm: Algorithm) -> Result<Self, CapError> {
-        let trusted = KeyPair::new_with_algorithm(algorithm).public();
+        let trusted = PrivateKey::new_with_algorithm(algorithm).public();
         let block = biscuit_auth::builder::BlockBuilder::new()
             .code(format!("check if true trusting {trusted}"))
             .map_err(CapError::Attenuate)?;
