@@ -513,30 +513,19 @@ impl Cap {
         Ok(x)
     }
 
-    /// When the issuing authority set this cap to expire, from its `expires_at` AUTHORITY fact. `None` for
-    /// a cap that carries none.
+    /// The authority's advisory expiry date, read from its `expires_at` fact.
     ///
-    /// ADVISORY, for DISPLAY and for a holder's own pre-dial refusal. The expiry CHECK is the SOLE
-    /// enforcement and nothing on an authorization path may consult this instead: the check is datalog
-    /// evaluated over the WHOLE chain at the moment of the request, this is one fact read out of one
-    /// block. Substituting the fact for the check would silently drop every narrowing an attenuation block
-    /// added and move the decision off the engine that is the actual gate. This answers a holder's
-    /// question about its own credential ("when does my badge die", so it can warn, print a date, or
-    /// decline to dial); it answers no one else's, and it admits nothing.
+    /// Returns the start of the encoded Unix second, not the effective expiry cutoff. An inclusive
+    /// expiry check accepts that entire second, and attenuation can add an earlier expiry check.
+    /// Use [`valid_until`](Self::valid_until) for the effective inclusive boundary across all blocks.
     ///
-    /// Reads origin-0 facts only, the same wall [`authority_bound_root`](Self::authority_bound_root)
-    /// stands behind: `query`, not `query_all`, so an `expires_at` forged into an attenuation block is
-    /// invisible and the instant returned is the one THIS authority signed. That also makes it an UPPER
-    /// BOUND on the effective grant, since an attenuation can only shorten the life further and is unread
-    /// here: this never reports EARLIER than the token really allows, so a refusal built on it can never
-    /// turn away a cap the gate would have admitted. A mint writes the fact and the check from one
-    /// `SystemTime` and biscuit dates are whole seconds, so the two cannot disagree.
+    /// This reads only the authority block; an `expires_at` fact added by attenuation is ignored.
+    /// It evaluates no checks and grants nothing. Use it to display the authority's date, not to
+    /// replace authorization or determine when the cap stops granting.
     ///
-    /// `None` means the token carries no such fact (a cap minted before the fact existed, whose expiry
-    /// lives only in its check), NOT that it never expires: a surface renders that as unknown. Reading a
-    /// fact evaluates no check, so a DEAD cap still reports when it died, which is exactly when its holder
-    /// needs to be told. A signed date past what `SystemTime` can hold is
-    /// [`UnreadableExpiry`](CapError::UnreadableExpiry), never a panic.
+    /// `Ok(None)` means the authority block carries no `expires_at` fact, not that the cap never
+    /// expires. An expired cap still reports its date. A date that `SystemTime` cannot represent
+    /// returns [`UnreadableExpiry`](CapError::UnreadableExpiry).
     pub fn expiry(&self) -> Result<Option<SystemTime>, CapError> {
         // Built through the budgeted path, not `Biscuit::authorizer`: a query runs the same datalog engine
         // under the same limits, so an unbudgeted one here would fail on a busy host exactly as an
@@ -553,30 +542,29 @@ impl Cap {
             .transpose()
     }
 
-    /// The last instant this cap can grant anything, read from the time checks of EVERY block: the
-    /// earliest bound any of them sets, so a holder's narrower attenuation wins over the authority's.
+    /// The inclusive expiry bound from this cap's time checks, including every attenuation block.
     ///
-    /// Unlike [`expiry`](Self::expiry), which reads the one fact the authority signed and is only an upper
-    /// bound, this reads what the engine enforces: past the instant returned, at least one check denies,
-    /// so a caller that stops honouring the cap there never ends a grant the gate would still admit. It
-    /// still admits nothing on its own; the checks remain the gate.
+    /// For `Ok(Some(until))`, stop honouring the cap when `now > until`, not at equality. This bound
+    /// grants nothing on its own; admission still requires the cap's checks to pass.
     ///
-    /// Three answers, kept apart by type:
-    /// - `Ok(Some(t))`: every check that reads the clock is `check if time($t), $t <= <date>`, and `t` is
-    ///   the earliest such date. Every mint and [`attenuate`](Self::attenuate) writes exactly that shape.
-    /// - `Ok(None)`: no check in any block reads the clock, so time alone never ends this cap. A token
-    ///   signed by its root with no expiry at all reads this way.
-    /// - `Err(`[`UnreadableExpiry`](CapError::UnreadableExpiry)`)`: some check reads the clock in a shape
-    ///   this crate never writes (another comparison, another predicate joined in, an alternative that
-    ///   can pass without the clock, or a `check all` / `reject if`), or bounds it by a date past what
-    ///   `SystemTime` can hold (biscuit dates are any `u64`). Its expiry cannot be read, and a
-    ///   caller treats that as expired. Refusing here rather than guessing is safe for the same reason
-    ///   the evaluation-cost whitelist is: this crate authored the grammar, so only a token it could not
-    ///   have minted or narrowed is refused. A token too complex to load at all is an error too
-    ///   ([`TooComplex`](CapError::TooComplex)), and reads the same way.
+    /// Signed dates and request times use whole seconds. An inclusive expiry check accepts its entire
+    /// expiry second, so `until` is the last representable `SystemTime` in that second, not its start.
+    /// On nanosecond-resolution platforms, that is 999,999,999 nanoseconds after the second starts.
+    /// [`expiry`](Self::expiry) instead reads the authority's advisory date, without accounting for
+    /// attenuation or converting it to an effective cutoff.
     ///
-    /// A check reads the clock when a query's body names the `time` predicate, the only fact that carries
-    /// the request's clock. Checks that do not (service, device binding, membership) set no bound.
+    /// The result distinguishes three cases:
+    /// - `Ok(Some(until))`: every clock-reading check contains only queries of the form
+    ///   `time($t), $t <= <date>`. Each check uses its latest alternative's bound; the earliest bound
+    ///   across checks wins. Minting and [`attenuate`](Self::attenuate) write this form.
+    /// - `Ok(None)`: no check reads the clock, so time alone sets no expiry bound.
+    /// - `Err(`[`UnreadableExpiry`](CapError::UnreadableExpiry)`)`: a clock-reading check has another
+    ///   shape, or its date or inclusive endpoint cannot be represented. Treat the cap as expired
+    ///   rather than guessing a cutoff. A token too complex to load returns
+    ///   [`TooComplex`](CapError::TooComplex).
+    ///
+    /// A check reads the clock when a query names the `time` predicate. Checks that do not read it
+    /// set no expiry bound.
     pub fn valid_until(&self) -> Result<Option<SystemTime>, CapError> {
         let authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
         let (_facts, _rules, checks, _policies) = authorizer.dump();
@@ -1426,8 +1414,9 @@ fn reads_the_clock(query: &Rule) -> bool {
         .any(|Predicate { name, .. }| name == "time")
 }
 
-/// The date `query` bounds the clock by, when it is exactly `time($t), $t <= <date>`: the one shape every
-/// mint and attenuation writes. `None` for any other shape.
+/// The inclusive endpoint of `query`'s expiry second for exactly `time($t), $t <= <date>`.
+/// Returns the last representable instant in that second, or `None` for another shape or an
+/// unrepresentable date or endpoint.
 fn time_at_most(query: &Rule) -> Option<SystemTime> {
     // The one predicate is `time`: the caller only asks about a query that joins it.
     let [Predicate { name: _, terms }] = query.body.as_slice() else {
@@ -1450,14 +1439,16 @@ fn time_at_most(query: &Rule) -> Option<SystemTime> {
     // body never binds, and that one bounds nothing.
     // A date the clock cannot hold is unreadable, not a panic: `Term::Date` is any `u64` off the wire, and
     // one past `SystemTime`'s range would overflow the std `Add`, which panics, on a token the gate admits.
-    (bound == compared).then_some(*secs).and_then(date_at)
+    // Admission compares whole seconds, so the inclusive bound covers the encoded second in full.
+    (bound == compared)
+        .then_some(*secs)
+        .and_then(date_at)
+        .and_then(|base| base.checked_add(Duration::from_nanos(999_999_999)))
 }
 
-/// The instant `secs` seconds past the unix epoch, or `None` when `SystemTime` cannot hold it.
+/// The start of Unix second `secs`, or `None` if it cannot be represented.
 ///
-/// The ONE conversion from a biscuit date to a `SystemTime` in this crate. biscuit's own
-/// `TryFrom<Term> for SystemTime` adds unchecked, and a holder writes any `u64` date into a block, so
-/// every date read off a token comes through here and an out-of-range one fails closed.
+/// Converts a raw Biscuit date with checked arithmetic. This is not the inclusive expiry endpoint.
 fn date_at(secs: u64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs))
 }

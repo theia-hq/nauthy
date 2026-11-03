@@ -847,6 +847,152 @@ fn a_narrowed_cap_reports_the_authority_expiry() {
     );
 }
 
+fn end_of_second(offset_secs: i64) -> SystemTime {
+    at(offset_secs)
+        .checked_add(Duration::from_nanos(999_999_999))
+        .expect("the test second has a representable endpoint")
+}
+
+#[test]
+fn valid_until_matches_admission_through_the_encoded_second() {
+    let issuer = identity(1);
+    let base = at(60);
+    let cap = issuer.mint(&service("ssh"), base).expect("mint");
+    let until = cap
+        .valid_until()
+        .expect("read expiry")
+        .expect("clock bound");
+    for now in [
+        base.checked_sub(Duration::from_nanos(1)).expect("before"),
+        base,
+        base.checked_add(Duration::from_nanos(1)).expect("inside"),
+        base.checked_add(Duration::from_millis(500))
+            .expect("halfway"),
+        until,
+    ] {
+        assert!(
+            issuer
+                .verify(
+                    &cap,
+                    &Request {
+                        now,
+                        ..request("ssh", 0)
+                    }
+                )
+                .is_ok()
+        );
+    }
+    let next = base
+        .checked_add(Duration::from_secs(1))
+        .expect("next second");
+    assert!(matches!(
+        issuer.verify(
+            &cap,
+            &Request {
+                now: next,
+                ..request("ssh", 0)
+            }
+        ),
+        Err(CapError::Denied(_))
+    ));
+    assert_eq!(cap.expiry().expect("advisory date"), Some(base));
+}
+
+#[test]
+fn valid_until_is_the_last_representable_time_in_the_encoded_second() {
+    let cap = identity(1).mint(&service("ssh"), at(60)).expect("mint");
+    let until = cap
+        .valid_until()
+        .expect("read expiry")
+        .expect("clock bound");
+    let base = at(60);
+    let next = at(61);
+    assert_eq!(
+        until
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs(),
+        base.duration_since(SystemTime::UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs()
+    );
+    let gap = next
+        .duration_since(until)
+        .expect("endpoint precedes next second");
+    assert!(!gap.is_zero());
+    assert_eq!(until.checked_add(gap), Some(next));
+    // Duration has integral nanoseconds. Monotone addition at the largest duration below the gap
+    // excludes every smaller intermediate step, including on clocks coarser than a nanosecond.
+    let below_gap = gap
+        .checked_sub(Duration::from_nanos(1))
+        .expect("positive gap");
+    assert_eq!(until.checked_add(below_gap), Some(until), "gap: {gap:?}");
+}
+
+#[test]
+fn fractional_minting_keeps_the_advisory_date_and_full_effective_second() {
+    let authority = identity(1);
+    let device = identity(2).verifying_key();
+    let expiry = at(60)
+        .checked_add(Duration::from_millis(500))
+        .expect("fractional expiry");
+    let plain = authority.mint(&service("ssh"), expiry).expect("plain slip");
+    let bound = authority
+        .mint_bound(&service("ssh"), device, expiry)
+        .expect("bound slip");
+    let badge = authority.mint_member(device, expiry).expect("badge");
+    let foreign = authority
+        .mint_authority_slip(&service("ssh"), device, expiry)
+        .expect("authority-bound slip");
+    let until = plain
+        .valid_until()
+        .expect("read expiry")
+        .expect("clock bound");
+    for cap in [&plain, &bound, &badge, &foreign] {
+        assert_eq!(cap.expiry().expect("advisory date"), Some(at(60)));
+        assert_eq!(cap.valid_until().expect("effective endpoint"), Some(until));
+    }
+    for now in [expiry, until] {
+        let request = Request {
+            now,
+            ..bound_request("ssh", 0, device)
+        };
+        assert!(authority.verify(&plain, &request).is_ok());
+        assert!(authority.verify(&bound, &request).is_ok());
+        assert!(
+            badge
+                .verify_member_at_root_without_revocation(now, device, authority.verifying_key())
+                .is_ok()
+        );
+        assert!(
+            foreign
+                .verify_authority_bound_at_root_without_revocation(
+                    &request,
+                    authority.verifying_key()
+                )
+                .is_ok()
+        );
+    }
+    let request = bound_request("ssh", 61, device);
+    assert!(matches!(
+        authority.verify(&plain, &request),
+        Err(CapError::Denied(_))
+    ));
+    assert!(matches!(
+        authority.verify(&bound, &request),
+        Err(CapError::Denied(_))
+    ));
+    assert!(matches!(
+        badge.verify_member_at_root_without_revocation(at(61), device, authority.verifying_key()),
+        Err(CapError::Denied(_))
+    ));
+    assert!(matches!(
+        foreign
+            .verify_authority_bound_at_root_without_revocation(&request, authority.verifying_key()),
+        Err(CapError::Denied(_))
+    ));
+}
+
 #[test]
 fn every_minted_kind_is_valid_until_its_expiry() {
     let authority = identity(1);
@@ -867,7 +1013,7 @@ fn every_minted_kind_is_valid_until_its_expiry() {
     for cap in &kinds {
         assert_eq!(
             cap.valid_until().expect("read the chain's expiry"),
-            Some(at(60)),
+            Some(end_of_second(60)),
             "every minted kind is valid until the expiry its check enforces"
         );
     }
@@ -890,10 +1036,21 @@ fn a_narrowed_expiry_wins_over_the_authority_one() {
         .expect("a narrowed slip has one");
     assert_eq!(
         until,
-        at(60),
+        end_of_second(60),
         "the holder's narrower instant, not the authority's"
     );
     assert!(authority.verify(&narrowed, &request("ssh", 60)).is_ok());
+    assert!(
+        authority
+            .verify(
+                &narrowed,
+                &Request {
+                    now: until,
+                    ..request("ssh", 0)
+                }
+            )
+            .is_ok()
+    );
     assert!(
         matches!(
             authority.verify(&narrowed, &request("ssh", 61)),
@@ -908,7 +1065,7 @@ fn a_narrowed_expiry_wins_over_the_authority_one() {
         .expect("append a later expiry");
     assert_eq!(
         widened.valid_until().expect("read the chain's expiry"),
-        Some(at(60)),
+        Some(end_of_second(60)),
         "a later bound appended after an earlier one cannot extend the grant"
     );
 }
@@ -933,7 +1090,7 @@ fn a_cap_with_no_clock_check_is_valid_forever_and_says_so() {
         .expect("narrow the expiry");
     assert_eq!(
         narrowed.valid_until().expect("read the chain's expiry"),
-        Some(at(60))
+        Some(end_of_second(60))
     );
 }
 
@@ -1010,14 +1167,74 @@ fn a_root_signed_date_past_the_clocks_range_is_unreadable_not_a_panic() {
     assert_eq!(near.expiry().expect("read the expiry"), Some(at(3600)));
     assert_eq!(
         near.valid_until().expect("read the chain's expiry"),
-        Some(at(3600))
+        Some(end_of_second(3600))
     );
+}
+
+#[test]
+fn a_clock_bound_at_the_clocks_last_second_uses_checked_arithmetic() {
+    let mut low = 0;
+    let mut high = u64::MAX;
+    while low < high {
+        let middle = low + (high - low) / 2 + 1;
+        if SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(middle))
+            .is_some()
+        {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
+    }
+    let base = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(low))
+        .expect("last representable whole second");
+    let authority = identity(1);
+    let cap = authority
+        .mint_with_raw_expiry(&service("ssh"), low)
+        .expect("mint the last second");
+    assert_eq!(cap.expiry().expect("advisory date"), Some(base));
+    // Some clocks end within a second; others hold its full endpoint. Only the former can reach
+    // the addition-overflow guard, while both must refuse the next unrepresentable whole second.
+    match base.checked_add(Duration::from_nanos(999_999_999)) {
+        Some(until) => {
+            assert_eq!(cap.valid_until().expect("effective endpoint"), Some(until));
+            assert_eq!(
+                until
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .expect("after epoch")
+                    .as_secs(),
+                low
+            );
+        }
+        None => assert!(matches!(cap.valid_until(), Err(CapError::UnreadableExpiry))),
+    }
+    let next = low
+        .checked_add(1)
+        .expect("the clock range ends before u64::MAX");
+    assert!(
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_secs(next))
+            .is_none()
+    );
+    let unreadable = authority
+        .mint_with_raw_expiry(&service("ssh"), next)
+        .expect("mint the first unrepresentable second");
+    assert!(matches!(
+        unreadable.expiry(),
+        Err(CapError::UnreadableExpiry)
+    ));
+    assert!(matches!(
+        unreadable.valid_until(),
+        Err(CapError::UnreadableExpiry)
+    ));
 }
 
 #[test]
 fn a_check_of_several_clock_alternatives_ends_at_the_latest() {
     // A check passes when any of its queries does, so of two clock bounds the later one is the check's.
-    let slip = identity(1)
+    let authority = identity(1);
+    let slip = authority
         .mint(&service("ssh"), at(3600))
         .expect("mint a slip");
     let either = slip
@@ -1027,8 +1244,27 @@ fn a_check_of_several_clock_alternatives_ends_at_the_latest() {
         .expect("append the block");
     assert_eq!(
         either.valid_until().expect("read the chain's expiry"),
-        Some(at(1000))
+        Some(end_of_second(1000))
     );
+    let until = either
+        .valid_until()
+        .expect("read expiry")
+        .expect("clock bound");
+    assert!(
+        authority
+            .verify(
+                &either,
+                &Request {
+                    now: until,
+                    ..request("ssh", 0)
+                }
+            )
+            .is_ok()
+    );
+    assert!(matches!(
+        authority.verify(&either, &request("ssh", 1001)),
+        Err(CapError::Denied(_))
+    ));
 }
 
 #[test]
