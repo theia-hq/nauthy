@@ -29,6 +29,7 @@ All notable changes to nauthy, newest first.
   token nauthy mints, narrows or seals still parses.
 
 ### Fixed
+- **`Cap::valid_until` returns `UnreadableExpiry` when clock-reading checks coexist with token-provided unary `time` date facts, regardless of scope or date.**
 - **`Cap::valid_until` returns the inclusive end of an encoded expiry second instead of its start.**
 - **A shorter denylist file no longer un-revokes a cap in a running process.** In v0.11.0 a refresh
   replaced the held set with any shorter non-empty file that parsed. A refresh now adds what it reads

@@ -557,24 +557,39 @@ impl Cap {
     /// - `Ok(Some(until))`: every clock-reading check contains only queries of the form
     ///   `time($t), $t <= <date>`. Each check uses its latest alternative's bound; the earliest bound
     ///   across checks wins. Minting and [`attenuate`](Self::attenuate) write this form.
+    ///   The token contains no unary `time` fact whose argument is a date.
     /// - `Ok(None)`: no check reads the clock, so time alone sets no expiry bound.
     /// - `Err(`[`UnreadableExpiry`](CapError::UnreadableExpiry)`)`: a clock-reading check has another
-    ///   shape, or its date or inclusive endpoint cannot be represented. Treat the cap as expired
-    ///   rather than guessing a cutoff. A token too complex to load returns
+    ///   shape, or its date or inclusive endpoint cannot be represented. This also occurs when a
+    ///   clock-reading check is present and the token supplies a unary `time` fact with a date
+    ///   argument, regardless of scope or date. Shape, date and endpoint errors take precedence.
+    ///   Treat the cap as expired rather than guessing a cutoff. A token too complex to load returns
     ///   [`TooComplex`](CapError::TooComplex).
     ///
     /// A check reads the clock when a query names the `time` predicate. Checks that do not read it
     /// set no expiry bound.
     pub fn valid_until(&self) -> Result<Option<SystemTime>, CapError> {
         let authorizer = self.budgeted_authorizer(AuthorizerBuilder::new())?;
-        let (_facts, _rules, checks, _policies) = authorizer.dump();
-        checks.iter().filter_map(clock_bound).try_fold(
+        let (facts, _rules, checks, _policies) = authorizer.dump();
+        let until = checks.iter().filter_map(clock_bound).try_fold(
             None,
-            |earliest: Option<SystemTime>, bound| {
+            |earliest: Option<SystemTime>, bound| -> Result<_, CapError> {
                 let bound = bound?;
                 Ok(Some(earliest.map_or(bound, |held| held.min(bound))))
             },
-        )
+        )?;
+        // The empty program injects no request clock: every fact here came from the token.
+        // A token clock can satisfy a check independently of request time, so its extracted bound
+        // is unsupported even when that particular fact is invisible or later than the bound.
+        if until.is_some()
+            && facts.iter().any(|fact| {
+                fact.predicate.name == "time"
+                    && matches!(fact.predicate.terms.as_slice(), [Term::Date(_)])
+            })
+        {
+            return Err(CapError::UnreadableExpiry);
+        }
+        Ok(until)
     }
 
     /// Whether this cap is an AUTHORITY-BOUND slip: it carries an `authority_bound` fact in its AUTHORITY
