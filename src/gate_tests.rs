@@ -627,6 +627,37 @@ fn a_foreign_root_disabled_during_evaluation_is_refused_on_the_second_read() {
 }
 
 #[test]
+fn unreadable_token_clocks_classify_as_refused() {
+    let authority = identity(1);
+    let cap = authority
+        .mint(
+            &service("ssh"),
+            SystemTime::UNIX_EPOCH + Duration::from_secs(3600),
+        )
+        .expect("mint")
+        .attenuate_with_raw_datalog("time(1970-01-01T00:00:00Z);")
+        .expect("append token clock")
+        .attenuate_with_raw_datalog(
+            "check if time($t), $t <= 1970-01-01T00:01:00Z trusting previous;",
+        )
+        .expect("append scoped bound");
+    let request = Request {
+        service: service("ssh"),
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(61),
+        bound_device: None,
+    };
+    assert!(authority.verify(&cap, &request).is_ok());
+    // Admission does not extract expiry here. Pin the existing error-classification seam without
+    // pretending this is an end-to-end gate invocation or replacing its request clock.
+    let checked = cap.valid_until().map(|_| authority.verifying_key());
+    assert_eq!(
+        Checked::from(checked).decide(&RecalledIds(Vec::new()), &cap),
+        Decision::Refuse(Refusal::NotGranted),
+        "unreadable token clock expiry must classify as a refusal, not a grant"
+    );
+}
+
+#[test]
 fn an_undecided_check_refuses_as_undecided_never_as_a_denial() {
     // A check that ran out of its evaluation budget decided NOTHING about the holder, so the gate must not
     // report the refusal every non-granting token gets: the peer would read "you are not authorized" from a

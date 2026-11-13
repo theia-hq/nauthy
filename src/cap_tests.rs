@@ -1095,6 +1095,123 @@ fn a_cap_with_no_clock_check_is_valid_forever_and_says_so() {
 }
 
 #[test]
+fn token_clocks_make_expiry_unreadable() {
+    let authority = identity(1);
+    let epoch = SystemTime::UNIX_EPOCH;
+    let slip = authority
+        .mint(&service("ssh"), epoch + Duration::from_secs(3600))
+        .expect("mint");
+    let previous = slip
+        .attenuate_with_raw_datalog("time(1970-01-01T00:00:00Z);")
+        .expect("append token clock")
+        .attenuate_with_raw_datalog(
+            "check if time($t), $t <= 1970-01-01T00:01:00Z trusting previous;",
+        )
+        .expect("append scoped bound");
+    let same = slip
+        .attenuate_with_raw_datalog(
+            "time(1970-01-01T00:00:00Z); check if time($t), $t <= 1970-01-01T00:01:00Z;",
+        )
+        .expect("append clock and bound together");
+    for cap in [previous, same] {
+        let cap = Cap::parse(cap.link().expect("encode").as_str()).expect("parse");
+        let request = Request {
+            service: service("ssh"),
+            now: epoch + Duration::from_secs(61),
+            bound_device: None,
+        };
+        assert_eq!(
+            authority
+                .verify(&cap, &request)
+                .expect("token clock satisfies the bound"),
+            authority.verifying_key()
+        );
+        assert!(
+            matches!(cap.valid_until(), Err(CapError::UnreadableExpiry)),
+            "a token clock must not yield the bypassed second-60 cutoff"
+        );
+    }
+}
+
+#[test]
+fn scoped_checks_keep_readable_expiry() {
+    let authority = identity(1);
+    let slip = authority.mint(&service("ssh"), at(3600)).expect("mint");
+    for scope in ["authority", "previous"] {
+        let cap = slip
+            .attenuate_with_raw_datalog(&format!(
+                "label(\"kept\"); check if label(\"kept\") trusting {scope};
+                check if time($t), $t <= 2023-11-14T22:14:20Z trusting {scope};"
+            ))
+            .expect("append scoped checks without a token clock");
+        assert_eq!(
+            cap.valid_until().expect("read scoped bound"),
+            Some(end_of_second(60))
+        );
+        assert!(authority.verify(&cap, &request("ssh", 60)).is_ok());
+        assert!(matches!(
+            authority.verify(&cap, &request("ssh", 61)),
+            Err(CapError::Denied(_))
+        ));
+    }
+}
+
+#[test]
+fn non_date_clocks_keep_readable_expiry() {
+    let authority = identity(1);
+    let slip = authority.mint(&service("ssh"), at(3600)).expect("mint");
+    for source in [
+        "time(1970-01-01T00:00:00Z, 1970-01-01T00:00:00Z);",
+        "time(0);",
+        "time(\"clock\");",
+        "timestamp(1970-01-01T00:00:00Z);",
+    ] {
+        let cap = slip
+            .attenuate_with_raw_datalog(source)
+            .expect("append fact");
+        assert_eq!(
+            cap.valid_until()
+                .expect("irrelevant fact leaves the bound readable"),
+            Some(end_of_second(3600)),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn token_clocks_without_checks_have_no_expiry() {
+    let cap = identity(1)
+        .mint_without_expiry(&service("ssh"))
+        .expect("mint without clock checks")
+        .attenuate_with_raw_datalog("time(1970-01-01T00:00:00Z);")
+        .expect("append token clock");
+    assert_eq!(cap.valid_until().expect("no check reads the clock"), None);
+}
+
+#[test]
+fn invisible_or_late_clocks_are_unreadable() {
+    let authority = identity(1);
+    let slip = authority.mint(&service("ssh"), at(3600)).expect("mint");
+    // An appended fact is invisible to the authority check. A later-than-bound fact cannot help
+    // even its own block's check, but neither case makes token clock provenance supported.
+    let invisible = slip
+        .attenuate_with_raw_datalog("time(1970-01-01T00:00:00Z);")
+        .expect("append invisible clock");
+    let late = slip
+        .attenuate_with_raw_datalog(
+            "time(2023-11-14T22:15:00Z); check if time($t), $t <= 2023-11-14T22:14:20Z;",
+        )
+        .expect("append clock later than its bound");
+    for cap in [invisible, late] {
+        assert!(authority.verify(&cap, &request("ssh", 0)).is_ok());
+        assert!(
+            matches!(cap.valid_until(), Err(CapError::UnreadableExpiry)),
+            "token clock provenance is refused even when the fact cannot bypass the check"
+        );
+    }
+}
+
+#[test]
 fn a_clock_check_in_a_shape_never_minted_is_unreadable() {
     // 1_700_003_600 is at(3600). Each block reads the clock in a way no mint or attenuation writes, so
     // the instant it ends cannot be read, and the answer is an error a caller treats as expired.
