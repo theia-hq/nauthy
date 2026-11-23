@@ -20,8 +20,4 @@ allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
 # Each ignore says why the advisory does not reach us; drop it when that stops being true.
 [advisories]
 yanked = "deny"
-ignore = [
-    # proc-macro-error2 is unmaintained, and no fix exists. A build-time proc macro, reached through
-    # biscuit-auth's biscuit-quote, so none of its code runs in a built binary.
-    { id = "RUSTSEC-2026-0173", reason = "unmaintained build-time proc macro, via biscuit-auth's biscuit-quote" },
-]
+ignore = []
